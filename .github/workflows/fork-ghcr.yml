@@ -1,0 +1,76 @@
+name: Fork → GHCR
+
+# Builds the UI and Worker images from this fork's branches and publishes
+# them to GHCR under the fork owner's namespace. Separate from upstream's
+# Docker Hub publishing workflow so it doesn't need DOCKERHUB secrets.
+
+on:
+  push:
+    branches:
+      - main
+      - 'local/**'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Extra tag to apply (in addition to branch tag)'
+        required: false
+        default: ''
+
+concurrency:
+  group: fork-ghcr-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ui
+            image: cashpilot-ui
+            dockerfile: Dockerfile
+          - name: worker
+            image: cashpilot-worker
+            dockerfile: Dockerfile.worker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+          flavor: |
+            latest=false
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
