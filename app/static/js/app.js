@@ -1547,6 +1547,9 @@ const CP = (() => {
       _detailWorkers = workers;
       if (title) title.textContent = svc.name;
       if (body) body.innerHTML = renderServiceDetail(svc, workers);
+      if (_isOwner && document.getElementById(`spec-editor-${slug}`)) {
+        loadServiceSpec(slug);
+      }
     } catch (err) {
       if (body) body.innerHTML = `<p class="empty-state-text">Could not load service: ${escapeHtml(err.message)}</p>`;
     }
@@ -1690,6 +1693,31 @@ const CP = (() => {
         <div class="log-viewer" id="logs-${svc.slug}-${inst.worker.id}" style="display:none; max-height:200px;"></div>`;
       }
       html += `</div>`;
+    }
+
+    // --- Service Spec editor (raw YAML override) ---
+    if (_isOwner) {
+      const overrideBadge = svc.has_spec_override
+        ? '<span style="font-size:0.75rem; color:var(--text-secondary); margin-left:8px;">(override active)</span>'
+        : '';
+      html += `
+      <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border-color);">
+        <h4 style="margin-bottom: 4px; font-size: 0.95rem;">Service Spec (YAML)${overrideBadge}</h4>
+        <p style="color: var(--text-muted); font-size: 0.8rem; margin-bottom: 8px;">
+          Edit the full service definition. Saved overrides take precedence over the catalog YAML on disk. Reset falls back to the on-disk catalog.
+        </p>
+        <textarea id="spec-editor-${svc.slug}"
+                  class="form-input"
+                  spellcheck="false"
+                  style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; min-height: 280px; white-space: pre; resize: vertical; width: 100%;"
+                  placeholder="(loading...)"></textarea>
+        <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap;">
+          <button class="btn btn-secondary btn-sm" onclick="CP.loadServiceSpec('${svc.slug}')">Reload</button>
+          <button class="btn btn-success btn-sm" onclick="CP.saveServiceSpec('${svc.slug}')">Save</button>
+          <button class="btn btn-ghost btn-sm" onclick="CP.resetServiceSpec('${svc.slug}')">Reset to catalog</button>
+          <span id="spec-status-${svc.slug}" style="font-size: 0.85rem;"></span>
+        </div>
+      </div>`;
     }
 
     return html;

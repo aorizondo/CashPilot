@@ -171,37 +171,6 @@
       <div class="log-viewer" id="detail-logs-{{ service.slug }}">(Click Load Logs to view)</div>
       <button class="btn btn-ghost btn-sm" style="margin-top: 8px;" onclick="CP.loadDetailLogs('{{ service.slug }}')">Load Logs</button>
     </div>
-
-    <!-- Service Spec Editor (raw YAML) -->
-    <div class="card" style="margin-bottom: 16px;">
-      <h3 class="card-title" style="margin-bottom: 12px;">
-        Service Spec (YAML)
-        {% if service.has_spec_override %}
-          <span style="font-size: 0.75rem; color: var(--text-secondary); margin-left: 8px;">(override active)</span>
-        {% endif %}
-      </h3>
-      <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 8px;">
-        Edit the full service definition. Saved overrides take precedence over the catalog YAML on disk. Resetting falls back to the on-disk catalog.
-      </p>
-      <textarea id="spec-editor-{{ service.slug }}"
-                class="form-input"
-                spellcheck="false"
-                style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; min-height: 320px; white-space: pre; resize: vertical;"
-                placeholder="(loading...)"></textarea>
-      <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap;">
-        <button class="btn btn-secondary btn-sm" onclick="CP.loadServiceSpec('{{ service.slug }}')">Load current</button>
-        <button class="btn btn-success btn-sm" onclick="CP.saveServiceSpec('{{ service.slug }}')">Save</button>
-        <button class="btn btn-ghost btn-sm" onclick="CP.resetServiceSpec('{{ service.slug }}')">Reset to catalog</button>
-        <span id="spec-status-{{ service.slug }}" style="font-size: 0.85rem;"></span>
-      </div>
-    </div>
   </div>
 </div>
-<script>
-  document.addEventListener('DOMContentLoaded', function () {
-    if (window.CP && CP.loadServiceSpec) {
-      CP.loadServiceSpec('{{ service.slug }}');
-    }
-  });
-</script>
 {% endblock %}
