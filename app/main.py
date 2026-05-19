@@ -311,7 +311,14 @@ def _require_owner(request: Request) -> dict[str, Any]:
 
 
 def _require_private_network(request: Request) -> None:
-    """Block requests from public IPs (for first-run setup)."""
+    """Block requests from public IPs (for first-run setup).
+
+    Bypassed when `CASHPILOT_PUBLIC_SETUP=1`. Intended for ephemeral staging
+    instances where the operator wants to bootstrap an admin from a public URL
+    without an SSH tunnel. Never enable in production.
+    """
+    if os.getenv("CASHPILOT_PUBLIC_SETUP") == "1":
+        return
     if not request.client or not request.client.host:
         return
     try:
