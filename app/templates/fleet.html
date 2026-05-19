@@ -25,30 +25,50 @@
   </div>
 </div>
 
-<!-- Add Worker Info -->
+<!-- Add Worker -->
 <div class="card" style="margin-bottom: 24px;">
   <div class="card-header">
     <span class="card-title">Add Worker</span>
   </div>
   <div style="padding: 0 20px 20px;">
     <p style="color: var(--text-secondary); margin-bottom: 12px; font-size: 0.9rem;">
-      Deploy <code>drumsergio/cashpilot-worker</code> on each server, or install the
+      Deploy <code>drumsergio/cashpilot-worker</code> on each VPS, or install the
       <a href="https://github.com/GeiserX/CashPilot-android" style="color: var(--accent);">Android app</a> on your phone.
-      For Docker workers, set these environment variables:
+      Fill in the two fields below and copy the snippet that matches your target platform.
     </p>
+
+    <div style="display: grid; gap: 12px; grid-template-columns: 1fr 1fr; margin-bottom: 12px;">
+      <div>
+        <label class="form-label" for="worker-name-input">Worker name</label>
+        <input id="worker-name-input" class="form-input" type="text" value="hostinger-vps"
+               placeholder="e.g. hetzner-fsn1">
+        <div class="form-hint">Free-form identifier shown in the fleet list.</div>
+      </div>
+      <div>
+        <label class="form-label" for="worker-url-input">Worker URL (public)</label>
+        <input id="worker-url-input" class="form-input" type="text" value=""
+               placeholder="https://worker.example.com  or  http://1.2.3.4:8081">
+        <div class="form-hint">Where this UI will reach the worker. Required behind a reverse proxy (Easypanel/Traefik).</div>
+      </div>
+    </div>
+
+    <div style="display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap;" id="snippet-tabs">
+      <button class="btn btn-sm tab-btn" data-tab="env" type="button">Env vars (Easypanel)</button>
+      <button class="btn btn-sm tab-btn" data-tab="compose" type="button">docker-compose.yml</button>
+      <button class="btn btn-sm tab-btn" data-tab="run" type="button">docker run</button>
+    </div>
+
     <div style="background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 8px; padding: 12px;">
-      <code id="worker-env" style="display: block; word-break: break-all; color: var(--text-primary); font-size: 0.85rem; white-space: pre-wrap;">CASHPILOT_UI_URL=<span id="env-ui-url"></span>
-CASHPILOT_API_KEY=<span id="env-api-key">********</span>
-CASHPILOT_WORKER_NAME=server-name</code>
+      <pre id="snippet-output" style="margin: 0; color: var(--text-primary); font-size: 0.82rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; overflow-x: auto;"></pre>
       {% if user.r == 'owner' %}
       <div style="display: flex; gap: 8px; margin-top: 8px;">
         <button class="btn btn-ghost btn-sm" onclick="toggleApiKey()" id="reveal-btn">Reveal API Key</button>
-        <button class="btn btn-ghost btn-sm" onclick="copyWorkerEnv()">Copy</button>
+        <button class="btn btn-ghost btn-sm" onclick="copySnippet()">Copy</button>
       </div>
       {% endif %}
     </div>
     <p style="color: var(--text-muted); margin-top: 8px; font-size: 0.82rem;">
-      The API key is set via <code>CASHPILOT_API_KEY</code> env var on the UI container. Use the same key on all workers.
+      The API key is the value of <code>CASHPILOT_API_KEY</code> on this UI container. All workers must use the same one.
     </p>
   </div>
 </div>
@@ -73,7 +93,80 @@ CASHPILOT_WORKER_NAME=server-name</code>
   let _apiKey = '';
   const _isOwner = {{ 'true' if user.r == 'owner' else 'false' }};
 
-  document.getElementById('env-ui-url').textContent = window.location.origin;
+  // -------------------------------------------------------------------------
+  // Add-Worker snippet generator: env / docker-compose / docker run
+  // -------------------------------------------------------------------------
+  let _activeTab = 'env';
+
+  function _uiUrl() { return window.location.origin; }
+  function _displayKey() { return _apiKeyRevealed ? (_apiKey || '(not configured)') : '********'; }
+  function _name() { return (document.getElementById('worker-name-input')?.value || 'worker-1').trim() || 'worker-1'; }
+  function _workerUrl() { return (document.getElementById('worker-url-input')?.value || '').trim(); }
+
+  function renderSnippet() {
+    const ui = _uiUrl();
+    const key = _displayKey();
+    const name = _name();
+    const wurl = _workerUrl();
+    const wurlLine = (k) => wurl ? `${k}=${wurl}\n` : '';
+    let out = '';
+    if (_activeTab === 'env') {
+      out =
+`CASHPILOT_UI_URL=${ui}
+CASHPILOT_API_KEY=${key}
+CASHPILOT_WORKER_NAME=${name}
+${wurl ? `CASHPILOT_WORKER_URL=${wurl}\n` : '# CASHPILOT_WORKER_URL=  # set if behind a reverse proxy\n'}`;
+    } else if (_activeTab === 'compose') {
+      out =
+`services:
+  cashpilot-worker:
+    image: drumsergio/cashpilot-worker:latest
+    container_name: cashpilot-worker
+    restart: unless-stopped
+    init: true
+    ports:
+      - "8081:8081"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - cashpilot_worker_data:/data
+    environment:
+      - TZ=UTC
+      - CASHPILOT_UI_URL=${ui}
+      - CASHPILOT_API_KEY=${key}
+      - CASHPILOT_WORKER_NAME=${name}
+${wurl ? `      - CASHPILOT_WORKER_URL=${wurl}\n` : `      # - CASHPILOT_WORKER_URL=  # set if behind a reverse proxy\n`}volumes:
+  cashpilot_worker_data:
+`;
+    } else if (_activeTab === 'run') {
+      out =
+`docker run -d --name cashpilot-worker --restart unless-stopped \\
+  -p 8081:8081 \\
+  -v /var/run/docker.sock:/var/run/docker.sock \\
+  -v cashpilot_worker_data:/data \\
+  -e CASHPILOT_UI_URL=${ui} \\
+  -e CASHPILOT_API_KEY=${key} \\
+  -e CASHPILOT_WORKER_NAME=${name} \\${wurl ? `\n  -e CASHPILOT_WORKER_URL=${wurl} \\` : ''}
+  drumsergio/cashpilot-worker:latest
+`;
+    }
+    document.getElementById('snippet-output').textContent = out;
+  }
+
+  function setActiveTab(tab) {
+    _activeTab = tab;
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      const active = btn.dataset.tab === tab;
+      btn.classList.toggle('btn-primary', active);
+      btn.classList.toggle('btn-secondary', !active);
+    });
+    renderSnippet();
+  }
+
+  document.querySelectorAll('.tab-btn').forEach(btn => btn.addEventListener('click', () => setActiveTab(btn.dataset.tab)));
+  document.getElementById('worker-name-input').addEventListener('input', renderSnippet);
+  document.getElementById('worker-url-input').addEventListener('input', renderSnippet);
+
+  setActiveTab('env');
 
   async function loadFleet() {
     try {
@@ -183,12 +276,10 @@ CASHPILOT_WORKER_NAME=server-name</code>
   }
 
   window.toggleApiKey = async function() {
-    const el = document.getElementById('env-api-key');
     const btn = document.getElementById('reveal-btn');
     if (_apiKeyRevealed) {
-      el.textContent = '********';
-      btn.textContent = 'Reveal API Key';
       _apiKeyRevealed = false;
+      btn.textContent = 'Reveal API Key';
     } else {
       if (!_apiKey) {
         try {
@@ -196,10 +287,10 @@ CASHPILOT_WORKER_NAME=server-name</code>
           _apiKey = data.api_key || '(not configured)';
         } catch { _apiKey = '(error)'; }
       }
-      el.textContent = _apiKey;
-      btn.textContent = 'Hide API Key';
       _apiKeyRevealed = true;
+      btn.textContent = 'Hide API Key';
     }
+    renderSnippet();
   };
 
   async function removeWorker(workerId, name) {
@@ -222,17 +313,26 @@ CASHPILOT_WORKER_NAME=server-name</code>
     removeWorker(id, name);
   });
 
-  window.copyWorkerEnv = async function() {
-    // Auto-fetch API key if not yet revealed
+  window.copySnippet = async function() {
+    // Make sure the real key is included even if not currently revealed
     if (!_apiKey) {
       try {
         const data = await CP.api('/api/fleet/api-key');
         _apiKey = data.api_key || '(not configured)';
       } catch { _apiKey = '(error)'; }
     }
-    const uiUrl = document.getElementById('env-ui-url').textContent;
-    const text = `CASHPILOT_UI_URL=${uiUrl}\nCASHPILOT_API_KEY=${_apiKey}\nCASHPILOT_WORKER_NAME=server-name`;
-    navigator.clipboard.writeText(text).then(() => CP.toast('Copied', 'success'));
+    const prevRevealed = _apiKeyRevealed;
+    _apiKeyRevealed = true;
+    renderSnippet();
+    const text = document.getElementById('snippet-output').textContent;
+    _apiKeyRevealed = prevRevealed;
+    renderSnippet();
+    try {
+      await navigator.clipboard.writeText(text);
+      CP.toast('Copied to clipboard', 'success');
+    } catch {
+      CP.toast('Copy failed — select the text manually', 'error');
+    }
   };
 
   loadFleet();
