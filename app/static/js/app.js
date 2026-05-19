@@ -1706,6 +1706,38 @@ const CP = (() => {
         <p style="color: var(--text-muted); font-size: 0.8rem; margin-bottom: 8px;">
           Edit the full service definition. Saved overrides take precedence over the catalog YAML on disk. Reset falls back to the on-disk catalog.
         </p>
+        <details style="margin-bottom: 8px; font-size: 0.8rem; color: var(--text-muted);">
+          <summary style="cursor: pointer; user-select: none;">How env values work (click)</summary>
+          <div style="margin-top: 6px; padding: 8px 10px; border-left: 2px solid var(--border-color); white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.75rem;">
+Two ways to supply values for the env vars you declare here:
+
+• Form A — leave each entry without 'default:'. The Deploy panel will
+  ask for the value at deploy time. Nothing is persisted on disk.
+
+  env:
+    - key: BITPING_EMAIL
+      label: "Bitping email"
+      required: true
+    - key: BITPING_PASSWORD
+      label: "Bitping password"
+      required: true
+      secret: true
+
+• Form B — add 'default: &lt;value&gt;'. The value is stored in this
+  override (plain text, not encrypted) and pre-fills the Deploy form.
+
+  env:
+    - key: BITPING_EMAIL
+      ...
+      default: "you@example.com"
+    - key: BITPING_PASSWORD
+      ...
+      secret: true
+      default: "your-password"
+
+'secret: true' only changes the input type to password (•••). It does
+NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
+        </details>
         <textarea id="spec-editor-${svc.slug}"
                   class="form-input"
                   spellcheck="false"

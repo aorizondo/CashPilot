@@ -23,9 +23,9 @@
 #     - key: ENV_VAR_NAME
 #       label: "Human label"
 #       required: true/false
-#       secret: true/false
+#       secret: true/false       # only changes UI input type (password vs text); does NOT encrypt
 #       description: "Help text"
-#       default: "" (optional)
+#       default: ""              # optional — see Forms A vs B below
 #   ports: ["port:port"]
 #   volumes: ["host:container"]
 #   command: "" (optional override)
@@ -33,6 +33,49 @@
 #   cap_add: [] (optional)
 #   stop_timeout: 30 (optional, seconds to wait before SIGKILL on stop — default 30)
 #   setup: "" (optional, one-time setup instructions/commands to run before first deploy)
+#
+# ─── Two ways to provide env values ──────────────────────────────────────────
+#
+# FORM A (recommended) — values live only in the deploy form, never on disk
+# ----------------------------------------------------------------------------
+# Declare the env vars without `default:`. The UI renders inputs in the
+# Deploy panel; the operator types the value at deploy time. The value is
+# sent to the worker as `env:` on POST /api/deploy/<slug> and ends up in
+# the container, but is NOT persisted in CashPilot's SQLite.
+#
+#   env:
+#     - key: BITPING_EMAIL
+#       label: "Bitping email"
+#       required: true
+#     - key: BITPING_PASSWORD
+#       label: "Bitping password"
+#       required: true
+#       secret: true              # form renders <input type="password">
+#
+# FORM B — values baked into the spec via `default:`
+# ----------------------------------------------------------------------------
+# When the override is saved through the UI editor, the YAML is stored
+# verbatim in the `service_specs` table (plain text — we intentionally don't
+# encrypt at this stage so the editor is debuggable). The deploy form will
+# come pre-filled with whatever `default:` you put here. Use this only when
+# you accept that any UI owner can read the values back from the editor.
+#
+#   env:
+#     - key: BITPING_EMAIL
+#       label: "Bitping email"
+#       required: true
+#       default: "you@example.com"
+#     - key: BITPING_PASSWORD
+#       label: "Bitping password"
+#       required: true
+#       secret: true
+#       default: "your-password"
+#
+# Special placeholders honoured at deploy time:
+#   {hostname}        — replaced with the deploy form's "hostname" field (or
+#                       HOSTNAME_PREFIX) inside `default:` strings.
+#   ${OTHER_KEY}      — inside `command:` and `volumes:` host paths, expanded
+#                       against the resolved env (catalog default + form input).
 
 # requirements:
 #   residential_ip: true/false
