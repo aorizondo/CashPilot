@@ -32,7 +32,7 @@
   </div>
   <div style="padding: 0 20px 20px;">
     <p style="color: var(--text-secondary); margin-bottom: 12px; font-size: 0.9rem;">
-      Deploy <code>drumsergio/cashpilot-worker</code> on each VPS, or install the
+      Deploy <code>ghcr.io/aorizondo/cashpilot-worker</code> on each VPS, or install the
       <a href="https://github.com/GeiserX/CashPilot-android" style="color: var(--accent);">Android app</a> on your phone.
       Fill in the two fields below and copy the snippet that matches your target platform.
     </p>
@@ -120,7 +120,7 @@ ${wurl ? `CASHPILOT_WORKER_URL=${wurl}\n` : '# CASHPILOT_WORKER_URL=  # set if b
       out =
 `services:
   cashpilot-worker:
-    image: drumsergio/cashpilot-worker:latest
+    image: ghcr.io/aorizondo/cashpilot-worker:local-spec-editor
     container_name: cashpilot-worker
     restart: unless-stopped
     init: true
@@ -146,7 +146,7 @@ ${wurl ? `      - CASHPILOT_WORKER_URL=${wurl}\n` : `      # - CASHPILOT_WORKER_
   -e CASHPILOT_UI_URL=${ui} \\
   -e CASHPILOT_API_KEY=${key} \\
   -e CASHPILOT_WORKER_NAME=${name} \\${wurl ? `\n  -e CASHPILOT_WORKER_URL=${wurl} \\` : ''}
-  drumsergio/cashpilot-worker:latest
+  ghcr.io/aorizondo/cashpilot-worker:local-spec-editor
 `;
     }
     document.getElementById('snippet-output').textContent = out;
