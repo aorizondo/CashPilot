@@ -335,11 +335,47 @@ def restart_service(slug: str) -> None:
     logger.info("Restarted container %s", container.name)
 
 
-def remove_service(slug: str) -> None:
-    """Stop and remove the container for a service."""
+def remove_service(slug: str, delete_volumes: bool = False) -> dict[str, Any]:
+    """Stop and remove the container for a service.
+
+    When `delete_volumes` is True, also remove any named volumes that were
+    mounted into the container (skipping bind mounts and anonymous volumes).
+    Returns a summary dict listing what was removed.
+    """
     container = _find_container(slug)
+    name = container.name
+    volume_names: list[str] = []
+    if delete_volumes:
+        try:
+            mounts = container.attrs.get("Mounts", []) or []
+        except APIError:
+            mounts = []
+        for m in mounts:
+            if m.get("Type") == "volume" and m.get("Name"):
+                volume_names.append(m["Name"])
     container.remove(force=True)
-    logger.info("Removed container %s", container.name)
+    logger.info("Removed container %s", name)
+
+    deleted_volumes: list[str] = []
+    failed_volumes: list[dict[str, str]] = []
+    if delete_volumes:
+        client = _get_client()
+        for vol_name in volume_names:
+            try:
+                client.volumes.get(vol_name).remove(force=True)
+                deleted_volumes.append(vol_name)
+                logger.info("Removed volume %s", vol_name)
+            except NotFound:
+                # already gone — count as deleted
+                deleted_volumes.append(vol_name)
+            except APIError as exc:
+                failed_volumes.append({"name": vol_name, "error": str(exc)})
+                logger.warning("Failed to remove volume %s: %s", vol_name, exc)
+    return {
+        "container": name,
+        "deleted_volumes": deleted_volumes,
+        "failed_volumes": failed_volumes,
+    }
 
 
 def start_service(slug: str) -> None:

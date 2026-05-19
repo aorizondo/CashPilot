@@ -1688,6 +1688,7 @@ const CP = (() => {
             <button class="btn btn-secondary btn-sm" onclick="CP.workerAction('${svc.slug}','restart',${inst.worker.id})">Restart</button>
             <button class="btn btn-secondary btn-sm" onclick="CP.workerAction('${svc.slug}','stop',${inst.worker.id})">Stop</button>
             <button class="btn btn-ghost btn-sm" onclick="CP.loadWorkerLogs('${svc.slug}',${inst.worker.id},'logs-${svc.slug}-${inst.worker.id}')">Logs</button>
+            <button class="btn btn-danger btn-sm" onclick="CP.removeWorkerService('${svc.slug}',${inst.worker.id},'${escapeHtml(inst.worker.name)}')">Remove</button>
           </div>` : ''}
         </div>
         <div class="log-viewer" id="logs-${svc.slug}-${inst.worker.id}" style="display:none; max-height:200px;"></div>`;
@@ -1792,6 +1793,36 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
         statusEl.style.color = 'var(--error)';
         toast(`Deploy failed: ${failures[0]}`, 'error');
       }
+    }
+  }
+
+  async function removeWorkerService(slug, workerId, workerName) {
+    const wname = workerName || `worker ${workerId}`;
+    const choice = prompt(
+      `Remove container "${slug}" from "${wname}"?\n\n` +
+      `Type one of:\n` +
+      `  keep    — remove the container, keep the volumes (default)\n` +
+      `  full    — remove the container AND named volumes (deletes credentials/data)\n` +
+      `  cancel  — abort\n`,
+      'keep'
+    );
+    if (!choice || choice.toLowerCase() === 'cancel') return;
+    const deleteVolumes = choice.toLowerCase() === 'full';
+    if (deleteVolumes && !confirm(`This will WIPE the data volumes of ${slug} on ${wname}. Continue?`)) return;
+    try {
+      const qs = `?worker_id=${workerId}${deleteVolumes ? '&delete_volumes=true' : ''}`;
+      const data = await api(`/api/services/${slug}${qs}`, { method: 'DELETE' });
+      const vols = data.deleted_volumes || [];
+      const failed = data.failed_volumes || [];
+      let msg = `Removed ${slug} from ${wname}`;
+      if (deleteVolumes) {
+        msg += vols.length ? ` (volumes: ${vols.join(', ')})` : ' (no named volumes)';
+        if (failed.length) msg += `; failed: ${failed.map(f => f.name).join(', ')}`;
+      }
+      CP.toast(msg, failed.length ? 'warning' : 'success');
+      openServiceDetail(slug);
+    } catch (err) {
+      CP.toast(`Remove failed: ${err.message}`, 'error');
     }
   }
 
@@ -2439,6 +2470,7 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     toggleInstances,
     deployServiceToWorkers,
     workerAction,
+    removeWorkerService,
     loadWorkerLogs,
     openCredentialModal,
     saveCredentialModal,
