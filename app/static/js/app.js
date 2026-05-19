@@ -1773,17 +1773,25 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     if (statusEl) statusEl.innerHTML = '<span class="spinner" style="display:inline-block;width:14px;height:14px;vertical-align:middle;"></span> Deploying...';
 
     let ok = 0, fail = 0;
+    const failures = [];
     for (const wid of workerIds) {
       try {
         await api(`/api/deploy/${slug}?worker_id=${wid}`, { method: 'POST', body: { env } });
         ok++;
       } catch (err) {
         fail++;
+        failures.push(err.message);
       }
     }
     if (statusEl) {
-      statusEl.textContent = fail === 0 ? `Deployed to ${ok} node(s)` : `${ok} ok, ${fail} failed`;
-      statusEl.style.color = fail === 0 ? 'var(--success)' : 'var(--error)';
+      if (fail === 0) {
+        statusEl.textContent = `Deployed to ${ok} node(s)`;
+        statusEl.style.color = 'var(--success)';
+      } else {
+        statusEl.textContent = `${ok} ok, ${fail} failed: ${failures[0]}`;
+        statusEl.style.color = 'var(--error)';
+        toast(`Deploy failed: ${failures[0]}`, 'error');
+      }
     }
   }
 
@@ -2370,6 +2378,10 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
       }
       _specStatus(slug, 'Saved');
       toast(`Spec saved for ${slug}`, 'success');
+      // Re-render the modal so the Deploy panel reflects the new env/ports/etc.
+      if (typeof openServiceDetail === 'function' && document.getElementById('service-detail-modal')?.classList.contains('open')) {
+        openServiceDetail(slug);
+      }
     } catch (err) {
       _specStatus(slug, `Save failed: ${err.message}`, true);
       toast(`Save failed: ${err.message}`, 'error');
