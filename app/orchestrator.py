@@ -245,6 +245,7 @@ def deploy_raw(
     hostname: str | None = None,
     labels: dict[str, str] | None = None,
     category: str = "bandwidth",
+    stop_timeout: Any = None,
 ) -> str:
     """Deploy a container from a raw spec (no catalog lookup).
 
@@ -279,21 +280,24 @@ def deploy_raw(
         logger.warning("Failed to pull image %s: %s (trying local)", image, exc)
 
     logger.info("Creating container %s from %s", name, image)
-    container = client.containers.run(
-        image=image,
-        name=name,
-        environment=env or {},
-        ports=ports if ports and network_mode != "host" else None,
-        volumes=volumes if volumes else None,
-        network_mode=network_mode,
-        cap_add=cap_add,
-        privileged=privileged,
-        command=command if command else None,
-        labels=all_labels,
-        hostname=hostname or f"cashpilot-{slug}",
-        detach=True,
-        restart_policy={"Name": "unless-stopped"},
-    )
+    run_kwargs: dict[str, Any] = {
+        "image": image,
+        "name": name,
+        "environment": env or {},
+        "ports": ports if ports and network_mode != "host" else None,
+        "volumes": volumes if volumes else None,
+        "network_mode": network_mode,
+        "cap_add": cap_add,
+        "privileged": privileged,
+        "command": command if command else None,
+        "labels": all_labels,
+        "hostname": hostname or f"cashpilot-{slug}",
+        "detach": True,
+        "restart_policy": {"Name": "unless-stopped"},
+    }
+    if stop_timeout is not None:
+        run_kwargs["stop_timeout"] = _parse_stop_timeout(stop_timeout)
+    container = client.containers.run(**run_kwargs)
 
     logger.info("Container %s started: %s", name, container.short_id)
     return container.id

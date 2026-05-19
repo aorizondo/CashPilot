@@ -155,6 +155,12 @@ CREATE TABLE IF NOT EXISTS health_events (
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS service_specs (
+    slug       TEXT PRIMARY KEY,
+    spec_yaml  TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_earnings_platform_date
     ON earnings (platform, date);
 
@@ -609,6 +615,59 @@ async def remove_deployment(slug: str) -> None:
     try:
         await db.execute("DELETE FROM deployments WHERE slug = ?", (slug,))
         await db.commit()
+    finally:
+        await db.close()
+
+
+# --- Service spec overrides ---
+
+
+async def get_service_spec(slug: str) -> str | None:
+    """Return the YAML override for a service, or None if no override exists."""
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT spec_yaml FROM service_specs WHERE slug = ?", (slug,)
+        )
+        row = await cursor.fetchone()
+        return row["spec_yaml"] if row else None
+    finally:
+        await db.close()
+
+
+async def save_service_spec(slug: str, spec_yaml: str) -> None:
+    """Insert or replace the YAML override for a service."""
+    db = await _get_db()
+    try:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO service_specs (slug, spec_yaml, updated_at)
+            VALUES (?, ?, datetime('now'))
+            """,
+            (slug, spec_yaml),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def delete_service_spec(slug: str) -> None:
+    """Remove the YAML override; the service falls back to its catalog file."""
+    db = await _get_db()
+    try:
+        await db.execute("DELETE FROM service_specs WHERE slug = ?", (slug,))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def list_service_spec_slugs() -> set[str]:
+    """Return the set of slugs that have a YAML override stored."""
+    db = await _get_db()
+    try:
+        cursor = await db.execute("SELECT slug FROM service_specs")
+        rows = await cursor.fetchall()
+        return {r["slug"] for r in rows}
     finally:
         await db.close()
 

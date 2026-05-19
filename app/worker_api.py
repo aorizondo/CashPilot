@@ -265,6 +265,8 @@ class DeploySpec(BaseModel):
     command: str | None = None
     hostname: str | None = None
     labels: dict[str, str] = {}
+    category: str = "bandwidth"
+    stop_timeout: int | None = None
 
 
 @app.get("/api/status")
@@ -310,11 +312,16 @@ async def api_deploy_container(request: Request, slug: str, spec: DeploySpec) ->
             command=spec.command,
             hostname=spec.hostname,
             labels=spec.labels,
+            category=spec.category,
+            stop_timeout=spec.stop_timeout,
         )
         return {"status": "deployed", "container_id": container_id}
-    except Exception:
+    except Exception as exc:
         logger.exception("Deploy failed for %s", slug)
-        raise HTTPException(status_code=500, detail="Container deployment failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Container deployment failed: {type(exc).__name__}: {exc}",
+        )
 
 
 @app.post("/api/containers/{slug}/restart")

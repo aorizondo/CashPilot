@@ -2265,6 +2265,76 @@ const CP = (() => {
   });
 
   // -----------------------------------------------------------
+  // Service spec editor (raw YAML)
+  // -----------------------------------------------------------
+  function _specEl(slug) {
+    return document.getElementById(`spec-editor-${slug}`);
+  }
+  function _specStatus(slug, msg, isError) {
+    const el = document.getElementById(`spec-status-${slug}`);
+    if (!el) return;
+    el.textContent = msg;
+    el.style.color = isError ? '#ef4444' : 'var(--text-secondary)';
+  }
+
+  async function loadServiceSpec(slug) {
+    const el = _specEl(slug);
+    if (!el) return;
+    _specStatus(slug, 'Loading...');
+    try {
+      const res = await fetch(`/api/services/${encodeURIComponent(slug)}/spec`);
+      const text = await res.text();
+      if (!res.ok) throw new Error(text || `Error ${res.status}`);
+      el.value = text;
+      _specStatus(slug, 'Loaded');
+    } catch (err) {
+      _specStatus(slug, `Load failed: ${err.message}`, true);
+    }
+  }
+
+  async function saveServiceSpec(slug) {
+    const el = _specEl(slug);
+    if (!el) return;
+    _specStatus(slug, 'Saving...');
+    try {
+      const res = await fetch(`/api/services/${encodeURIComponent(slug)}/spec`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'text/plain' },
+        body: el.value,
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        let msg = text;
+        try { msg = (JSON.parse(text).detail) || text; } catch (_) {}
+        throw new Error(msg || `Error ${res.status}`);
+      }
+      _specStatus(slug, 'Saved');
+      toast(`Spec saved for ${slug}`, 'success');
+    } catch (err) {
+      _specStatus(slug, `Save failed: ${err.message}`, true);
+      toast(`Save failed: ${err.message}`, 'error');
+    }
+  }
+
+  async function resetServiceSpec(slug) {
+    if (!confirm(`Discard override and fall back to the on-disk catalog for ${slug}?`)) return;
+    _specStatus(slug, 'Resetting...');
+    try {
+      const res = await fetch(`/api/services/${encodeURIComponent(slug)}/spec`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error((data && data.detail) || `Error ${res.status}`);
+      }
+      await loadServiceSpec(slug);
+      _specStatus(slug, 'Reset to catalog');
+      toast(`Reset to catalog for ${slug}`, 'success');
+    } catch (err) {
+      _specStatus(slug, `Reset failed: ${err.message}`, true);
+      toast(`Reset failed: ${err.message}`, 'error');
+    }
+  }
+
+  // -----------------------------------------------------------
   // Public API
   // -----------------------------------------------------------
   return {
@@ -2301,5 +2371,8 @@ const CP = (() => {
     openCredentialModal,
     saveCredentialModal,
     clearServiceCredentials,
+    loadServiceSpec,
+    saveServiceSpec,
+    resetServiceSpec,
   };
 })();

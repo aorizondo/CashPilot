@@ -110,11 +110,68 @@ def get_services_by_category() -> dict[str, list[dict[str, Any]]]:
 
 
 def get_service(slug: str) -> dict[str, Any] | None:
-    """Look up a single service by slug (returns a shallow copy)."""
+    """Look up a single service by slug (returns a shallow copy).
+
+    Does NOT apply DB overrides — use `get_effective_service` for deploy paths.
+    """
     if not _by_slug:
         load_services()
     svc = _by_slug.get(slug)
     return dict(svc) if svc else None
+
+
+def get_catalog_yaml(slug: str) -> str | None:
+    """Serialise the on-disk catalog entry for a slug as a YAML string."""
+    svc = get_service(slug)
+    if svc is None:
+        return None
+    return yaml.safe_dump(svc, sort_keys=False, allow_unicode=True)
+
+
+def parse_spec_yaml(text: str) -> dict[str, Any]:
+    """Parse a YAML service spec and validate required fields.
+
+    Raises ValueError on parse or validation failure.
+    """
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid YAML: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Spec must be a YAML mapping")
+    missing = _REQUIRED_FIELDS - set(data.keys())
+    if missing:
+        raise ValueError(f"Missing required fields: {sorted(missing)}")
+    docker = data.get("docker")
+    if not isinstance(docker, dict) or not docker.get("image"):
+        raise ValueError("`docker.image` is required")
+    return data
+
+
+async def get_effective_service(slug: str) -> dict[str, Any] | None:
+    """Return the service spec to use for deploy: DB override > catalog file.
+
+    Async because reading the override hits SQLite.
+    """
+    from app import database  # local import to avoid circular at module load
+
+    override_yaml = await database.get_service_spec(slug)
+    if override_yaml:
+        try:
+            return parse_spec_yaml(override_yaml)
+        except ValueError as exc:
+            logger.error("Invalid override for %s, falling back to catalog: %s", slug, exc)
+    return get_service(slug)
+
+
+async def get_effective_yaml(slug: str) -> str | None:
+    """Return the YAML text that drives deploys: DB override if present, else catalog."""
+    from app import database
+
+    override_yaml = await database.get_service_spec(slug)
+    if override_yaml:
+        return override_yaml
+    return get_catalog_yaml(slug)
 
 
 def _sighup_handler(signum: int, frame: Any) -> None:

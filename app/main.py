@@ -575,7 +575,11 @@ async def api_mode(request: Request) -> dict[str, Any]:
 @app.get("/api/services")
 async def api_list_services(request: Request) -> list[dict[str, Any]]:
     _require_auth_api(request)
-    return catalog.get_services()
+    services = catalog.get_services()
+    override_slugs = await database.list_service_spec_slugs()
+    for svc in services:
+        svc["has_spec_override"] = svc.get("slug") in override_slugs
+    return services
 
 
 @app.get("/api/services/deployed")
@@ -769,6 +773,7 @@ async def api_get_service(request: Request, slug: str) -> dict[str, Any]:
 
     svc["deployed"] = slug in deployed_slugs or slug in worker_slugs
     svc["node_count"] = len(worker_nodes)
+    svc["has_spec_override"] = (await database.get_service_spec(slug)) is not None
     return svc
 
 
@@ -793,7 +798,7 @@ class DeployRequest(BaseModel):
 async def api_deploy(request: Request, slug: str, body: DeployRequest, worker_id: int | None = None) -> dict[str, str]:
     _require_owner(request)
     worker_id = await _resolve_worker_id(worker_id)
-    svc = catalog.get_service(slug)
+    svc = await catalog.get_effective_service(slug)
     if not svc:
         raise HTTPException(status_code=404, detail=f"Service '{slug}' not found")
     if svc.get("status") == "dead":
@@ -846,6 +851,7 @@ async def api_deploy(request: Request, slug: str, body: DeployRequest, worker_id
             mode = parts[2] if len(parts) > 2 else "rw"
             volumes[host_path] = {"bind": container_path, "mode": mode}
 
+    yaml_labels = docker_conf.get("labels") or {}
     spec: dict[str, Any] = {
         "image": image,
         "env": env,
@@ -855,6 +861,9 @@ async def api_deploy(request: Request, slug: str, body: DeployRequest, worker_id
         "network_mode": docker_conf.get("network_mode") or None,
         "cap_add": docker_conf.get("cap_add") or None,
         "privileged": docker_conf.get("privileged", False),
+        "labels": {str(k): str(v) for k, v in yaml_labels.items()} if yaml_labels else {},
+        "category": svc.get("category", "bandwidth"),
+        "stop_timeout": docker_conf.get("stop_timeout"),
     }
 
     # Command: resolve ${VAR} placeholders
@@ -1049,6 +1058,49 @@ async def api_service_remove(request: Request, slug: str, worker_id: int | None 
     result = await _proxy_worker_command(worker_id, "remove", slug)
     await database.remove_deployment(slug)
     return result
+
+
+# ---------------------------------------------------------------------------
+# API: Service spec overrides (raw YAML editor)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/services/{slug}/spec", response_class=PlainTextResponse)
+async def api_get_service_spec(request: Request, slug: str) -> str:
+    """Return the effective spec YAML for a service (override if set, else catalog)."""
+    _require_auth_api(request)
+    text = await catalog.get_effective_yaml(slug)
+    if text is None:
+        raise HTTPException(status_code=404, detail=f"Service '{slug}' not found")
+    return text
+
+
+@app.put("/api/services/{slug}/spec", response_class=PlainTextResponse)
+async def api_put_service_spec(request: Request, slug: str) -> str:
+    """Replace the service spec with the YAML body. Creates entry if new slug."""
+    _require_owner(request)
+    body = (await request.body()).decode("utf-8", errors="replace")
+    if not body.strip():
+        raise HTTPException(status_code=400, detail="Spec body is empty")
+    try:
+        parsed = catalog.parse_spec_yaml(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if parsed.get("slug") and parsed["slug"] != slug:
+        raise HTTPException(
+            status_code=422,
+            detail=f"slug in body ({parsed['slug']!r}) does not match URL ({slug!r})",
+        )
+    await database.save_service_spec(slug, body)
+    return body
+
+
+@app.delete("/api/services/{slug}/spec")
+async def api_delete_service_spec(request: Request, slug: str) -> dict[str, str]:
+    """Remove the override; the service falls back to its catalog YAML."""
+    _require_owner(request)
+    await database.delete_service_spec(slug)
+    return {"status": "reset"}
 
 
 # ---------------------------------------------------------------------------
