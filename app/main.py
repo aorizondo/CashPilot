@@ -764,7 +764,7 @@ async def api_services_available(request: Request) -> list[dict[str, Any]]:
 @app.get("/api/services/{slug}")
 async def api_get_service(request: Request, slug: str) -> dict[str, Any]:
     _require_auth_api(request)
-    svc = catalog.get_service(slug)
+    svc = await catalog.get_effective_service(slug)
     if not svc:
         raise HTTPException(status_code=404, detail=f"Service '{slug}' not found")
 
