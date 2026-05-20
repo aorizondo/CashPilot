@@ -121,6 +121,7 @@ ${wurl ? `CASHPILOT_WORKER_URL=${wurl}\n` : '# CASHPILOT_WORKER_URL=  # set if b
 `services:
   cashpilot-worker:
     image: aorizondo/cashpilot-worker:latest
+    pull_policy: always
     container_name: cashpilot-worker
     restart: unless-stopped
     init: true
@@ -139,7 +140,7 @@ ${wurl ? `      - CASHPILOT_WORKER_URL=${wurl}\n` : `      # - CASHPILOT_WORKER_
 `;
     } else if (_activeTab === 'run') {
       out =
-`docker run -d --name cashpilot-worker --restart unless-stopped \\
+`docker run -d --name cashpilot-worker --restart unless-stopped --pull=always \\
   -p 8081:8081 \\
   -v /var/run/docker.sock:/var/run/docker.sock \\
   -v cashpilot_worker_data:/data \\

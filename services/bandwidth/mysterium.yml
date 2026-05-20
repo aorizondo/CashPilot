@@ -17,12 +17,27 @@ referral:
 docker:
   image: mysteriumnetwork/myst
   platforms: [linux/amd64, linux/arm64]
-  env: []
+  env:
+    - key: MYST_IDENTITY_PASSPHRASE
+      label: "Identity passphrase"
+      required: true
+      secret: true
+      description: >
+        Locks and unlocks the on-chain wallet of this node. The binary needs
+        it to sign quality/metric events; without it the node shows up as
+        "Monitoring failed" on mystnodes.com. The same passphrase will be
+        required to export or recover the identity later, so use one you can
+        store in a password manager.
   ports:
     - "4449:4449"
   volumes:
     - "mysterium-data:/var/lib/mysterium-node"
-  command: "--ui.address=0.0.0.0 --tequilapi.address=0.0.0.0 service --agreed-terms-and-conditions"
+  command: >-
+    --ui.address=0.0.0.0
+    --tequilapi.address=0.0.0.0
+    --identity.passphrase=${MYST_IDENTITY_PASSPHRASE}
+    service
+    --agreed-terms-and-conditions
   network_mode: "host"
   cap_add: [NET_ADMIN]
   privileged: true
