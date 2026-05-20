@@ -17,29 +17,39 @@ referral:
 docker:
   image: mysteriumnetwork/myst
   platforms: [linux/amd64, linux/arm64]
-  env:
-    - key: MYST_IDENTITY_PASSPHRASE
-      label: "Identity passphrase"
-      required: true
-      description: >
-        Locks and unlocks the on-chain wallet of this node. The binary needs
-        it to sign quality/metric events; without it the node shows up as
-        "Monitoring failed" on mystnodes.com. The same passphrase will be
-        required to export or recover the identity later, so use one you can
-        store in a password manager.
+  env: []
   ports:
     - "4449:4449"
   volumes:
     - "mysterium-data:/var/lib/mysterium-node"
-  command: >-
-    --ui.address=0.0.0.0
-    --tequilapi.address=0.0.0.0
-    service
-    --identity.passphrase=${MYST_IDENTITY_PASSPHRASE}
-    --agreed-terms-and-conditions
+  command: "--ui.address=0.0.0.0 --tequilapi.address=0.0.0.0 service --agreed-terms-and-conditions"
   network_mode: "host"
   cap_add: [NET_ADMIN]
   privileged: true
+  setup: >
+    Mandatory steps after first deploy — otherwise mystnodes.com will show
+    the node as "Monitoring failed" and you will not earn anything:
+
+    1. Open the Node WebUI at  http://<this-host>:4449
+    2. Complete the onboarding wizard. When the "Claim node" step
+       links you to mystnodes.com, sign in (or sign up). mystnodes
+       will generate a passphrase for this node and show it on screen.
+       Copy it.
+    3. Back in the Node WebUI, go to  Settings -> Change Password.
+       Paste the passphrase mystnodes gave you into the "New password"
+       and "Confirm new password" fields. Save.
+    4. Same Settings page -> Settlement wallet -> enter your beneficiary
+       wallet address (where MYST settles every 4 MYST).
+    5. Within ~15 min the node moves from "Monitoring failed" to
+       "Online" on https://my.mystnodes.com/nodes.
+
+    Why steps 1-3 matter: the on-chain identity keystore is encrypted with
+    a passphrase. The binary needs that same passphrase to sign every
+    quality/metric event it sends to the network. mystnodes generates the
+    passphrase during the claim flow; setting it via Change Password
+    stores it into the keystore so the daemon can unlock the identity on
+    every restart instead of relying on an in-memory cache that dies with
+    the container.
 
 requirements:
   residential_ip: false
