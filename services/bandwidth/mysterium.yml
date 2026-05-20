@@ -34,8 +34,8 @@ docker:
   command: >-
     --ui.address=0.0.0.0
     --tequilapi.address=0.0.0.0
-    --identity.passphrase=${MYST_IDENTITY_PASSPHRASE}
     service
+    --identity.passphrase=${MYST_IDENTITY_PASSPHRASE}
     --agreed-terms-and-conditions
   network_mode: "host"
   cap_add: [NET_ADMIN]
