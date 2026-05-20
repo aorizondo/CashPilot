@@ -1746,10 +1746,12 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
                   placeholder="(loading...)"></textarea>
         <div style="display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap;">
           <button class="btn btn-secondary btn-sm" onclick="CP.loadServiceSpec('${svc.slug}')">Reload</button>
+          <button class="btn btn-secondary btn-sm" onclick="CP.validateServiceSpec('${svc.slug}')">Validate</button>
           <button class="btn btn-success btn-sm" onclick="CP.saveServiceSpec('${svc.slug}')">Save</button>
           <button class="btn btn-ghost btn-sm" onclick="CP.resetServiceSpec('${svc.slug}')">Reset to catalog</button>
           <span id="spec-status-${svc.slug}" style="font-size: 0.85rem;"></span>
         </div>
+        <pre id="spec-summary-${svc.slug}" style="display: none; background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 6px; padding: 10px; margin-top: 8px; font-size: 0.78rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; line-height: 1.5;"></pre>
       </div>`;
     }
 
@@ -2391,6 +2393,67 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     }
   }
 
+  function _renderSpecSummary(slug, summary) {
+    const el = document.getElementById(`spec-summary-${slug}`);
+    if (!el) return;
+    const lines = [];
+    lines.push(`✓ Valid YAML`);
+    lines.push(`  image:        ${summary.image}`);
+    if (summary.env.length) {
+      lines.push(`  env vars (${summary.env.length}):`);
+      for (const e of summary.env) {
+        const flags = [e.required ? 'required' : 'optional', e.has_default ? 'has-default' : ''].filter(Boolean).join(', ');
+        lines.push(`    - ${e.key}  (${flags})  — ${e.label}`);
+      }
+    } else {
+      lines.push(`  env vars:     (none)`);
+    }
+    lines.push(`  ports:        ${summary.ports.length ? summary.ports.join(', ') : '(none)'}`);
+    lines.push(`  volumes:      ${summary.volumes.length ? summary.volumes.join(', ') : '(none)'}`);
+    lines.push(`  network_mode: ${summary.network_mode || '(default bridge)'}`);
+    lines.push(`  privileged:   ${summary.privileged}`);
+    lines.push(`  cap_add:      ${summary.cap_add.length ? summary.cap_add.join(', ') : '(none)'}`);
+    if (summary.command) {
+      const cmd = summary.command.length > 200 ? summary.command.slice(0, 200) + '…' : summary.command;
+      lines.push(`  command:      ${cmd}`);
+    }
+    el.style.display = 'block';
+    el.textContent = lines.join('\n');
+  }
+
+  async function validateServiceSpec(slug) {
+    const ed = _specEl(slug);
+    if (!ed) return;
+    _specStatus(slug, 'Validating...');
+    try {
+      const res = await fetch(`/api/services/${encodeURIComponent(slug)}/spec/validate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: ed.value,
+      });
+      const text = await res.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (_) {}
+      if (!res.ok) {
+        const msg = (data && data.detail) || text || `Error ${res.status}`;
+        _specStatus(slug, `Invalid: ${msg.split('\n')[0].slice(0, 200)}`, true);
+        const summaryEl = document.getElementById(`spec-summary-${slug}`);
+        if (summaryEl) {
+          summaryEl.style.display = 'block';
+          summaryEl.style.color = '#ef4444';
+          summaryEl.textContent = `✗ ${msg}`;
+        }
+        return;
+      }
+      const summaryEl = document.getElementById(`spec-summary-${slug}`);
+      if (summaryEl) summaryEl.style.color = '';
+      _renderSpecSummary(slug, data.summary);
+      _specStatus(slug, 'Valid');
+    } catch (err) {
+      _specStatus(slug, `Validate failed: ${err.message}`, true);
+    }
+  }
+
   async function saveServiceSpec(slug) {
     const el = _specEl(slug);
     if (!el) return;
@@ -2407,12 +2470,17 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
         try { msg = (JSON.parse(text).detail) || text; } catch (_) {}
         throw new Error(msg || `Error ${res.status}`);
       }
-      _specStatus(slug, 'Saved');
+      _specStatus(slug, 'Saved — reloading modal…');
       toast(`Spec saved for ${slug}`, 'success');
-      // Re-render the modal so the Deploy panel reflects the new env/ports/etc.
-      if (typeof openServiceDetail === 'function' && document.getElementById('service-detail-modal')?.classList.contains('open')) {
-        openServiceDetail(slug);
-      }
+      // Always re-render the modal (catalog cache + Deploy form) and scroll to Deploy
+      await openServiceDetail(slug);
+      // Scroll the modal body to the Deploy section so new env inputs are visible
+      setTimeout(() => {
+        const body = document.getElementById('service-detail-body');
+        if (!body) return;
+        const deployHeader = [...body.querySelectorAll('h4')].find(h => h.textContent.trim() === 'Deploy');
+        if (deployHeader) deployHeader.scrollIntoView({block: 'start', behavior: 'smooth'});
+      }, 200);
     } catch (err) {
       _specStatus(slug, `Save failed: ${err.message}`, true);
       toast(`Save failed: ${err.message}`, 'error');
@@ -2478,5 +2546,6 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     loadServiceSpec,
     saveServiceSpec,
     resetServiceSpec,
+    validateServiceSpec,
   };
 })();

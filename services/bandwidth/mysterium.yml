@@ -21,7 +21,6 @@ docker:
     - key: MYST_IDENTITY_PASSPHRASE
       label: "Identity passphrase"
       required: true
-      secret: true
       description: >
         Locks and unlocks the on-chain wallet of this node. The binary needs
         it to sign quality/metric events; without it the node shows up as

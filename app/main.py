@@ -1122,6 +1122,53 @@ async def api_delete_service_spec(request: Request, slug: str) -> dict[str, str]
     return {"status": "reset"}
 
 
+@app.post("/api/services/{slug}/spec/validate")
+async def api_validate_service_spec(request: Request, slug: str) -> dict[str, Any]:
+    """Parse the YAML body and return a structured summary (without saving)."""
+    _require_auth_api(request)
+    body = (await request.body()).decode("utf-8", errors="replace")
+    if not body.strip():
+        raise HTTPException(status_code=400, detail="Spec body is empty")
+    try:
+        parsed = catalog.parse_spec_yaml(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    if parsed.get("slug") and parsed["slug"] != slug:
+        raise HTTPException(
+            status_code=422,
+            detail=f"slug in body ({parsed['slug']!r}) does not match URL ({slug!r})",
+        )
+    docker = parsed.get("docker") or {}
+    env_list = docker.get("env") or []
+    return {
+        "ok": True,
+        "summary": {
+            "name": parsed.get("name"),
+            "slug": parsed.get("slug"),
+            "category": parsed.get("category"),
+            "status": parsed.get("status"),
+            "image": docker.get("image"),
+            "env": [
+                {
+                    "key": e.get("key"),
+                    "label": e.get("label") or e.get("key"),
+                    "required": bool(e.get("required")),
+                    "has_default": bool(e.get("default")),
+                }
+                for e in env_list
+                if isinstance(e, dict) and e.get("key")
+            ],
+            "ports": [str(p) for p in (docker.get("ports") or [])],
+            "volumes": [str(v) for v in (docker.get("volumes") or [])],
+            "command": docker.get("command") or "",
+            "network_mode": docker.get("network_mode") or "",
+            "privileged": bool(docker.get("privileged")),
+            "cap_add": list(docker.get("cap_add") or []),
+            "stop_timeout": docker.get("stop_timeout"),
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
 # API: Compose export
 # ---------------------------------------------------------------------------
