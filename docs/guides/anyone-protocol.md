@@ -5,7 +5,7 @@
 
 ## Description
 
-Anyone Protocol (formerly ATOR) is a decentralized onion-routing privacy network. Node operators run relay nodes and earn ANYONE tokens for bandwidth contributed. Think "incentivized Tor." Official Docker images available for amd64 and arm64 including Raspberry Pi. Configuration is file-based via an anonrc file mounted into the container (Nickname, ContactInfo, ORPort, etc.).
+Anyone Protocol (formerly ATOR) is a decentralized onion-routing privacy network. Node operators run relay nodes and earn ANYONE tokens for bandwidth contributed. Think "incentivized Tor." This guide covers deploying the relay with CashPilot, which uses the `aorizondo/anyone-anon` image that renders the `anonrc` from environment variables at startup (no config file to mount). Available for amd64 and arm64.
 
 ## Earning Estimates
 
@@ -17,7 +17,7 @@ Anyone Protocol (formerly ATOR) is a decentralized onion-routing privacy network
 | Payout frequency | Epoch-based |
 | Payment methods | Crypto |
 
-> Earnings based on bandwidth contributed and uptime. Open source project with active development.
+> Earnings based on bandwidth contributed and uptime. Non-hardware relays must lock 100 ANYONE per relay and hold the prerequisite at airdrop time.
 
 ## Requirements
 
@@ -33,29 +33,20 @@ Anyone Protocol (formerly ATOR) is a decentralized onion-routing privacy network
 
 ### 1. Create an account
 
-No account creation is needed. Anyone Protocol relays are permissionless -- you just run a node and earn ANYONE tokens based on uptime and bandwidth.
+No account creation is needed. Anyone Protocol relays are permissionless — you just run a node and earn ANYONE tokens based on uptime and bandwidth.
 
-### 2. Configure anonrc
+### 2. Deploy with CashPilot (env-var image)
 
-Anyone Protocol requires an `anonrc` configuration file. Create it before deploying:
+In the CashPilot web UI, find **Anyone Protocol** in the service catalog and click **Deploy**. The `aorizondo/anyone-anon` image builds the `anonrc` from the fields you fill in — there is no `anonrc` file to mount. Key fields:
 
-```
-User anond
-DataDirectory /var/lib/anon
-ControlSocket /run/anon/control
-ControlSocketsGroupWritable 1
-CookieAuthentication 1
-CookieAuthFile /run/anon/control.authcookie
-CookieAuthFileGroupReadable 1
-Log notice file /etc/anon/notices.log
-ORPort 9001
-ExitRelay 0
-Nickname YourRelayName
-ContactInfo your@email.com
-AgreeToTerms 1
-```
+- **ANON_NICKNAME** — relay name, 1–19 chars `[a-zA-Z0-9]`, no spaces. Defaults to the deploy hostname so each relay is unique when deploying many at once.
+- **ANON_ETHEREUM_ADDRESS** — your EVM wallet (`0x…`). Written as `ContactInfo @anon: <addr>`; required to earn ANYONE.
+- **ANON_ORPORT** — onion routing port (default 9001). Must be reachable on the host.
+- **ANON_CONTROLPORT** — control port for monitoring (default 9051); set `0` to disable.
+- **ANON_EXITRELAY** — `0` = middle/guard (recommended), `1` = exit (needs an exit policy + more legal exposure).
+- **ANON_AGREETOTERMS** — must be `1` or the relay exits immediately. Defaults to `1`.
 
-**Important:** `AgreeToTerms 1` is required since version 0.4.9.7-live. Without it, the container exits immediately with "User has not agreed to the terms and conditions."
+> **`AgreeToTerms 1` is mandatory.** Without it the container exits with "User has not agreed to the terms and conditions."
 
 ### 3. Port forwarding (required)
 
@@ -65,21 +56,38 @@ AgreeToTerms 1
 
 If running behind a firewall (e.g. ufw), also allow port 9001/tcp inbound.
 
-### 4. Deploy with CashPilot
+### 4. MyFamily (operating multiple relays)
 
-In the CashPilot web UI, find **Anyone Protocol** in the service catalog and click **Deploy**. CashPilot will handle the anonrc creation and volume setup.
+If you run more than one relay, declare them as a family so the network doesn't double-count your relays as independent bandwidth. `MyFamily` is a list of relay fingerprints.
+
+- **You can't know a fingerprint before the relay runs once.** The fingerprint is a hash of the relay's identity key, generated on first start in the data volume. So the workflow is two-phase:
+  1. **Deploy each relay with `ANON_MYFAMILY` empty.** Each generates its own identity.
+  2. **Collect the fingerprints.** Read `/var/lib/anon/fingerprint` inside the container, run `docker exec cashpilot-anyone-protocol anon --list-fingerprint` on the host, or look the relay up at [api.ec.anyone.tech/relays](https://api.ec.anyone.tech/relays/).
+  3. **Set `ANON_MYFAMILY` on every relay** to the comma-separated list of *all* your fingerprints (including each relay's own), then restart.
+- **Persist the data volume.** The `anon-data` volume holds the identity key. If you delete it, the relay gets a new identity and a new fingerprint — and your `MyFamily` list silently breaks. Don't wipe it.
 
 ## Docker Configuration
 
-- **Image:** `ghcr.io/anyone-protocol/ator-protocol`
+- **Image:** `aorizondo/anyone-anon`
 - **Platforms:** linux/amd64, linux/arm64
 
 ### Environment Variables
 
 | Variable | Label | Required | Secret | Description |
 |----------|-------|:--------:|:------:|-------------|
-| `CONTACT_EMAIL` | Contact Email | No | No | Operator email (set in anonrc ContactInfo if not already present) |
+| `ANON_NICKNAME` | Relay nickname | Yes | No | 1–19 chars `[a-zA-Z0-9]`, no spaces. Defaults to hostname. |
+| `ANON_ETHEREUM_ADDRESS` | Ethereum wallet (rewards) | No* | No | `0x…` address; written as `ContactInfo @anon: <addr>`. Required to earn. |
+| `ANON_ORPORT` | ORPort | No | No | Default 9001. |
+| `ANON_CONTROLPORT` | ControlPort | No | No | Default 9051; `0` disables. |
+| `ANON_EXITRELAY` | Exit relay | No | No | `0` (default) = middle/guard; `1` = exit. |
+| `ANON_BANDWIDTHRATE` | Bandwidth rate (Mbit) | No | No | e.g. `100`. Empty = unlimited. |
+| `ANON_BANDWIDTHBURST` | Bandwidth burst (Mbit) | No | No | e.g. `120`. Empty = unlimited. |
+| `ANON_MYFAMILY` | MyFamily fingerprints | No | No | Comma-separated fingerprints of all your relays. |
+| `ANON_AGREETOTERMS` | Agree to terms | No | No | Must be `1`. Defaults to `1`. |
+| `ANON_CONTACTINFO` | Operator contact (email) | No | No | Optional; published in the directory if set. |
+
+\* Required to earn ANYONE tokens.
 
 ### Required Configuration
 
-The `anonrc` file must contain `AgreeToTerms 1` to accept the [Anyone Protocol Terms](https://www.anyone.io/terms). The entrypoint script only handles Nickname and ContactInfo -- the terms check is in the `anon` binary itself.
+The relay must accept the terms. With this image that is `ANON_AGREETOTERMS=1` (the default), which the entrypoint writes as `AgreeToTerms 1` in the generated `anonrc`.

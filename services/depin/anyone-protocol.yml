@@ -58,7 +58,13 @@ docker:
     - key: ANON_MYFAMILY
       label: "MyFamily fingerprints"
       required: false
-      description: "Comma-separated relay fingerprints if you operate multiple relays, so they aren't double-counted."
+      description: >-
+        Comma-separated fingerprints of ALL your relays (including each relay's
+        own). You can only set this after every relay has run once — collect the
+        fingerprints from /var/lib/anon/fingerprint (or 'docker exec
+        cashpilot-anyone-protocol anon --list-fingerprint'), then put the SAME
+        list on every relay and restart. Tells the network not to count your
+        relays as independent bandwidth.
     - key: ANON_AGREETOTERMS
       label: "Agree to terms"
       required: false
@@ -85,6 +91,11 @@ docker:
     The Ethereum rewards wallet is written as 'ContactInfo @anon: <addr>'.
     Port 9001 (ORPort) MUST be forwarded/open on the host or the relay will not
     publish its descriptor and will earn nothing. AgreeToTerms defaults to 1.
+    For multiple relays, set ANON_MYFAMILY to the comma-separated fingerprints of
+    ALL your relays (collect them after first run from /var/lib/anon/fingerprint
+    or via 'docker exec cashpilot-anyone-protocol anon --list-fingerprint') and
+    keep the anon-data volume intact — wiping it generates a new identity and
+    breaks the MyFamily list.
 
 requirements:
   residential_ip: false
