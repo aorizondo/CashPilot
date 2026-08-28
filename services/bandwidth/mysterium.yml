@@ -13,19 +13,33 @@ short_description: Decentralized VPN node - blockchain-based, works on VPS
 
 referral:
   signup_url: "https://mystnodes.co/?referral_code=do7v7YOoBBpbOstKQovX2pUvZYKia4ZhH3QIdNtE"
+  code: "do7v7YOoBBpbOstKQovX2pUvZYKia4ZhH3QIdNtE"
 
 docker:
   image: mysteriumnetwork/myst
   platforms: [linux/amd64, linux/arm64]
+  resources:
+    mem_limit: "768m"
+    oom_score_adj: -100
   env: []
   ports:
     - "4449:4449"
   volumes:
     - "mysterium-data:/var/lib/mysterium-node"
+  critical_volumes:
+    - target: "/var/lib/mysterium-node"
+      holds: >-
+        Node identity keystore. Destroying it creates a brand-new identity: the
+        node loses its reputation and any earnings still held against the old one.
   command: "--ui.address=0.0.0.0 --tequilapi.address=0.0.0.0 service --agreed-terms-and-conditions"
   network_mode: "host"
   cap_add: [NET_ADMIN]
-  privileged: true
+  # Wireguard/dvpn need a TUN device. Without it the node starts, registers and
+  # advertises itself to the network but carries no traffic - it looks healthy
+  # and earns nothing. See docs/guides/mysterium.md.
+  devices:
+    - "/dev/net/tun"
+  privileged: false
   setup: >
     Mandatory steps after first deploy — otherwise mystnodes.com will show
     the node as "Monitoring failed" and you will not earn anything:
@@ -83,3 +97,36 @@ platforms: [docker, windows, macos, linux, android, browser-extension]
 collector:
   type: api
   notes: "Tequila API at http://localhost:4449/tequilapi/settlement/total-fees. Returns MYST in wei (10^18). No auth needed."
+  # MystNodes reports earnings per registered node, not just an
+  # account total, so the UI can break the figure down by machine.
+  per_node_earnings: true
+  credential_hint: "Use your MystNodes account email and password (same as <a href='https://my.mystnodes.com' target='_blank'>my.mystnodes.com</a>)."
+
+# What this service does with the user's machine (CashPilot-66x).
+# Written to be read by someone deciding whether to trust it.
+disclosure:
+  sells: >-
+    Bandwidth. Your connection is used as an exit node for the Mysterium
+    network, which sells VPN, proxy AND data-scraping services. Scraping
+    traffic leaving a residential IP is the use most likely to draw complaints,
+    and you cannot choose which of the three your node carries.
+  third_party_traffic: >-
+    Yes. Strangers route their traffic through your IP address — that is the
+    product.
+  data_collected: >-
+    Node identity (a blockchain address), your IP, and coarse location
+    (country/city/ISP), which the node publishes to the network so buyers can
+    select it.
+  isp_risk: >-
+    Real and worth understanding. Traffic from other people leaves your
+    connection attributed to you, so anything they do appears to originate
+    from your line. Many consumer ISP contracts prohibit this. Check yours
+    before running it.
+  account_rules: >-
+    Unlimited devices per account and per IP.
+
+payout:
+  model: external
+  chain: polygon
+  address_source: manual
+  notes: "The beneficiary wallet is set AFTER deploy, via TequilAPI or the node WebUI -- not by an env var, so it cannot be read from the container spec."

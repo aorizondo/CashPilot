@@ -16,6 +16,7 @@ import logging
 
 import httpx
 
+from app.collectors import base
 from app.collectors.base import BaseCollector, EarningsResult
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class SaladCollector(BaseCollector):
     platform = "salad"
 
     def __init__(self, auth_cookie: str) -> None:
+        super().__init__()
         self.auth_cookie = auth_cookie
 
     async def collect(self) -> EarningsResult:
@@ -36,35 +38,47 @@ class SaladCollector(BaseCollector):
         try:
             cookies = {"auth": self.auth_cookie}
             headers = {"X-XSRF-TOKEN": self.auth_cookie}
+            client = self._get_client(cookies=cookies)
 
-            async with httpx.AsyncClient(timeout=30) as client:
-                resp = await client.get(
+            async def _fetch() -> httpx.Response:
+                return await client.get(
                     f"{API_BASE}/profile/balance",
-                    cookies=cookies,
                     headers=headers,
                 )
 
-                if resp.status_code in (401, 403):
-                    return EarningsResult(
-                        platform=self.platform,
-                        balance=0.0,
-                        error="Auth cookie expired — get a new 'auth' cookie from salad.com",
-                    )
+            resp = await self._retry(_fetch)
 
-                resp.raise_for_status()
-                data = resp.json()
-
-                balance = float(data.get("currentBalance", 0))
-
+            if resp.status_code in (401, 403):
                 return EarningsResult(
                     platform=self.platform,
-                    balance=round(balance, 4),
-                    currency="USD",
+                    balance=0.0,
+                    error="Auth cookie expired — get a new 'auth' cookie from salad.com",
+                    error_kind=base.KIND_AUTH,
                 )
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            raw = data.get("currentBalance")
+            if raw is None:
+                return EarningsResult(
+                    platform=self.platform,
+                    balance=0.0,
+                    error="currentBalance field missing — API shape may have changed",
+                    error_kind=base.KIND_SHAPE,
+                )
+            balance = float(raw)
+
+            return EarningsResult(
+                platform=self.platform,
+                balance=round(balance, 4),
+                currency="USD",
+            )
         except Exception as exc:
-            logger.error("Salad collection failed: %s", exc)
+            base.log_failure(logger, "Salad", exc)
             return EarningsResult(
                 platform=self.platform,
                 balance=0.0,
                 error=str(exc),
+                error_kind=base.classify_exception(exc),
             )

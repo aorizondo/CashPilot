@@ -23,8 +23,11 @@ const CP = (() => {
       const res = await fetch(path, config);
       const data = await res.json().catch(() => null);
       if (!res.ok) {
-        const msg = (data && data.detail) || `Error ${res.status}`;
-        throw new Error(msg);
+        // detail can be a structured refusal ({error, message, ...}); surface
+        // its message instead of the useless "[object Object]".
+        let detail = data && data.detail;
+        if (detail && typeof detail === 'object') detail = detail.message || JSON.stringify(detail);
+        throw new Error(detail || `Error ${res.status}`);
       }
       return data;
     } catch (err) {
@@ -67,9 +70,52 @@ const CP = (() => {
   }
 
   function escapeHtml(str) {
-    const d = document.createElement('div');
-    d.textContent = str;
-    return d.innerHTML;
+    // Escape quotes too (the textContent/innerHTML trick doesn't), so values
+    // interpolated into attributes like placeholder="..." can't break out.
+    return String(str ?? '')
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
+  }
+
+  function sanitizeHint(html) {
+    const el = document.createElement('div');
+    el.innerHTML = html;
+    const allowedSchemes = ['http:', 'https:', 'mailto:'];
+    el.querySelectorAll('*').forEach(node => {
+      if (!['A', 'B', 'CODE'].includes(node.tagName)) {
+        node.replaceWith(document.createTextNode(node.textContent));
+        return;
+      }
+      for (const attr of [...node.attributes]) {
+        if (node.tagName === 'A' && attr.name === 'href') {
+          const scheme = (attr.value || '').trim().toLowerCase();
+          if (!allowedSchemes.some(s => scheme.startsWith(s))) node.removeAttribute('href');
+          continue;
+        }
+        if (node.tagName === 'A' && attr.name === 'target') continue;
+        node.removeAttribute(attr.name);
+      }
+      // Anything opening a new tab gets rel="noopener noreferrer", set HERE
+      // rather than in the YAML.
+      //
+      // The loop above strips every attribute it does not explicitly keep, so a
+      // rel written into a service's credential_hint would be removed on its
+      // way to the DOM — the fix would look applied, pass review, and do
+      // nothing. Setting it after sanitising covers all 13 existing hints and
+      // every future one, and cannot be forgotten by whoever writes the next.
+      //
+      // Modern browsers imply noopener for target=_blank, so this is defence in
+      // depth rather than a live hole; noreferrer is the part still worth
+      // having, since these links point at a provider's dashboard and the
+      // referrer would name the user's CashPilot host.
+      if (node.tagName === 'A' && node.getAttribute('target')) {
+        node.setAttribute('rel', 'noopener noreferrer');
+      }
+    });
+    return el.innerHTML;
   }
 
   function capFirst(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ''; }
@@ -159,10 +205,41 @@ const CP = (() => {
     return map[locale] || map[locale.split('-')[0]] || 'USD';
   }
 
+  // Which sources are currently stale, and what that means for what is shown.
+  //
+  // exchange_rates.py keeps a separate clock per source, each advanced only on
+  // that source's own HTTP 200, and publishes crypto_stale / fiat_stale. No
+  // caller ever asked. So if CoinGecko stopped responding after one successful
+  // fetch, every token balance kept rendering at a price that could be hours or
+  // days old, and nothing on screen changed (CashPilot-dfw).
+  function staleRateNotice() {
+    const cryptoStale = _exchangeRates.crypto_stale === true;
+    // Fiat only matters when a conversion actually uses it — a viewer reading in
+    // USD is not affected by a stale USD->X table, and warning them would be the
+    // kind of noise that teaches people to ignore warnings.
+    const fiatStale = _exchangeRates.fiat_stale === true && _displayCurrency !== 'USD';
+    if (!cryptoStale && !fiatStale) return '';
+    const sources = [];
+    if (cryptoStale) sources.push('crypto prices');
+    if (fiatStale) sources.push(`${_displayCurrency} exchange rates`);
+    return `Using cached ${sources.join(' and ')} — the last refresh failed, so converted figures may be out of date.`;
+  }
+
+  function renderStaleRateNotice() {
+    const note = document.getElementById('rates-stale-note');
+    if (!note) return;
+    const message = staleRateNotice();
+    note.textContent = message;
+    note.style.display = message ? '' : 'none';
+  }
+
   async function loadExchangeRates() {
     try {
       _exchangeRates = await api('/api/exchange-rates');
-    } catch { /* keep defaults */ }
+    } catch (err) {
+      console.warn('Could not refresh exchange rates, keeping previous values:', err);
+    }
+    renderStaleRateNotice();
   }
 
   async function loadTopbarEarnings() {
@@ -170,8 +247,9 @@ const CP = (() => {
       await loadExchangeRates();
       const data = await api('/api/earnings/summary');
       setTextContent('topbar-total', formatCurrency(data.total || 0));
-    } catch {
-      setTextContent('topbar-total', formatCurrency(0));
+    } catch (err) {
+      // Keep whatever was already shown rather than fabricating $0.
+      console.warn('Could not refresh topbar earnings, keeping previous value:', err);
     }
   }
 
@@ -181,6 +259,7 @@ const CP = (() => {
       loadDashboardStats(),
       loadServicesTable(),
       loadEarningsChart('7'),
+      loadPayoutQueue(),
     ]);
 
     // Auto-refresh every hour
@@ -188,7 +267,243 @@ const CP = (() => {
     refreshTimer = setInterval(() => {
       loadDashboardStats();
       loadServicesTable();
+      loadPayoutQueue();
     }, 3600000);
+  }
+
+  // Payouts awaiting an answer.
+  //
+  // The backend has detected these for a while and had nowhere to ask: a
+  // balance drop was recorded as a PROBABLE payout, and without an answer it
+  // never counts toward lifetime earnings. So a real payout quietly looked like
+  // a loss, which is the opposite of what the feature is for.
+  async function loadPayoutQueue() {
+    const card = document.getElementById('payout-queue-card');
+    const list = document.getElementById('payout-queue-list');
+    if (!card || !list) return;
+
+    let pending;
+    try {
+      pending = (await api('/api/earnings/payouts')).probable || [];
+    } catch (err) {
+      // Unknown is not "nothing pending". Leave whatever is on screen rather
+      // than hiding a question the user still owes an answer to.
+      console.warn('Could not load pending payouts:', err);
+      return;
+    }
+
+    if (!pending.length) {
+      card.style.display = 'none';
+      list.innerHTML = '';
+      return;
+    }
+
+    card.style.display = '';
+    list.innerHTML = pending.map(p => {
+      // The NATIVE amount leads, because it is what the provider actually paid
+      // and it is what the user will see on the provider's own page when they
+      // go to check. Everywhere else on the dashboard the display currency is
+      // the right answer; here it is a converted approximation of a specific
+      // real transaction, so it is shown second and marked as approximate.
+      // A browser check caught this: a 24.90 USD payout rendered as "£18.55",
+      // which is not a figure the user can match against anything.
+      const nativeCurrency = p.currency || 'USD';
+      const native = `${Number(p.amount).toFixed(2)} ${nativeCurrency}`;
+      // Compare CURRENCY CODES, not the formatted strings. formatCurrency
+      // returns "$24.90" via Intl while `native` is "24.90 USD", so a string
+      // comparison finds them different for a USD payout on a USD dashboard
+      // and renders "24.90 USD (≈ $24.90)" — the duplication this is meant to
+      // suppress. The codes are the thing that actually decides whether a
+      // conversion happened.
+      const approx = effectiveDisplayCurrency(nativeCurrency) !== nativeCurrency
+        ? ` <span style="color:var(--text-muted);">(≈ ${escapeHtml(formatCurrency(p.amount, nativeCurrency))})</span>`
+        : '';
+      return `
+        <div class="payout-queue-item" data-payout-id="${escapeHtml(String(p.id))}">
+          <div class="payout-queue-body">
+            <div class="payout-queue-platform">${escapeHtml(p.platform || '')}</div>
+            <div class="payout-queue-detail">Balance dropped by ${escapeHtml(native)}${approx}${p.detected_at ? ` on ${escapeHtml(String(p.detected_at).slice(0, 10))}` : ''}</div>
+          </div>
+          <div class="payout-queue-actions">
+            ${_canWrite ? `
+            <button class="btn btn-primary btn-sm" data-action="confirmPayout" data-a1="${escapeHtml(String(p.id))}" data-a2="${escapeHtml(p.platform || '')}">Yes, I was paid</button>
+            <button class="btn btn-ghost btn-sm" data-action="rejectPayout" data-a1="${escapeHtml(String(p.id))}" data-a2="${escapeHtml(p.platform || '')}">No, not a payout</button>
+            ` : `<span style="font-size:0.72rem; color:var(--text-muted);">Writer access required to answer this.</span>`}
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  // How far off is the next payout for this one service.
+  //
+  // Three separate questions that used to be one number which went DOWN when
+  // the user got paid: what is sitting there now, what has this service earned
+  // in total, and when can it be cashed out. The backend already answers all
+  // three and states its own uncertainty precisely — "not enough history yet"
+  // and "this is not earning" are different problems with different fixes — so
+  // this renders that sentence rather than inventing a cheerier one.
+  async function loadPayoutProgress() {
+    const card = document.getElementById('payout-progress-card');
+    const body = document.getElementById('payout-progress-body');
+    if (!card || !body) return;
+    const slug = card.dataset.slug;
+    if (!slug) return;
+
+    let data;
+    try {
+      data = await api(`/api/services/${encodeURIComponent(slug)}/payout-progress`);
+    } catch (err) {
+      // Leave the card hidden rather than showing a fabricated zero.
+      console.warn('Could not load payout progress:', err);
+      return;
+    }
+
+    const projection = data.projection || {};
+    const balance = Number(data.current_balance || 0);
+
+    // The endpoint reports what is LEFT, not the target, so the target is
+    // derived. A service with no documented minimum omits `remaining`
+    // entirely — checked against payouts.project() rather than assumed — and
+    // that absence is what suppresses the bar. "No documented minimum" is not
+    // "0% of the way there", and a bar stuck at zero would say the wrong thing
+    // far more loudly than no bar at all.
+    let bar = '';
+    const remaining = projection.remaining;
+    if (typeof remaining === 'number') {
+      const threshold = balance + remaining;
+      const pct = threshold > 0 ? Math.max(0, Math.min(100, (balance / threshold) * 100)) : 100;
+      bar = `
+        <div class="payout-progress-track" role="img"
+             aria-label="${escapeHtml(pct.toFixed(0))}% of the ${escapeHtml(threshold.toFixed(2))} minimum">
+          <div class="payout-progress-fill" style="width:${pct.toFixed(1)}%;"></div>
+        </div>`;
+    }
+
+    // Everything in this card shares ONE unit, and it is the unit the balance is
+    // actually recorded in — deliberately not the dashboard's display currency.
+    // A browser check caught why: the balance rendered as "£3.73" directly above
+    // "to the 20 minimum", so the two halves of a single comparison were in
+    // different units and the progress bar agreed with neither.
+    //
+    // It used to be the CASHOUT currency from the catalog, which is right only
+    // while the collector reports that same unit. Storj records USD and declares
+    // its minimum in STORJ, so a $3.50 balance rendered as "3.50 STORJ" and
+    // counted down to a threshold in tokens. The endpoint now converts the
+    // minimum into the balance's unit and states what that unit is.
+    const unit = data.balance_currency || card.dataset.currency || '';
+    const money = value => (unit ? `${Number(value).toFixed(2)} ${unit}` : formatCurrency(value));
+
+    const paid = data.confirmed_payout_count || 0;
+
+    // Nothing read and nothing ever paid out: there is no progress to show.
+    //
+    // The card used to appear anyway, asserting a definite 0.00 lifetime and a
+    // 0%-of-minimum bar for a service CashPilot had never once looked at. It
+    // already got "Balance now" right (`balance_known`), which made the two
+    // fabricated figures beside it read as corroborated.
+    //
+    // Confirmed payouts alone are worth showing, so this hides the card only
+    // when BOTH are absent. Same defect filed three times: CashPilot-3oa
+    // (the API), -s2b (the lifetime figure), -jkd (the card and bar).
+    if (!data.balance_known && !paid) {
+      card.style.display = 'none';
+      return;
+    }
+    card.style.display = '';
+    body.innerHTML = `
+      <div class="detail-grid">
+        <div class="detail-item">
+          <div class="detail-label">Balance now</div>
+          <div class="detail-value">${data.balance_known ? escapeHtml(money(balance)) : '<span style="color:var(--text-muted);">not collected yet</span>'}</div>
+        </div>
+        <div class="detail-item">
+          <div class="detail-label">Earned in total</div>
+          <div class="detail-value">${data.balance_known || paid ? escapeHtml(money(data.lifetime_earned || 0)) : '<span style="color:var(--text-muted);">not collected yet</span>'}</div>
+          ${paid ? `<div style="font-size:0.7rem; color:var(--text-muted);">includes ${escapeHtml(String(paid))} confirmed payout${paid === 1 ? '' : 's'}</div>` : ''}
+        </div>
+      </div>
+      ${bar}
+      <p style="margin-top:12px; color:var(--text-secondary); font-size:0.85rem;">${escapeHtml(projection.summary || '')}</p>
+    `;
+  }
+
+  // What running this service actually does with the machine and connection.
+  //
+  // Two questions the deploy step never asked: whether strangers route traffic
+  // through the user's IP under their name, and whether the container can be
+  // kept off the home LAN. Both are answered by the backend already, and both
+  // are things a person deserves to know BEFORE they click deploy rather than
+  // after an ISP letter.
+  //
+  // "Nobody has documented this" is rendered as loudly as a known risk,
+  // because unknown is not safe — that distinction is the whole design of
+  // app/lan_isolation.py and dropping it here would undo it.
+  async function loadDeployRisk() {
+    const card = document.getElementById('deploy-risk-card');
+    const body = document.getElementById('deploy-risk-body');
+    if (!card || !body) return;
+    const slug = card.dataset.slug;
+    if (!slug) return;
+
+    let risk;
+    try {
+      risk = await api(`/api/services/${encodeURIComponent(slug)}/deploy-risk`);
+    } catch (err) {
+      console.warn('Could not load deploy risk:', err);
+      return;
+    }
+
+    const attribution = risk.attribution;
+    const isolation = risk.isolation || {};
+    if (!attribution && !isolation.summary) { card.style.display = 'none'; return; }
+
+    let html = '';
+    if (attribution) {
+      // documented === false means nobody checked, which is a different claim
+      // from "no risk" and is styled to say so rather than to reassure.
+      const tone = attribution.documented ? 'var(--warning)' : 'var(--text-muted)';
+      html += `
+        <div class="deploy-risk-block" style="border-left-color:${tone};">
+          <div class="deploy-risk-headline">${escapeHtml(attribution.headline || '')}</div>
+          <div class="deploy-risk-body-text">${escapeHtml(attribution.body || '')}</div>
+          ${attribution.lateral_note ? `<div class="deploy-risk-body-text">${escapeHtml(attribution.lateral_note)}</div>` : ''}
+          ${attribution.source ? `<div class="deploy-risk-source">Source: ${escapeHtml(attribution.source)}</div>` : ''}
+        </div>`;
+    }
+    if (isolation.summary) {
+      html += `
+        <div class="deploy-risk-block" style="border-left-color:var(--border-color);">
+          <div class="deploy-risk-headline">Keeping it off your LAN</div>
+          <div class="deploy-risk-body-text">${escapeHtml(isolation.summary)}</div>
+        </div>`;
+    }
+    card.style.display = '';
+    body.innerHTML = html;
+  }
+
+  async function confirmPayout(payoutId, platform) {
+    try {
+      await api(`/api/earnings/payouts/${encodeURIComponent(payoutId)}/confirm`, { method: 'POST' });
+      toast(`Recorded the ${platform || 'payout'} as paid.`, 'success');
+      // The totals move as a direct result, so refresh them alongside the queue
+      // rather than leaving the user to wonder whether it took effect.
+      await Promise.all([loadPayoutQueue(), loadDashboardStats(), loadCollectorAlerts()]);
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  }
+
+  async function rejectPayout(payoutId, platform) {
+    // Rejection DELETES the row, and there is no undo, so it asks first.
+    if (!window.confirm(`Discard the detected ${platform || ''} payout? This cannot be undone.`)) return;
+    try {
+      await api(`/api/earnings/payouts/${encodeURIComponent(payoutId)}/reject`, { method: 'POST' });
+      toast('Discarded — it will not count as earnings.', 'success');
+      await Promise.all([loadPayoutQueue(), loadCollectorAlerts()]);
+    } catch (err) {
+      toast(err.message, 'error');
+    }
   }
 
   async function loadDashboardStats() {
@@ -196,10 +511,22 @@ const CP = (() => {
       const data = await api('/api/earnings/summary');
       const totalBonus = data.total_bonus || 0;
       const displayTotal = totalBonus > 0 ? (data.total_adjusted || 0) : (data.total || 0);
-      setTextContent('total-earnings', formatCurrency(displayTotal));
-      setTextContent('today-earnings', formatCurrency(data.today || 0));
-      setTextContent('month-earnings', formatCurrency(data.month || 0));
-      setTextContent('active-services', data.active_services || 0);
+      // "Nothing has been read yet" and "we read it and it was zero" are
+      // different facts, and only one of them is a measurement. Rendering both
+      // as $0.00 told a brand-new user their balance was zero before anything
+      // had ever looked, and said exactly the same thing on an install whose
+      // collection had silently stopped.
+      const money = value => (data.has_readings === false ? '\u2014' : formatCurrency(value));
+      setTextContent('total-earnings', money(displayTotal));
+      setTextContent('today-earnings', money(data.today || 0));
+      setTextContent('month-earnings', money(data.month || 0));
+      // `|| 0` would render "could not be counted" as "nothing is running".
+      // The endpoint sends null when the count could not be taken
+      // (CashPilot-45k).
+      setTextContent('active-services', data.active_services == null ? '\u2014' : data.active_services);
+
+      const nothingYet = document.getElementById('no-readings-note');
+      if (nothingYet) nothingYet.style.display = data.has_readings === false ? '' : 'none';
 
       // Show promo offset footnote under total
       const bonusNote = document.getElementById('total-bonus-note');
@@ -213,7 +540,7 @@ const CP = (() => {
       }
 
       // Update topbar
-      setTextContent('topbar-total', formatCurrency(displayTotal));
+      setTextContent('topbar-total', money(displayTotal));
 
       // Change indicators
       if (data.today_change !== undefined) {
@@ -223,12 +550,9 @@ const CP = (() => {
         setChangeIndicator('month-change', data.month_change);
       }
     } catch (err) {
-      // API not yet implemented — fill with placeholder
-      setTextContent('total-earnings', formatCurrency(0));
-      setTextContent('today-earnings', formatCurrency(0));
-      setTextContent('month-earnings', formatCurrency(0));
-      setTextContent('active-services', '0');
-      setTextContent('topbar-total', formatCurrency(0));
+      // Keep whatever was already displayed — a transient fetch failure
+      // must not look like the dashboard's earnings dropped to zero.
+      toast(err.message || 'Could not refresh dashboard', 'error');
     }
   }
 
@@ -274,23 +598,200 @@ const CP = (() => {
           va = parseFloat(a.memory) || 0;
           vb = parseFloat(b.memory) || 0;
           break;
+        // Both sort UNKNOWN last in either direction rather than as zero.
+        // `parseFloat(x) || 0` — the idiom used above — would rank a host whose
+        // free space could not be read as the fullest disk on the fleet, which
+        // is the same "absent read as a definite value" this codebase keeps
+        // having to undo.
+        case 'disk':
+          va = sortableFreeBytes(a);
+          vb = sortableFreeBytes(b);
+          break;
+        case 'gpu':
+          va = sortableGpu(a);
+          vb = sortableGpu(b);
+          break;
         case 'payout': {
           const coA = a.cashout || {};
           const coB = b.cashout || {};
           const balA = (breakdownMap[a.slug] && breakdownMap[a.slug].balance) || a.balance || 0;
           const balB = (breakdownMap[b.slug] && breakdownMap[b.slug].balance) || b.balance || 0;
-          va = coA.min_amount > 0 ? (balA / coA.min_amount) : -1;
-          vb = coB.min_amount > 0 ? (balB / coB.min_amount) : -1;
+          // Sorting by "closest to payout" needs the same like-for-like ratio;
+          // otherwise a USD balance over a token minimum sorts nonsensically.
+          va = coA.min_amount_comparable > 0 ? (balA / coA.min_amount_comparable) : -1;
+          vb = coB.min_amount_comparable > 0 ? (balB / coB.min_amount_comparable) : -1;
           break;
         }
         default:
           va = 0; vb = 0;
       }
       if (_sortCol !== 'name') {
+        // Unknown sinks in BOTH directions. A sentinel number cannot do this:
+        // -Infinity sorts last descending but FIRST ascending, which would put
+        // every host whose free space could not be read at the top of "least
+        // free space" -- stating a failed reading as the worst case.
+        const aU = va === SORT_UNKNOWN;
+        const bU = vb === SORT_UNKNOWN;
+        if (aU || bU) return aU && bU ? 0 : (aU ? 1 : -1);
         return _sortAsc ? va - vb : vb - va;
       }
       return 0;
     });
+  }
+
+  // worker_id -> {disk, gpu} for the Disk and GPU columns, or null when the
+  // worker list could not be read at all.
+  let _hostResources = null;
+
+  // Sort keys. Unknown must not collapse into a number that sorts like a real
+  // reading, so both return this sentinel, which the comparator keeps at the
+  // bottom regardless of direction.
+  const SORT_UNKNOWN = Symbol('unknown');
+
+  function sortableFreeBytes(svc) {
+    const hosts = hostsFor(svc);
+    if (!hosts) return SORT_UNKNOWN;
+    const free = hosts
+      .filter(h => h.disk && typeof h.disk.free_bytes === 'number')
+      .map(h => h.disk.free_bytes);
+    return free.length ? Math.min(...free) : SORT_UNKNOWN;
+  }
+
+  // Ranked has-one > known-none > unknown, matching what the cell says.
+  function sortableGpu(svc) {
+    const hosts = hostsFor(svc);
+    if (!hosts) return SORT_UNKNOWN;
+    if (hosts.some(h => h.gpu && h.gpu.available === true)) return 2;
+    if (hosts.every(h => h.gpu && h.gpu.available === false)) return 1;
+    return SORT_UNKNOWN;
+  }
+
+  function buildHostResourceMap(workers) {
+    if (!Array.isArray(workers)) return null;
+    const map = {};
+    for (const w of workers) {
+      const info = w.system_info || {};
+      map[String(w.id)] = {
+        name: w.name || 'worker',
+        online: w.status === 'online',
+        // The Android client does not collect either of these. Telling its
+        // owner their worker "may predate the feature" would send them to
+        // upgrade something that was never going to report it -- verified
+        // against the live fleet, where the phone reports neither.
+        android: info.device_type === 'android',
+        disk: info.disk || null,
+        gpu: info.gpu || null,
+      };
+    }
+    return map;
+  }
+
+  function fmtBytes(n) {
+    if (typeof n !== 'number' || !isFinite(n) || n < 0) return null;
+    const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+    let i = 0;
+    let v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return `${v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)} ${units[i]}`;
+  }
+
+  // The hosts a service actually runs on. A service can span several workers,
+  // and the columns must describe THOSE hosts rather than the fleet.
+  function hostsFor(svc) {
+    if (!_hostResources) return null;
+    // `instance_details`, NOT `instances` — the latter is a COUNT, and
+    // `for...of` over a number throws, which would have taken the whole table
+    // down rather than degrading one column. Checked against app/main.py:1229
+    // instead of assumed from the name.
+    const ids = new Set();
+    for (const inst of (Array.isArray(svc.instance_details) ? svc.instance_details : [])) {
+      if (inst && inst.worker_id != null) ids.add(String(inst.worker_id));
+    }
+    if (svc.worker_id != null) ids.add(String(svc.worker_id));
+    const hosts = [...ids].map(id => _hostResources[id]).filter(Boolean);
+    return hosts.length ? hosts : null;
+  }
+
+  const UNKNOWN_CELL = (why) => `<span style="color:var(--text-muted);" title="${escapeHtml(why)}">&mdash;</span>`;
+
+  // Free space on the host filesystem, NOT the service's own volume.
+  //
+  // Storj is paid for what it stores, so free space is earning capacity — a
+  // node that quietly fills up stops growing. The column is labelled "Host
+  // disk" because those are two different numbers and showing one under the
+  // other's name would be worse than showing neither.
+  function diskCell(svc) {
+    return diskCellForHosts(hostsFor(svc));
+  }
+
+  // One instance's own host, so a sub-row is exact rather than an aggregate.
+  function hostForWorker(workerId) {
+    if (!_hostResources || workerId == null) return null;
+    const h = _hostResources[String(workerId)];
+    return h ? [h] : null;
+  }
+
+  function diskCellForHosts(hosts) {
+    if (!_hostResources) return UNKNOWN_CELL('CashPilot could not read the worker list, so it does not know this host');
+    if (!hosts) return UNKNOWN_CELL('CashPilot does not know which host runs this service');
+    const known = hosts.filter(h => h.disk && typeof h.disk.free_bytes === 'number' && h.disk.total_bytes > 0);
+    if (!known.length) {
+      if (hosts.every(h => h.android)) {
+        return UNKNOWN_CELL('The Android client does not report host disk usage');
+      }
+      const offline = hosts.every(h => !h.online);
+      return UNKNOWN_CELL(offline
+        ? 'This host is not reporting right now, so its free space is unknown'
+        : 'This worker did not report disk usage; it may predate the feature');
+    }
+    // The tightest host is the one that decides whether the service can keep
+    // growing, so a fleet-wide average would hide exactly the case that matters.
+    const tightest = known.reduce((a, b) => (a.disk.free_bytes <= b.disk.free_bytes ? a : b));
+    const free = tightest.disk.free_bytes;
+    const total = tightest.disk.total_bytes;
+    const usedPct = Math.round(((total - free) / total) * 100);
+    const unreported = hosts.length - known.length;
+    const detail = [
+      `${tightest.name}: ${fmtBytes(free)} free of ${fmtBytes(total)} (${usedPct}% used)`,
+      `Free space on the host filesystem, not this service's own volume.`,
+      known.length > 1 ? `Showing the tightest of ${known.length} hosts running this service.` : '',
+      unreported > 0 ? `${unreported} host${unreported > 1 ? 's' : ''} did not report.` : '',
+    ].filter(Boolean).join(' ');
+    const warn = usedPct >= 90 ? ' style="color:var(--danger);"' : usedPct >= 80 ? ' style="color:var(--warning);"' : '';
+    return `<span${warn} title="${escapeHtml(detail)}">${fmtBytes(free)}</span>`;
+  }
+
+  // Three-valued on purpose. `available: false` is a real "this host has no
+  // GPU"; `null` is "could not tell" — which is what a containerised worker
+  // reports when the device was never passed through. Rendering the second as
+  // the first would state as fact that a machine has no GPU when it has three
+  // idle render nodes, which is precisely how the fleet looked.
+  function gpuCell(svc) {
+    return gpuCellForHosts(hostsFor(svc));
+  }
+
+  function gpuCellForHosts(hosts) {
+    if (!_hostResources) return UNKNOWN_CELL('CashPilot could not read the worker list, so it does not know this host');
+    if (!hosts) return UNKNOWN_CELL('CashPilot does not know which host runs this service');
+    const withGpu = hosts.filter(h => h.gpu && h.gpu.available === true);
+    if (withGpu.length) {
+      const devices = withGpu.flatMap(h => h.gpu.devices || []);
+      const label = devices.length ? devices[0] : 'Yes';
+      const detail = withGpu.map(h => `${h.name}: ${(h.gpu.devices || ['present']).join(', ')}`).join(' | ');
+      const more = devices.length > 1 ? ` +${devices.length - 1}` : '';
+      return `<span title="${escapeHtml(detail)}">${escapeHtml(String(label))}${more}</span>`;
+    }
+    // No host says yes. Only call it "None" when every host actually SAID no.
+    if (hosts.every(h => h.gpu && h.gpu.available === false)) {
+      return `<span style="color:var(--text-muted);" title="No GPU is visible on the host${hosts.length > 1 ? 's' : ''} running this service">None</span>`;
+    }
+    if (hosts.every(h => h.android)) {
+      return UNKNOWN_CELL('The Android client does not report GPU information');
+    }
+    const reason = hosts.map(h => h.gpu && h.gpu.reason).find(Boolean);
+    return UNKNOWN_CELL(reason
+      ? `Unknown — ${reason}`
+      : 'This worker did not report GPU information; it may predate the feature');
   }
 
   async function loadServicesTable() {
@@ -303,17 +804,51 @@ const CP = (() => {
     }
 
     try {
-      const [services, breakdown] = await Promise.all([
+      // Workers are fetched for the Disk and GPU columns. Both are facts about
+      // the HOST a service runs on, not about the container, so they can only
+      // come from the worker that reported them — which is what makes them work
+      // for a remote host exactly as they do for the local one.
+      //
+      // .catch(() => null) rather than `[]`: an empty list would mean "no
+      // workers", and the columns would render a confident em-dash for every
+      // row. null means the lookup itself failed, which is a different answer
+      // and gets a different tooltip.
+      const [services, breakdown, workers] = await Promise.all([
         api('/api/services/deployed'),
         api('/api/earnings/breakdown').catch(() => []),
+        api('/api/workers').catch(() => null),
       ]);
+      _hostResources = buildHostResourceMap(workers);
 
       if (!services || services.length === 0) {
-        container.innerHTML = `
+        // An empty list means one of two very different things, and saying the
+        // wrong one is worse than saying nothing.
+        //
+        // /api/services/deployed is built only from ONLINE workers, so three
+        // minutes after a host stops heartbeating — a reboot, a network blip, a
+        // worker container restart — the table emptied and the dashboard stated
+        // as fact that the user had no services and should start over. The
+        // containers were still running and still earning.
+        let unreachable = 0;
+        try {
+          const workers = await api('/api/workers');
+          unreachable = (workers || []).filter(w => w.status !== 'online').length;
+        } catch (err) {
+          // Cannot tell which case this is; say so rather than guess.
+          unreachable = -1;
+        }
+        container.innerHTML = unreachable === 0
+          ? `
           <div class="empty-state" style="padding:32px 0; text-align:center;">
             <div class="empty-state-title">No services deployed yet</div>
             <div class="empty-state-text">Get started by deploying your first passive income service.</div>
             <a href="/setup" class="btn btn-primary" style="margin-top:12px;">Setup Wizard</a>
+          </div>`
+          : `
+          <div class="empty-state" style="padding:32px 0; text-align:center;">
+            <div class="empty-state-title">Can't reach ${unreachable > 0 ? escapeHtml(String(unreachable)) + ' worker' + (unreachable === 1 ? '' : 's') : 'the workers'}</div>
+            <div class="empty-state-text">Services running on ${unreachable === 1 ? 'it' : 'them'} are not shown here — this does not mean they stopped. Containers keep running and earning while a worker is offline.</div>
+            <a href="/fleet" class="btn btn-ghost" style="margin-top:12px;">Check the fleet</a>
           </div>`;
         return;
       }
@@ -355,6 +890,8 @@ const CP = (() => {
               ${sortTh('change', 'Change', 'right')}
               ${sortTh('cpu', 'CPU', 'right')}
               ${sortTh('memory', 'Memory', 'right')}
+              ${sortTh('disk', 'Host disk', 'right')}
+              ${sortTh('gpu', 'GPU', 'center')}
               ${sortTh('payout', 'Payout', 'center')}
               <th style="text-align:center;">Actions</th>
             </tr>
@@ -385,11 +922,85 @@ const CP = (() => {
         }
       });
     } catch (err) {
-      // Keep existing table if we had one; only show spinner on truly empty state
+      // Keep the existing table on a refresh failure. Only replace the
+      // perpetual "Loading..." spinner with a clear error + retry affordance
+      // when there was nothing on screen yet.
       if (!container.querySelector('.breakdown-table')) {
-        container.innerHTML = `<div style="display:flex; align-items:center; justify-content:center; gap:8px; padding:24px 0; color:var(--text-muted);"><div class="spinner"></div> Loading services...</div>`;
+        container.innerHTML = `
+          <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; padding:24px 0; color:var(--text-muted); text-align:center;">
+            <span>Couldn't load services${err && err.message ? `: ${escapeHtml(err.message)}` : ''}.</span>
+            <button class="btn btn-ghost btn-sm" data-action="loadServicesTable">Retry</button>
+          </div>`;
       }
     }
+  }
+
+  // Action-button icons, extracted so the single-instance row and the per-node sub-row
+  // share one copy each (cyc componentization). Byte-identical to the inline SVGs replaced.
+  const ICON_RESTART = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>';
+  const ICON_STOP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>';
+  const ICON_LOGS = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>';
+
+  // -------------------------------------------------------------------------
+  // Shared fragment builders (CashPilot-cyc)
+  //
+  // These markup blocks were written out three and two times respectively, and
+  // had already drifted: one env-input copy omitted the label's `for` and the
+  // hint, and the two worker lists differed only in a class name. Duplicated
+  // markup does not stay identical — it stays ALMOST identical, which is worse,
+  // because a fix applied to one copy silently misses the others.
+  // -------------------------------------------------------------------------
+
+  function envInputFields(svc, envs, { withId = true, withHint = true } = {}) {
+    return (envs || []).map((env) => {
+      const inputType = env.secret ? 'password' : 'text';
+      const id = withId ? `env-${svc.slug}-${env.key}` : '';
+      const label = withId
+        ? `<label class="form-label" for="${id}">${escapeHtml(env.label)}</label>`
+        : `<label class="form-label">${escapeHtml(env.label)}</label>`;
+      const hint = withHint && env.description
+        ? `<div class="form-hint">${escapeHtml(env.description)}</div>`
+        : '';
+      // A default containing {hostname} is a TEMPLATE, not a value. Prefilling
+      // it put the literal text in the box, and the browser posted it straight
+      // back as a user override — which outranks the default the server would
+      // have substituted. Showing it as the placeholder keeps the hint visible
+      // while leaving the field genuinely empty, so the server fills it in per
+      // worker and each host registers under its own name.
+      const defaultIsTemplate = String(env.default || '').includes('{hostname}');
+      return `
+      <div class="form-group">
+        ${label}
+        <input class="form-input" type="${inputType}"${withId ? ` id="${id}"` : ''}
+               data-slug="${svc.slug}" data-key="${env.key}"
+               placeholder="${escapeHtml(defaultIsTemplate ? String(env.default) : (env.description || ''))}"
+               value="${escapeHtml(defaultIsTemplate ? '' : (env.default || ''))}"
+               ${env.required ? 'required' : ''}>
+        ${hint}
+      </div>`;
+    }).join('');
+  }
+
+  // The class is a parameter rather than unified, deliberately: the setup wizard
+  // and the detail view can both be in the DOM at once, and their deploy
+  // handlers select by class. One shared class would make each pick up the
+  // other's checkboxes.
+  function workerCheckboxList(svc, onlineWorkers, checkboxClass) {
+    let rows = '';
+    let allDeployed = true;
+    for (const w of onlineWorkers) {
+      const deployed = (w.containers || []).map((c) => c.slug).includes(svc.slug);
+      if (!deployed) allDeployed = false;
+      rows += `
+      <label style="display:flex; align-items:center; gap:8px; padding:6px 0; ${deployed ? 'opacity:0.5;' : ''}">
+        <input type="checkbox" class="${checkboxClass}" data-slug="${svc.slug}" data-wid="${w.id}" ${deployed ? 'disabled checked' : ''}>
+        <span>${escapeHtml(w.name)}</span>
+        ${deployed
+          ? '<span class="badge badge-deployed" style="font-size:0.75rem;">Deployed</span>'
+          : '<span class="badge badge-available" style="font-size:0.75rem;">Available</span>'}
+      </label>`;
+    }
+    return { rows, allDeployed };
   }
 
   function renderServiceRow(svc, bk) {
@@ -418,12 +1029,23 @@ const CP = (() => {
     let healthBadge = '<span style="color:var(--text-muted);">--</span>';
     if (!isExternal && svc.health_score !== null && svc.health_score !== undefined) {
       const score = svc.health_score;
-      const hClass = score >= 80 ? 'badge-running' : score >= 50 ? 'badge-error' : 'badge-stopped';
-      healthBadge = `<span class="badge ${hClass}" title="Health ${score}/100">${score}</span>`;
+      const crashes = svc.crashes_7d || 0;
+      const restarts = svc.restarts_7d || 0;
+      const unstable = svc.unstable === true;
+      // Unstable (repeated crashes in the 7-day window) takes the worst tone + an explicit
+      // label so a crash-looping service is legible at a glance, not just via a low number.
+      const hClass = (unstable || score < 50) ? 'badge-stopped' : score >= 80 ? 'badge-running' : 'badge-error';
+      const uptime = (svc.uptime_pct !== null && svc.uptime_pct !== undefined) ? `${svc.uptime_pct}% uptime · ` : '';
+      const title = `Health ${score}/100 · ${uptime}${restarts} restarts · ${crashes} crashes (7d)`;
+      const label = unstable ? `unstable · ${crashes} crashes` : String(score);
+      healthBadge = `<span class="badge ${hClass}" title="${title}">${label}</span>`;
     }
 
     // Balance + delta from breakdown
-    const balance = (bk && bk.balance) || svc.balance || 0;
+    // `|| 0` would defeat the whole fix: it coerces a null balance — which now
+    // explicitly means "never read" — straight back into a confident zero.
+    const balanceKnown = (bk ? bk.balance != null : null) ?? svc.balance_known ?? (svc.balance != null);
+    const balance = (bk && bk.balance != null ? bk.balance : svc.balance) ?? 0;
     const signupBonus = (bk && bk.signup_bonus) || 0;
     const balanceAdj = signupBonus > 0 ? ((bk && bk.balance_adjusted) ?? Math.max(0, balance - signupBonus)) : balance;
     const currency = (bk && bk.currency) || svc.currency || 'USD';
@@ -436,11 +1058,28 @@ const CP = (() => {
     const bonusLabel = signupBonus > 0
       ? `<div style="font-size:0.6rem; color:var(--text-muted);">\u2212${formatCurrency(signupBonus, currency)} promo</div>`
       : '';
-    const disconnectedLabel = svc.collector_disconnected
-      ? `<div style="font-size:0.6rem; color:#ef4444; font-weight:500; display:flex; align-items:center; justify-content:flex-end; gap:4px;">disconnected${_isOwner ? ` <button class="btn btn-ghost" onclick="event.stopPropagation(); CP.openCredentialModal('${escapeHtml(svc.slug)}')" style="font-size:0.6rem; padding:1px 5px; line-height:1.2; color:#ef4444; border:1px solid #ef4444; border-radius:3px; cursor:pointer;">update</button>` : ''}</div>`
+    // Image drift: the running container no longer matches the catalog image
+    // (provider migrated or re-pinned). Prompt a re-deploy — otherwise a retired
+    // image keeps looking healthy while it silently stops earning.
+    const outdatedBadge = svc.image_outdated === true
+      ? ` <span class="badge badge-stopped" title="This service is running an image that no longer matches the catalog (the provider changed or re-pinned it). Re-deploy it from the catalog to update.">update available</span>`
       : '';
+
+    // Earnings-collector state. "disconnected" = collector ran and failed
+    // (e.g. wrong credentials). "needs setup" = the service is deployed and
+    // earning, but its (separate) earnings-tracking credentials aren't set yet.
+    let disconnectedLabel = '';
+    if (svc.collector_disconnected) {
+      disconnectedLabel = `<div title="CashPilot couldn't read this balance — check the earnings-tracking credentials" style="font-size:0.6rem; color:var(--error); font-weight:500; display:flex; align-items:center; justify-content:flex-end; gap:4px;">can't read balance${_isOwner ? ` <button class="btn btn-ghost" data-action="openCredentialModal" data-stop="1" data-a1="${escapeHtml(svc.slug)}" style="font-size:0.6rem; padding:1px 5px; line-height:1.2; color:var(--error); border:1px solid #ef4444; border-radius:3px; cursor:pointer;">fix</button>` : ''}</div>`;
+    } else if (svc.collector_needs_setup) {
+      disconnectedLabel = `<div title="This service is running and earning. To show its balance here, add its earnings-tracking credentials." style="font-size:0.6rem; color:var(--text-muted); font-weight:500; display:flex; align-items:center; justify-content:flex-end; gap:4px;">tracking not set up${_isOwner ? ` <button class="btn btn-ghost" data-action="openCredentialModal" data-stop="1" data-a1="${escapeHtml(svc.slug)}" style="font-size:0.6rem; padding:1px 5px; line-height:1.2; color:var(--text-muted); border:1px solid var(--border); border-radius:3px; cursor:pointer;">set up</button>` : ''}</div>`;
+    }
     let balanceHtml;
-    if (nativeLabel) {
+    if (!balanceKnown) {
+      // Never read. An em dash, not a number — the user must be able to tell
+      // "nothing has looked at this" from "this earned nothing".
+      balanceHtml = `<span style="color:var(--text-muted);" title="CashPilot has not read a balance for this service yet">&mdash;</span>${disconnectedLabel}`;
+    } else if (nativeLabel) {
       balanceHtml = `${formatCurrency(displayBalance, currency)}<div style="font-size:0.65rem;color:var(--text-muted);">${nativeLabel}</div>${bonusLabel}${disconnectedLabel}`;
     } else {
       balanceHtml = `${formatCurrency(displayBalance, currency)}${bonusLabel}${disconnectedLabel}`;
@@ -451,23 +1090,49 @@ const CP = (() => {
     if (isExternal) {
       cpuStr = '--';
       memStr = '--';
+    } else if (svc.cpu == null || svc.memory == null) {
+      // Nothing could be measured: every instance's Docker stats call failed.
+      // `|| '0'` used to render that as a confident 0%, which reads as idle for
+      // a container that may be working hard (CashPilot-zdi).
+      const why = 'Docker could not report stats for this service';
+      cpuStr = `<span title="${why}">—</span>`;
+      memStr = `<span title="${why}">—</span>`;
     } else if (isMulti && instances > 0) {
-      const avgCpu = (parseFloat(svc.cpu) / instances).toFixed(2);
-      const totalMem = parseFloat(svc.memory);
-      const avgMem = (totalMem / instances).toFixed(1);
-      cpuStr = `<span title="Average across ${instances} instances">~${avgCpu}%</span>`;
-      memStr = `<span title="Average across ${instances} instances">~${avgMem} MB</span>`;
+      // Averaged over the instances that WERE measured. Dividing by the full
+      // instance count when some failed would drag the average toward zero for
+      // the same reason.
+      const measured = Math.max(1, instances - (svc.stats_unknown || 0));
+      const avgCpu = (parseFloat(svc.cpu) / measured).toFixed(2);
+      const avgMem = (parseFloat(svc.memory) / measured).toFixed(1);
+      const note = (svc.stats_unknown || 0) > 0
+        ? ` (${svc.stats_unknown} instance${svc.stats_unknown > 1 ? 's' : ''} could not be measured)`
+        : '';
+      cpuStr = `<span title="Average across ${measured} instance${measured > 1 ? 's' : ''}${note}">~${avgCpu}%</span>`;
+      memStr = `<span title="Average across ${measured} instance${measured > 1 ? 's' : ''}${note}">~${avgMem} MB</span>`;
     } else {
-      cpuStr = `${svc.cpu || '0'}%`;
-      memStr = svc.memory || '0 MB';
+      cpuStr = `${svc.cpu}%`;
+      memStr = svc.memory;
     }
 
     // Payout progress
     const co = svc.cashout || {};
-    const minAmount = co.min_amount || 0;
-    const eligible = balance > 0 && balance >= minAmount;
-    const pctToMin = minAmount > 0 ? Math.min(100, (balance / minAmount) * 100) : 0;
-    const progressBar = minAmount > 0 ? `
+    // The minimum in the SAME unit as the balance beside it. co.min_amount is
+    // whatever the provider declared — STORJ for a Storj balance recorded in USD
+    // — so comparing against it directly rated a $3.50 balance as 87% of the way
+    // to "4", and the tooltip printed 4 STORJ as "$4.00". null means the two
+    // units cannot be reconciled right now, and no bar is better than a wrong one.
+    // `?? 0` here would defeat the endpoint's own three-valued answer: null
+    // means the threshold could not be brought into the balance's unit, and
+    // coercing it to zero rates EVERY positive balance as eligible — the exact
+    // "unknown read as a definite yes" this whole change exists to remove.
+    const minAmount = co.min_amount_comparable;
+    const comparable = typeof minAmount === 'number';
+    // Eligibility is the endpoint's to decide; it is the only side that knows
+    // whether a rate was available. Recomputing it here is what let the two
+    // disagree.
+    const eligible = co.eligible === true;
+    const pctToMin = comparable && minAmount > 0 ? Math.min(100, (balance / minAmount) * 100) : 0;
+    const progressBar = comparable && minAmount > 0 ? `
       <div class="payout-progress" title="${formatCurrency(balance, currency)} / ${formatCurrency(minAmount, currency)}" style="min-width:60px;">
         <div class="payout-progress-bar ${eligible ? 'eligible' : ''}" style="width:${pctToMin.toFixed(0)}%"></div>
       </div>
@@ -479,7 +1144,7 @@ const CP = (() => {
       ? (eligible ? 'Cash out earnings' : 'View payout details')
       : 'No payout info available';
     const claimDisabled = !co.dashboard_url;
-    const claimBtn = `<button class="btn btn-icon ${eligible ? 'btn-success' : ''}" onclick="${claimDisabled ? '' : `CP.openClaimModal('${svc.slug}')`}" title="${claimTitle}"${claimDisabled ? ' disabled' : ''}>
+    const claimBtn = `<button class="btn btn-icon ${eligible ? 'btn-success' : ''}" data-action="openClaimModal" data-a1="${escapeHtml(svc.slug)}" title="${claimTitle}"${claimDisabled ? ' disabled' : ''}>
            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/></svg>
          </button>`;
 
@@ -488,9 +1153,14 @@ const CP = (() => {
       ? ` <span class="badge badge-instances" title="${instances} instance${instances > 1 ? 's' : ''}">${instances}x</span>`
       : '';
 
+    // Say why the buttons are dead rather than leaving the user to click one.
+    const unmanagedLabel = svc.unmanaged
+      ? ` <span class="badge badge-category" title="This container was started outside CashPilot, so CashPilot cannot stop, restart or read the logs of it.">Unmanaged</span>`
+      : '';
+
     // Settings gear (owner-only) — opens credential + bonus modal
     const settingsBtn = _isOwner
-      ? `<button class="btn btn-icon" onclick="event.stopPropagation(); CP.openCredentialModal('${escapeHtml(svc.slug)}')" title="Credentials &amp; settings">
+      ? `<button class="btn btn-icon" data-action="openCredentialModal" data-stop="1" data-a1="${escapeHtml(svc.slug)}" title="Credentials &amp; settings">
            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
          </button>` : '';
 
@@ -498,7 +1168,7 @@ const CP = (() => {
     // For single instance: show action buttons directly
     let actionBtns;
     if (isMulti) {
-      const chevron = `<button class="btn btn-icon expand-toggle" onclick="event.stopPropagation(); CP.toggleInstances('${svc.slug}')" title="Expand instances">
+      const chevron = `<button class="btn btn-icon expand-toggle" data-action="toggleInstances" data-stop="1" data-a1="${escapeHtml(svc.slug)}" title="Expand instances">
         <svg class="expand-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
       </button>`;
       actionBtns = `<div class="action-btns">${claimBtn}${settingsBtn}${chevron}</div>`;
@@ -509,33 +1179,43 @@ const CP = (() => {
       const inst = details[0] || {};
       const wParam = inst.worker_id != null ? `', ${inst.worker_id}` : `'`;
       const noDocker = !inst.has_docker || inst.is_android;
-      const disabledAttr = noDocker ? ' disabled title="No Docker access"' : '';
+      // Started outside CashPilot — matched by IMAGE, not by a CashPilot label,
+      // so every container command targets a name that does not exist and
+      // answers "404 Container not found" for a row this same screen calls
+      // Running. Offering the button at all is the bug; the disabled title says
+      // why rather than leaving it looking broken.
+      const unmanaged = inst.unmanaged || svc.unmanaged;
+      const disabledAttr = unmanaged
+        ? ' disabled title="Started outside CashPilot — manage it where you started it"'
+        : (noDocker ? ' disabled title="No Docker access"' : '');
       actionBtns = `<div class="action-btns">
           ${claimBtn}
           ${settingsBtn}
           ${_canWrite ? `
-          <button class="btn btn-icon" onclick="CP.restartService('${svc.slug}${wParam})" title="Restart"${disabledAttr}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+          <button class="btn btn-icon" data-action="restartService" data-a1="'${escapeHtml(svc.slug)}${wParam}" title="Restart"${disabledAttr}>
+            ${ICON_RESTART}
           </button>
-          <button class="btn btn-icon" onclick="CP.stopService('${svc.slug}${wParam})" title="Stop"${disabledAttr}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+          <button class="btn btn-icon" data-action="stopService" data-a1="'${escapeHtml(svc.slug)}${wParam}" title="Stop"${disabledAttr}>
+            ${ICON_STOP}
           </button>
-          <button class="btn btn-icon" onclick="CP.viewLogs('${svc.slug}${wParam})" title="Logs"${disabledAttr}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+          <button class="btn btn-icon" data-action="viewLogs" data-a1="'${escapeHtml(svc.slug)}${wParam}" title="Logs"${disabledAttr}>
+            ${ICON_LOGS}
           </button>` : ''}
         </div>`;
     }
 
     // Main row
     let html = `
-    <tr class="breakdown-row${isMulti ? ' expandable' : ''}" data-slug="${escapeHtml(svc.slug)}"${isMulti ? ` onclick="CP.toggleInstances('${escapeHtml(svc.slug)}', event)" style="cursor:pointer;"` : ''}>
+    <tr class="breakdown-row${isMulti ? ' expandable' : ''}" data-slug="${escapeHtml(svc.slug)}"${isMulti ? ` data-action="toggleInstances" data-a1="${escapeHtml(svc.slug)}" data-a2="event" style="cursor:pointer;"` : ''}>
       <td>${nameHtml}<div style="font-size:0.7rem; color:var(--text-muted);">${subtitle}</div></td>
-      <td style="text-align:center;"><span class="badge badge-${statusClass}"><span class="status-dot ${statusClass}"></span> ${statusLabel}</span>${instanceLabel}</td>
+      <td style="text-align:center;"><span class="badge badge-${statusClass}"><span class="status-dot ${statusClass}"></span> ${statusLabel}</span>${instanceLabel}${unmanagedLabel}${outdatedBadge}</td>
       <td style="text-align:center;">${healthBadge}</td>
       <td style="text-align:right; font-weight:600;">${balanceHtml}</td>
       <td style="text-align:right;"><span class="stat-change ${deltaClass}">${deltaStr}</span></td>
       <td style="text-align:right;">${cpuStr}</td>
       <td style="text-align:right;">${memStr}</td>
+      <td style="text-align:right;">${diskCell(svc)}</td>
+      <td style="text-align:center;">${gpuCell(svc)}</td>
       <td style="text-align:center;">${progressBar}</td>
       <td style="text-align:center; white-space:nowrap;">${actionBtns}</td>
     </tr>`;
@@ -548,10 +1228,27 @@ const CP = (() => {
         const nodeLabel = inst.node === 'local' ? 'Local' : escapeHtml(inst.node);
         const wParam = inst.worker_id != null ? `', ${inst.worker_id}` : `'`;
         const iNoDocker = !inst.has_docker || inst.is_android;
-        const disabledAttr = iNoDocker ? ' disabled title="No Docker access"' : '';
+        // The mixed case this whole change is built around. The ROW keeps its
+        // buttons because a managed instance can still be controlled — but the
+        // external instance in that same row cannot, and its sub-row was still
+        // offering Restart/Stop/Logs that answer 404. The per-instance flag has
+        // to be READ here; marking it in the payload and ignoring it at the one
+        // place a mixed service is drawn left the bug exactly where it was.
+        // (CodeRabbit, PR #212.)
+        const iUnmanaged = inst.unmanaged || svc.unmanaged;
+        const disabledAttr = iUnmanaged
+          ? ' disabled title="Started outside CashPilot — manage it where you started it"'
+          : (iNoDocker ? ' disabled title="No Docker access"' : '');
         const subLabel = inst.is_android ? '' : escapeHtml(inst.container_name);
-        const cpuCell = inst.is_android ? `↑ ${fmtNetBytes(inst.net_tx_24h)}` : `${inst.cpu || '0'}%`;
-        const memCell = inst.is_android ? `↓ ${fmtNetBytes(inst.net_rx_24h)}` : (inst.memory || '0 MB');
+        // `|| '0'` would render an unmeasurable container as a confident 0%.
+        // The endpoint sends null when the Docker stats call failed, and an em
+        // dash is the only honest rendering of that (CashPilot-zdi).
+        const cpuCell = inst.is_android
+          ? `↑ ${fmtNetBytes(inst.net_tx_24h)}`
+          : (inst.cpu == null ? '<span title="Docker could not report this container\'s stats">—</span>' : `${inst.cpu}%`);
+        const memCell = inst.is_android
+          ? `↓ ${fmtNetBytes(inst.net_rx_24h)}`
+          : (inst.memory == null ? '<span title="Docker could not report this container\'s stats">—</span>' : inst.memory);
         html += `
         <tr class="instance-row" data-parent="${escapeHtml(svc.slug)}" style="display:none;">
           <td style="padding-left:28px;">
@@ -564,18 +1261,20 @@ const CP = (() => {
           <td></td>
           <td style="text-align:right;">${cpuCell}</td>
           <td style="text-align:right;">${memCell}</td>
+          <td style="text-align:right;">${diskCellForHosts(hostForWorker(inst.worker_id))}</td>
+          <td style="text-align:center;">${gpuCellForHosts(hostForWorker(inst.worker_id))}</td>
           <td></td>
           <td style="text-align:center; white-space:nowrap;">
             <div class="action-btns">
               ${_canWrite ? `
-              <button class="btn btn-icon" onclick="CP.restartService('${svc.slug}${wParam})" title="Restart on ${nodeLabel}"${disabledAttr}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+              <button class="btn btn-icon" data-action="restartService" data-a1="'${escapeHtml(svc.slug)}${wParam}" title="Restart on ${nodeLabel}"${disabledAttr}>
+                ${ICON_RESTART}
               </button>
-              <button class="btn btn-icon" onclick="CP.stopService('${svc.slug}${wParam})" title="Stop on ${nodeLabel}"${disabledAttr}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+              <button class="btn btn-icon" data-action="stopService" data-a1="'${escapeHtml(svc.slug)}${wParam}" title="Stop on ${nodeLabel}"${disabledAttr}>
+                ${ICON_STOP}
               </button>
-              <button class="btn btn-icon" onclick="CP.viewLogs('${svc.slug}${wParam})" title="Logs on ${nodeLabel}"${disabledAttr}>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+              <button class="btn btn-icon" data-action="viewLogs" data-a1="'${escapeHtml(svc.slug)}${wParam}" title="Logs on ${nodeLabel}"${disabledAttr}>
+                ${ICON_LOGS}
               </button>` : ''}
             </div>
           </td>
@@ -631,15 +1330,31 @@ const CP = (() => {
       labels = data.map(d => d.date);
       values = data.map(d => d.amount);
     } catch (err) {
-      // Generate placeholder data
-      const now = new Date();
-      const count = parseInt(days) || 7;
-      for (let i = count - 1; i >= 0; i--) {
-        const d = new Date(now);
-        d.setDate(d.getDate() - i);
-        labels.push(d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }));
-        values.push(0);
+      // A failed fetch is NOT a month of zero earnings.
+      //
+      // This used to fabricate one bar per day at exactly 0.00, drawn with the
+      // same axis and tooltips as real money. The user read "I earned nothing
+      // every day for the last month" when the truth was that the browser could
+      // not reach the server. Of every place in this app that could turn
+      // unknown into a number, this was the loudest: a full-width chart of
+      // confident zeros.
+      //
+      // Leave whatever is on screen alone if a chart already exists — stale
+      // real data beats invented data — and say so plainly when there is not.
+      console.warn('Could not load earnings for the chart:', err);
+      if (!earningsChart && ctx) {
+        const holder = ctx.parentElement;
+        if (holder) {
+          holder.innerHTML =
+            '<div class="empty-state" style="padding:32px 0;">'
+            + '<div class="empty-state-text">Could not load earnings. This is not a reading of zero — '
+            + 'the figures could not be fetched.</div>'
+            + '<button class="btn btn-ghost btn-sm" data-action="loadEarningsChart" data-a1="'
+            + escapeHtml(String(days)) + '" style="margin-top:10px;">Retry</button>'
+            + '</div>';
+        }
       }
+      return;
     }
 
     if (earningsChart) {
@@ -649,6 +1364,14 @@ const CP = (() => {
       return;
     }
 
+    const cs = getComputedStyle(document.documentElement);
+    const textMuted = cs.getPropertyValue('--text-muted').trim();
+    const textPrimary = cs.getPropertyValue('--text-primary').trim();
+    const textSecondary = cs.getPropertyValue('--text-secondary').trim();
+    const bgSecondary = cs.getPropertyValue('--bg-secondary').trim();
+    const borderColor = cs.getPropertyValue('--border-color').trim();
+    const accent = cs.getPropertyValue('--accent').trim();
+
     earningsChart = new Chart(ctx, {
       type: 'bar',
       data: {
@@ -656,11 +1379,11 @@ const CP = (() => {
         datasets: [{
           label: 'Daily Earnings',
           data: values,
-          backgroundColor: 'rgba(244, 63, 94, 0.4)',
-          borderColor: 'rgba(244, 63, 94, 0.9)',
+          backgroundColor: accent + '66',
+          borderColor: accent,
           borderWidth: 1,
           borderRadius: 4,
-          hoverBackgroundColor: 'rgba(244, 63, 94, 0.6)',
+          hoverBackgroundColor: accent + '99',
         }],
       },
       options: {
@@ -669,10 +1392,10 @@ const CP = (() => {
         plugins: {
           legend: { display: false },
           tooltip: {
-            backgroundColor: '#0e0e1a',
-            titleColor: '#e8e6f0',
-            bodyColor: '#9d95b0',
-            borderColor: 'rgba(139, 92, 246, 0.2)',
+            backgroundColor: bgSecondary,
+            titleColor: textPrimary,
+            bodyColor: textSecondary,
+            borderColor: borderColor,
             borderWidth: 1,
             padding: 10,
             callbacks: {
@@ -682,14 +1405,14 @@ const CP = (() => {
         },
         scales: {
           x: {
-            grid: { color: 'rgba(139, 92, 246, 0.08)' },
-            ticks: { color: '#6b6280', font: { size: 11 } },
+            grid: { color: borderColor },
+            ticks: { color: textMuted, font: { size: 11 } },
           },
           y: {
             beginAtZero: true,
-            grid: { color: 'rgba(139, 92, 246, 0.08)' },
+            grid: { color: borderColor },
             ticks: {
-              color: '#6b6280',
+              color: textMuted,
               font: { size: 11 },
               callback: (v) => formatCurrency(v),
             },
@@ -728,15 +1451,35 @@ const CP = (() => {
       }
       if (title) title.textContent = `${col.name} — Credentials`;
 
-      const fieldsHtml = col.fields.filter(f => f.required).map(f => {
+      const secrets = config._secrets || {};
+      // EVERY field, not just the required ones.
+      //
+      // Filtering to required hid exactly the credentials this UI recommends.
+      // Bytelixir's session cookie expires in about two hours; its remember_web
+      // and xsrf_token cookies last a year and are what stop collection dying
+      // the same afternoon — and both are optional, so the credential-health
+      // panel said "a longer-lived credential exists for this service" while
+      // the modal it links to offered nowhere to put it.
+      //
+      // Storj is worse: its only field is optional, so the modal rendered no
+      // inputs at all.
+      const fieldsHtml = col.fields.map(f => {
         const inputType = f.secret ? 'password' : 'text';
+        const optionalSuffix = f.required ? '' : ' <span style="color:var(--text-muted); font-weight:400;">(optional)</span>';
+        // Secret inputs are write-only: empty, with a placeholder that reflects
+        // whether a value is already stored (per _secrets). Non-secret fields keep
+        // their plain placeholder.
+        const placeholder = f.secret
+          ? (secrets[f.key] ? '•••••••• (set — leave blank to keep)' : escapeHtml(f.label))
+          : escapeHtml(f.label);
         return `
         <div style="margin-bottom:10px;">
-          <label style="display:block; font-size:0.8rem; color:var(--text-secondary); margin-bottom:4px;">${escapeHtml(f.label)}</label>
+          <label style="display:block; font-size:0.8rem; color:var(--text-secondary); margin-bottom:4px;">${escapeHtml(f.label)}${optionalSuffix}</label>
           <input class="form-input cred-modal-input" type="${inputType}"
                  data-config="${escapeHtml(f.key)}"
                  value=""
-                 placeholder="${escapeHtml(f.label)}"
+                 placeholder="${placeholder}"
+                 ${f.secret ? 'autocomplete="new-password"' : ''}
                  style="width:100%;">
         </div>`;
       }).join('');
@@ -761,26 +1504,26 @@ const CP = (() => {
         </div>`;
 
       body.innerHTML = `
-        ${hint ? `<p style="font-size:0.75rem; color:var(--text-muted); margin:0 0 12px; line-height:1.4;">${hint}</p>` : ''}
+        ${hint ? `<p style="font-size:0.875rem; color:var(--text-secondary); margin:0 0 14px; line-height:1.5;">${sanitizeHint(hint)}</p>` : ''}
         ${fieldsHtml}
         ${bonusHtml}
         <div style="display:flex; gap:8px; margin-top:14px;">
-          <button class="btn btn-primary btn-sm" onclick="CP.saveCredentialModal()">Save</button>
-          <button class="btn btn-ghost btn-sm" onclick="CP.closeModal('cred-modal')">Cancel</button>
-          <button class="btn btn-ghost btn-sm" style="color:#ef4444; margin-left:auto;" onclick="CP.clearServiceCredentials('${escapeHtml(slug)}', '${escapeHtml(col.name)}'); CP.closeModal('cred-modal');">Clear</button>
+          <button class="btn btn-primary btn-sm" data-action="saveCredentialModal" data-a1="${escapeHtml(slug)}">Save</button>
+          <button class="btn btn-ghost btn-sm" data-action="closeModal" data-a1="cred-modal">Cancel</button>
+          <button class="btn btn-ghost btn-sm" style="color:var(--error); margin-left:auto;" data-action="clearServiceCredentials" data-a1="${escapeHtml(slug)}" data-a2="${escapeHtml(col.name)}">Clear</button>
         </div>`;
     } catch (err) {
-      if (body) body.innerHTML = `<p style="color:#ef4444;">Failed to load: ${escapeHtml(err.message)}</p>`;
+      if (body) body.innerHTML = `<p style="color:var(--error);">Failed to load: ${escapeHtml(err.message)}</p>`;
     }
   }
 
-  async function saveCredentialModal() {
+  async function saveCredentialModal(slug) {
     const inputs = document.querySelectorAll('.cred-modal-input');
     const data = {};
     inputs.forEach(input => {
       const key = input.dataset.config;
       const val = input.value.trim();
-      if (val && val !== '********') data[key] = val;
+      if (val) data[key] = val;
     });
     if (!Object.keys(data).length) {
       toast('Enter at least one credential', 'warning');
@@ -788,8 +1531,36 @@ const CP = (() => {
     }
     try {
       await api('/api/config', { method: 'POST', body: { data } });
-      toast('Credentials saved — collecting now\u2026', 'success');
       closeModal('cred-modal');
+
+      // Say whether the credentials WORK, not just that they were stored.
+      //
+      // app/credential_test.py exists to end the "paste a token, wait up to an
+      // hour, learn from the notification bell" loop, and it produces the
+      // actionable sentence ("... most likely expired — copy a fresh one and try
+      // again"). Nothing called it. What a user with a mistyped password got
+      // instead was the next hourly run's alert, rendered verbatim: "Client
+      // error '401 Unauthorized' for url 'https://.../api/v1/users/tokens' For
+      // more information check: https://developer.mozilla.org/...".
+      //
+      // The endpoint deliberately returns no field that could carry a secret,
+      // so its message is safe to show as-is.
+      if (slug) {
+        toast('Credentials saved — checking them\u2026', 'success');
+        try {
+          const verdict = await api(`/api/services/${encodeURIComponent(slug)}/test-credentials`, { method: 'POST' });
+          toast(verdict.message || (verdict.ok ? 'Credentials work.' : 'Could not verify these credentials.'),
+                verdict.ok ? 'success' : 'error');
+        } catch (err) {
+          // The CHECK failed, which is not the same as the credentials failing.
+          // Saying "rejected" here would send someone to re-copy a token that
+          // was fine.
+          toast(`Saved, but could not check them right now: ${err.message}`, 'warning');
+        }
+      } else {
+        toast('Credentials saved — collecting now\u2026', 'success');
+      }
+
       // Trigger a collection so it picks up new creds immediately
       api('/api/collect', { method: 'POST' }).catch(() => {});
       // Silently refresh the dashboard after collection has time to finish
@@ -800,9 +1571,121 @@ const CP = (() => {
   }
 
   // -----------------------------------------------------------
+  // Change Password Modal
+  // -----------------------------------------------------------
+  function openChangePasswordModal() {
+    // Reset fields and any prior error each time the modal opens.
+    ['chpw-current', 'chpw-new', 'chpw-confirm'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+    const err = document.getElementById('chpw-error');
+    if (err) { err.textContent = ''; err.style.display = 'none'; }
+    // Close the avatar dropdown if it was the launch point.
+    const dropdown = document.getElementById('avatar-dropdown');
+    if (dropdown) dropdown.classList.remove('open');
+    openModal('password-modal');
+    const current = document.getElementById('chpw-current');
+    if (current) setTimeout(() => current.focus(), 50);
+  }
+
+  function _setPwdError(msg) {
+    const err = document.getElementById('chpw-error');
+    if (err) {
+      err.textContent = msg;
+      err.style.display = msg ? '' : 'none';
+    }
+  }
+
+  async function submitPasswordChange() {
+    const currentEl = document.getElementById('chpw-current');
+    const newEl = document.getElementById('chpw-new');
+    const confirmEl = document.getElementById('chpw-confirm');
+    if (!currentEl || !newEl || !confirmEl) return;
+
+    const current_password = currentEl.value;
+    const new_password = newEl.value;
+    const confirm = confirmEl.value;
+
+    // Client-side validation mirrors the backend rules for instant feedback.
+    if (!current_password) {
+      _setPwdError('Enter your current password.');
+      currentEl.focus();
+      return;
+    }
+    if (new_password.length < 10) {
+      _setPwdError('New password must be at least 10 characters.');
+      newEl.focus();
+      return;
+    }
+    if (new_password !== confirm) {
+      _setPwdError('New password and confirmation do not match.');
+      confirmEl.focus();
+      return;
+    }
+    if (new_password === current_password) {
+      _setPwdError('New password must be different from the current one.');
+      newEl.focus();
+      return;
+    }
+
+    _setPwdError('');
+    const btn = document.getElementById('pwd-submit');
+    if (btn) { btn.disabled = true; btn.dataset.label = btn.textContent; btn.textContent = 'Saving…'; }
+
+    try {
+      await api('/api/users/me/password', {
+        method: 'POST',
+        body: { current_password, new_password },
+      });
+      // Cookie is re-minted server-side, so the session stays valid.
+      toast('Password changed', 'success');
+      closeModal('password-modal');
+    } catch (err) {
+      _setPwdError(err.message);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = btn.dataset.label || 'Change Password'; }
+    }
+  }
+
+  // -----------------------------------------------------------
   // Claim Modal
   // -----------------------------------------------------------
-  let _breakdownCache = [];
+  // Why this service has no earnings row, said accurately. Three different
+  // facts hide behind one empty result and they need three different answers.
+  async function renderNoEarningsYet(platform, title, body) {
+    let service = null;
+    try {
+      const available = await api('/api/services/available');
+      service = (available || []).find(s => s.slug === platform) || null;
+    } catch (err) {
+      // Could not check. Say that, rather than guessing at either answer.
+      if (title) title.textContent = 'Cashout';
+      if (body) {
+        body.innerHTML = `<p>Could not check this service right now: ${escapeHtml(err.message || 'request failed')}.</p>`;
+      }
+      return;
+    }
+
+    const name = service ? (service.name || platform) : platform;
+    if (title) title.textContent = `Cashout \u2014 ${name}`;
+    if (!body) return;
+
+    if (!service) {
+      // The only case that genuinely deserves the old wording.
+      body.innerHTML = `<p>${escapeHtml(name)} is not in the service catalog, so CashPilot knows nothing about its cashout.</p>`;
+      return;
+    }
+
+    // Deployed and running, but nothing has been read yet. Name the likely
+    // cause, because "no data" without a reason reads as a broken page.
+    const reason = service.has_collector
+      ? 'No earnings have been read for this service yet. Add its credentials in '
+        + 'Settings \u2192 Collectors, or wait for the next hourly collection if you already have.'
+      : 'CashPilot has no earnings collector for this service yet, so it cannot read a balance. '
+        + 'It may still be running and earning \u2014 check the provider\'s own dashboard.';
+    body.innerHTML = `<p>${escapeHtml(reason)}</p>`;
+  }
 
   async function openClaimModal(platform) {
     openModal('claim-modal');
@@ -816,29 +1699,53 @@ const CP = (() => {
       const data = await api('/api/earnings/breakdown');
       const svc = data.find(s => s.platform === platform);
       if (!svc) {
-        if (body) body.innerHTML = '<p>Service not found.</p>';
+        // /api/earnings/breakdown is built from the EARNINGS table, so a service
+        // that has never produced a reading is simply absent from it. Reporting
+        // that absence as "Service not found" told the user the software had
+        // lost track of a service they were looking straight at -- it is in the
+        // catalog, on the dashboard, deployed and running. On this fleet that
+        // was 5 of 18 tracked services (CashPilot: claim-modal bead).
+        await renderNoEarningsYet(platform, title, body);
         return;
       }
 
       const co = svc.cashout || {};
+      // Three-valued, exactly as the endpoint reports it. `eligible` false and
+      // `eligible` null are different answers — "you are below the minimum" and
+      // "we cannot tell" — and rendering the second as the first tells the user
+      // something we do not know.
       const eligible = co.eligible;
-      const minAmount = co.min_amount || 0;
+      const eligibilityUnknown = eligible == null;
+      // Same reconciliation as the service row: compare and render in the unit
+      // the balance is in, never the catalog's declared cashout unit.
+      const minAmount = co.min_amount_comparable;
+      const comparable = typeof minAmount === 'number';
       const currency = svc.currency || 'USD';
 
       if (title) title.textContent = `Claim — ${svc.name}`;
 
-      const statusIcon = eligible
+      const unknownIcon = '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="8" y1="12" x2="16" y2="12"/></svg>';
+      const statusIcon = eligibilityUnknown
+        ? unknownIcon
+        : eligible
         ? '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="16 8 10 16 7 13"/></svg>'
         : '<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--warning)" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>';
 
-      const statusText = eligible
+      const statusText = eligibilityUnknown
+        ? `<span style="color:var(--text-muted); font-weight:600; font-size:1.1rem;">Cannot tell yet</span>
+           <div style="color:var(--text-muted); font-size:0.85rem; margin-top:6px;">
+             This provider's minimum is set in ${escapeHtml(String(co.min_amount_currency || 'another currency'))} and the balance is
+             recorded in ${escapeHtml(String(currency))}. Without an exchange rate the two cannot be compared, so
+             CashPilot will not guess. Check the provider's own dashboard.
+           </div>`
+        : eligible
         ? `<span style="color:var(--success); font-weight:600; font-size:1.1rem;">Eligible for payout!</span>`
         : `<span style="color:var(--warning); font-weight:600; font-size:1.1rem;">Below minimum payout</span>`;
 
-      const pctToMin = minAmount > 0 ? Math.min(100, (svc.balance / minAmount) * 100) : 0;
-      const remaining = Math.max(0, minAmount - svc.balance);
+      const pctToMin = comparable && minAmount > 0 ? Math.min(100, (svc.balance / minAmount) * 100) : 0;
+      const remaining = comparable ? Math.max(0, minAmount - svc.balance) : 0;
 
-      const progressSection = minAmount > 0 ? `
+      const progressSection = comparable && minAmount > 0 ? `
         <div style="margin: 20px 0;">
           <div style="display:flex; justify-content:space-between; font-size:0.85rem; margin-bottom:6px;">
             <span>Current: <strong>${formatCurrency(svc.balance, currency)}</strong></span>
@@ -993,10 +1900,11 @@ const CP = (() => {
     categories: [],
     selectedServices: [],
     deployed: [],
+    deployAttempted: false,
   };
 
   async function initWizard() {
-    wizardState = { step: 1, categories: [], selectedServices: [], deployed: [] };
+    wizardState = { step: 1, categories: [], selectedServices: [], deployed: [], deployAttempted: false };
 
     // Pre-populate from saved preferences
     try {
@@ -1048,6 +1956,7 @@ const CP = (() => {
       if (wizardState.step === 2) loadWizardServices();
       if (wizardState.step === 3) loadWizardSetupForms();
       if (wizardState.step === 4) {
+        renderWizardOutcome();
         // Persist category/service selections
         api('/api/preferences', {
           method: 'POST',
@@ -1059,6 +1968,45 @@ const CP = (() => {
         }).catch(() => {});
       }
     }
+  }
+
+  function renderWizardOutcome() {
+    // Say what actually happened.
+    //
+    // The final screen was unconditional markup: "You're all set! Your services
+    // are being deployed." It said that whether five services deployed, or none
+    // did, or every deploy 403'd — wizardState.deployed was written twice and
+    // read nowhere. A user whose deploys all failed was congratulated and sent
+    // to an empty dashboard with no idea anything had gone wrong.
+    const title = document.getElementById('wizard-done-title');
+    const text = document.getElementById('wizard-done-text');
+    if (!title || !text) return;
+    const done = wizardState.deployed || [];
+    const wanted = wizardState.selectedServices || [];
+    if (done.length === 0) {
+      // Three different nothings, and only one is a failure. Skipping step 3
+      // reaches here with services selected and no deploy attempted, which is
+      // not the same as every deploy failing — telling someone their deploys
+      // failed when none were tried sends them hunting a problem that is not
+      // there.
+      if (!wizardState.deployAttempted) {
+        title.textContent = 'Setup saved';
+        text.textContent = wanted.length
+          ? 'Your choices are saved. Nothing was deployed yet — deploy them from the catalog whenever you are ready.'
+          : 'Your preferences are saved. Nothing was deployed, because no services were selected.';
+        return;
+      }
+      title.textContent = 'Nothing was deployed';
+      text.textContent =
+        'None of the selected services could be deployed. Your choices are saved — check the Fleet page for a worker that is online, then deploy from the catalog.';
+      return;
+    }
+    const missed = wanted.filter(s => !done.includes(s));
+    title.textContent = missed.length ? 'Partly deployed' : "You're all set!";
+    const names = done.map(escapeHtml).join(', ');
+    text.textContent = missed.length
+      ? `Deployed: ${names}. ${missed.length} service${missed.length === 1 ? '' : 's'} could not be deployed — check the Fleet page.`
+      : `Deployed: ${names}. Head to the dashboard to monitor status and earnings.`;
   }
 
   function wizardPrev() {
@@ -1107,19 +2055,6 @@ const CP = (() => {
   // Cached worker container data for wizard
   let _wizardWorkerSlugs = {};  // slug -> node count
   let _wizardWorkers = [];      // full workers array from /api/workers
-
-  // Global worker cache for detail modal
-  let _cachedWorkers = null;
-  async function getCachedWorkers() {
-    if (_cachedWorkers) return _cachedWorkers;
-    try {
-      _cachedWorkers = await api('/api/workers');
-    } catch {
-      _cachedWorkers = [];
-    }
-    return _cachedWorkers;
-  }
-  function invalidateWorkerCache() { _cachedWorkers = null; }
 
   async function loadWizardServices() {
     const container = document.getElementById('wizard-services');
@@ -1180,7 +2115,7 @@ const CP = (() => {
     }
 
     return `
-    <div class="${classes.join(' ')}" data-slug="${svc.slug}" onclick="CP.toggleWizardService('${svc.slug}', this)">
+    <div class="${classes.join(' ')}" data-slug="${svc.slug}" data-action="toggleWizardService" data-a1="${svc.slug}">
       <div class="service-card-header">
         <div class="service-icon">${(svc.name || '?')[0]}</div>
         <div>
@@ -1197,14 +2132,27 @@ const CP = (() => {
     </div>`;
   }
 
-  function toggleWizardService(slug, el) {
+  function toggleWizardService(slug) {
+    // Resolves its own element. It used to take one as a second argument, fed
+    // by `data-a2="this"` — a leftover from the inline-handler migration, where
+    // `this` really was the element. delegate.js reads arguments out of
+    // `dataset`, and dataset values are ALWAYS strings, so the handler received
+    // the literal string "this" and threw on `.classList`.
+    //
+    // The throw was the harmless half. The selection is mutated BEFORE the
+    // line that throws, so a click updated wizardState and then died before
+    // highlighting anything: no visual feedback, and a second click silently
+    // deselected a service the user could not see was selected. They then
+    // pressed Next and were told to select something.
+    const card = document.querySelector(`#wizard-services .service-card[data-slug="${CSS.escape(slug)}"]`)
+      || document.querySelector(`.service-card[data-slug="${CSS.escape(slug)}"]`);
     const idx = wizardState.selectedServices.indexOf(slug);
     if (idx >= 0) {
       wizardState.selectedServices.splice(idx, 1);
-      el.classList.remove('selected');
+      card?.classList.remove('selected');
     } else {
       wizardState.selectedServices.push(slug);
-      el.classList.add('selected');
+      card?.classList.add('selected');
     }
   }
 
@@ -1227,6 +2175,26 @@ const CP = (() => {
     }
   }
 
+  // Earnings tracking takes a SECOND set of credentials.
+  //
+  // The container credentials only configure the container; the dashboard shows
+  // no balance until the same values are entered again under Settings →
+  // Collectors. The service-detail view said so; the setup wizard — the one
+  // screen a new user actually sees — did not, so the expected end state of
+  // onboarding was a dashboard reading zero (CashPilot-p6s).
+  //
+  // One function rather than two copies: a notice that exists twice drifts, and
+  // the wizard's version is the one that matters most.
+  function collectorCredentialsNotice(slug) {
+    return `
+        <div style="font-size:0.8rem; color:var(--text-muted); background:var(--bg-subtle, rgba(255,255,255,0.03)); border:1px solid var(--border); border-radius:6px; padding:8px 10px; margin:10px 0;">
+          The credentials above run the service. To also see its <strong>balance</strong> on the dashboard,
+          add earnings-tracking credentials under
+          <a href="#" data-action="openCredentialModal" data-prevent="1" data-a1="${escapeHtml(slug)}" style="color:var(--accent, #3b82f6);">Settings → Collectors</a>
+          after deploying. This is optional — the service earns either way.
+        </div>`;
+  }
+
   function renderServiceSetupForm(svc, workers) {
     const isDeployed = svc.deployed || false;
     const dashboardUrl = (svc.cashout && svc.cashout.dashboard_url) || svc.website || '';
@@ -1239,19 +2207,7 @@ const CP = (() => {
     // Manual-only services: show signup link + earnings tracking notice + any env fields
     if (svc.manual_only) {
       const platforms = (svc.platforms || []).map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(', ');
-      const manualEnvFields = (svc.docker && svc.docker.env || []).map(env => {
-        const inputType = env.secret ? 'password' : 'text';
-        return `
-        <div class="form-group">
-          <label class="form-label" for="env-${svc.slug}-${env.key}">${escapeHtml(env.label)}</label>
-          <input class="form-input" type="${inputType}" id="env-${svc.slug}-${env.key}"
-                 data-slug="${svc.slug}" data-key="${env.key}"
-                 placeholder="${escapeHtml(env.description || '')}"
-                 value="${escapeHtml(env.default || '')}"
-                 ${env.required ? 'required' : ''}>
-          ${env.description ? `<div class="form-hint">${escapeHtml(env.description)}</div>` : ''}
-        </div>`;
-      }).join('');
+      const manualEnvFields = envInputFields(svc, svc.docker && svc.docker.env);
       const manualBtnLabel = isDeployed && dashboardUrl
         ? `Dashboard for ${escapeHtml(svc.name)}`
         : `Sign Up for ${escapeHtml(svc.name)}`;
@@ -1281,19 +2237,7 @@ const CP = (() => {
       </div>`;
     }
 
-    const envFields = (svc.docker && svc.docker.env || []).map(env => {
-      const inputType = env.secret ? 'password' : 'text';
-      return `
-      <div class="form-group">
-        <label class="form-label" for="env-${svc.slug}-${env.key}">${escapeHtml(env.label)}</label>
-        <input class="form-input" type="${inputType}" id="env-${svc.slug}-${env.key}"
-               data-slug="${svc.slug}" data-key="${env.key}"
-               placeholder="${escapeHtml(env.description || '')}"
-               value="${escapeHtml(env.default || '')}"
-               ${env.required ? 'required' : ''}>
-        ${env.description ? `<div class="form-hint">${escapeHtml(env.description)}</div>` : ''}
-      </div>`;
-    }).join('');
+    const envFields = envInputFields(svc, svc.docker && svc.docker.env);
 
     return `
     <div class="card" style="margin-bottom: 16px;" id="setup-${svc.slug}">
@@ -1319,21 +2263,11 @@ const CP = (() => {
 
       ${envFields}
 
+      ${svc.has_collector ? collectorCredentialsNotice(svc.slug) : ''}
+
       ${(() => {
         const onlineWorkers = (workers || []).filter(w => w.status === 'online');
-        let workerRows = '';
-        let allDeployed = true;
-        for (const w of onlineWorkers) {
-          const slugs = (w.containers || []).map(c => c.slug);
-          const deployed = slugs.includes(svc.slug);
-          if (!deployed) allDeployed = false;
-          workerRows += `
-          <label style="display:flex; align-items:center; gap:8px; padding:6px 0; ${deployed ? 'opacity:0.5;' : ''}">
-            <input type="checkbox" class="setup-deploy-worker-cb" data-slug="${svc.slug}" data-wid="${w.id}" ${deployed ? 'disabled checked' : ''}>
-            <span>${escapeHtml(w.name)}</span>
-            ${deployed ? '<span class="badge badge-deployed" style="font-size:0.75rem;">Deployed</span>' : '<span class="badge badge-available" style="font-size:0.75rem;">Available</span>'}
-          </label>`;
-        }
+        const { rows: workerRows, allDeployed } = workerCheckboxList(svc, onlineWorkers, 'setup-deploy-worker-cb');
 
         if (onlineWorkers.length === 0) {
           return `<p style="color:var(--text-muted); font-size:0.85rem; margin-bottom:12px;">No workers online.</p>`;
@@ -1349,7 +2283,7 @@ const CP = (() => {
           <div id="setup-worker-list-${svc.slug}">${workerRows}</div>
         </div>
         <div style="display:flex; gap:8px; align-items:center;">
-          <button class="btn btn-success" onclick="CP.deployService('${svc.slug}')"${_canWrite ? '' : ' disabled title="Writer access required"'}>
+          <button class="btn btn-success" data-action="deployService" data-a1="${svc.slug}"${_isOwner ? '' : ' disabled title="Owner access required"'}>
             Deploy ${escapeHtml(svc.name)}
           </button>
           <span class="deploy-status" id="deploy-status-${svc.slug}" style="margin-left: 4px; font-size: 0.85rem;"></span>
@@ -1358,18 +2292,62 @@ const CP = (() => {
     </div>`;
   }
 
-  async function deployService(slug) {
-    const statusEl = document.getElementById(`deploy-status-${slug}`);
-    const checkboxes = document.querySelectorAll(`.setup-deploy-worker-cb[data-slug="${slug}"]:checked:not(:disabled)`);
-    const workerIds = Array.from(checkboxes).map(cb => parseInt(cb.dataset.wid));
+  // Deploy `slug` to the given worker node ids: collect the env inputs, validate the
+  // required fields, POST per worker, and surface each per-worker failure. Shared by both
+  // deploy entry points (the setup wizard and the catalog/detail view) so validation and
+  // error reporting are identical — the detail view previously skipped validation and
+  // swallowed server errors silently.
+  // Ask preflight about every target node, and put anything it objects to in
+  // front of the user before the deploy rather than after.
+  //
+  // Returns true to proceed. A preflight that cannot be reached returns TRUE:
+  // the check is advice, and failing to fetch advice is not grounds for
+  // blocking a deploy the user asked for. Silence here means "no opinion", not
+  // "no risk", which is why nothing is displayed in that case either.
+  async function _confirmPreflight(slug, workerIds) {
+    let assessments;
+    try {
+      // Every worker in THIS deploy is passed along, so each assessment can see
+      // the others. Asking per worker in isolation meant two machines behind one
+      // connection warned about nothing — neither had the service yet, so
+      // neither counted against the other (CashPilot-3tr).
+      const planned = workerIds.join(',');
+      assessments = await Promise.all(
+        workerIds.map(id => api(
+          `/api/services/${slug}/preflight?worker_id=${encodeURIComponent(id)}&planned=${encodeURIComponent(planned)}`
+        ))
+      );
+    } catch (err) {
+      console.warn('Preflight unavailable, proceeding:', err);
+      return true;
+    }
 
+    // Only the findings worth interrupting for. "check_these" is advisory —
+    // surfacing it as a modal on every deploy would train people to click
+    // through the one that matters.
+    const serious = [];
+    assessments.forEach((a, i) => {
+      (a && a.findings ? a.findings : [])
+        .filter(f => f.verdict === 'will_earn_nothing' || a.blocking)
+        .forEach(f => serious.push({worker: workerIds[i], message: f.message}));
+    });
+    if (!serious.length) return true;
+
+    const lines = serious.map(s => `• ${s.message}`).join('\n\n');
+    return window.confirm(
+      `${slug}: this may not work as expected.\n\n${lines}\n\nDeploy anyway?`
+    );
+  }
+
+  async function _deployToWorkers(slug, workerIds) {
+    const statusEl = document.getElementById(`deploy-status-${slug}`);
     if (workerIds.length === 0) {
       toast('Select at least one worker node', 'warning');
       if (statusEl) statusEl.textContent = 'Select at least one node.';
       return;
     }
 
-    // Collect env vars (only env inputs, not worker checkboxes)
+    // Collect env vars (only env inputs carry data-key, not the worker checkboxes).
     const envInputs = document.querySelectorAll(`input[data-slug="${slug}"][data-key]`);
     const env = {};
     let missingRequired = false;
@@ -1389,6 +2367,21 @@ const CP = (() => {
       return;
     }
 
+    // Preflight, at the deploy step — which is where the backend's own comments
+    // say it belongs, "not buried in an FAQ". It has been computed since 1.10.x
+    // and asked by nothing.
+    //
+    // WARNS, never blocks: the assessment itself reports blocking=false and
+    // says "you can deploy it anyway", and the machine running this knows
+    // things CashPilot does not. But the findings include cases like a second
+    // instance behind one IP, where some providers forfeit the account balance
+    // — a real loss, and worth one question before it happens rather than an
+    // explanation afterwards.
+    if (!await _confirmPreflight(slug, workerIds)) {
+      if (statusEl) statusEl.textContent = '';
+      return;
+    }
+
     if (statusEl) {
       statusEl.innerHTML = '<span class="spinner" style="display:inline-block;width:14px;height:14px;vertical-align:middle;"></span> Deploying...';
     }
@@ -1396,8 +2389,16 @@ const CP = (() => {
     let ok = 0, fail = 0;
     for (const wid of workerIds) {
       try {
-        await api(`/api/deploy/${slug}?worker_id=${wid}`, { method: 'POST', body: { env } });
+        const res = await api(`/api/deploy/${slug}?worker_id=${wid}`, { method: 'POST', body: { env } });
         ok++;
+        // A redeploy rebuilds from the RECORDED spec where it diverges from
+        // the catalog. The API has always reported what it kept; nothing
+        // rendered it, so the operator saw a plain success while e.g. their
+        // typed-in catalog values were quietly superseded (CashPilot-23yb).
+        const kept = res && res.kept_from_previous_deployment;
+        if (Array.isArray(kept) && kept.length) {
+          toast(`${slug}: kept from the previous deployment — ${kept.join('; ')}`, 'warning');
+        }
       } catch (err) {
         fail++;
         toast(`Deploy to worker ${wid} failed: ${err.message}`, 'error');
@@ -1414,6 +2415,22 @@ const CP = (() => {
         wizardState.deployed.push(slug);
       }
     }
+  }
+
+  // Parse the checked worker ids from a checkbox selector (dropping any unparseable id).
+  function _selectedWorkerIds(selector) {
+    return Array.from(document.querySelectorAll(selector))
+      .map(cb => parseInt(cb.dataset.wid))
+      .filter(id => !Number.isNaN(id));
+  }
+
+  async function deployService(slug) {
+    // Record that a deploy was ATTEMPTED, separately from whether it worked.
+    // Step 3 offers "Skip to Summary", so a user can select services and reach
+    // the final screen having deployed nothing — and an empty `deployed` list
+    // then looks identical to every deploy having failed.
+    wizardState.deployAttempted = true;
+    await _deployToWorkers(slug, _selectedWorkerIds(`.setup-deploy-worker-cb[data-slug="${slug}"]:checked:not(:disabled)`));
   }
 
   // -----------------------------------------------------------
@@ -1472,9 +2489,9 @@ const CP = (() => {
     const hasDocker = svc.docker && svc.docker.image;
     let actionBtn;
     if (isDeployed) {
-      actionBtn = `<button class="btn btn-secondary btn-sm" onclick="CP.openServiceDetail('${svc.slug}')">Manage</button>`;
+      actionBtn = `<button class="btn btn-secondary btn-sm" data-action="openServiceDetail" data-a1="${svc.slug}">Manage</button>`;
     } else if (hasDocker) {
-      actionBtn = `<button class="btn btn-primary btn-sm" onclick="CP.openServiceDetail('${svc.slug}')">Deploy</button>`;
+      actionBtn = `<button class="btn btn-primary btn-sm" data-action="openServiceDetail" data-a1="${svc.slug}">Deploy</button>`;
     } else {
       const url = (svc.referral && svc.referral.signup_url) || svc.website || '#';
       actionBtn = `<a href="${escapeHtml(url)}" target="_blank" rel="noopener" class="btn btn-ghost btn-sm">Visit</a>`;
@@ -1550,6 +2567,11 @@ const CP = (() => {
       if (_isOwner && document.getElementById(`spec-editor-${slug}`)) {
         loadServiceSpec(slug);
       }
+      // After the markup is in the DOM, not before: the container it fills is
+      // created by the line above. Not awaited, so a slow earnings query never
+      // holds up the rest of the modal.
+      loadPayoutProgress();
+      loadDeployRisk();
     } catch (err) {
       if (body) body.innerHTML = `<p class="empty-state-text">Could not load service: ${escapeHtml(err.message)}</p>`;
     }
@@ -1569,6 +2591,21 @@ const CP = (() => {
     // --- Info grid (no referral bonus) ---
     let html = `
     <p style="color: var(--text-secondary); margin-bottom: 16px;">${escapeHtml(svc.description || svc.short_description || '')}</p>
+    <!-- Filled in by loadPayoutProgress once the modal is in the DOM. Hidden
+         until it has a real answer: an empty "Payout progress" heading on a
+         service that has never been collected is worse than no heading. -->
+    <div id="payout-progress-card" data-slug="${escapeHtml(svc.slug || '')}"
+         data-currency="${escapeHtml(svc.cashout?.currency || '')}" style="display:none; margin-bottom:20px;">
+      <div class="detail-label" style="margin-bottom:8px;">Payout progress</div>
+      <div id="payout-progress-body"></div>
+    </div>
+    <!-- What running this actually does with the machine and the connection.
+         Filled by loadDeployRisk once the modal exists. This belongs at the
+         deploy step rather than in a FAQ nobody opens, which is what the
+         backend's own comments say and what it never got. -->
+    <div id="deploy-risk-card" data-slug="${escapeHtml(svc.slug || '')}" style="display:none; margin-bottom:20px;">
+      <div id="deploy-risk-body"></div>
+    </div>
     <div class="detail-grid" style="margin-bottom: 20px;">
       <div class="detail-item">
         <div class="detail-label">Category</div>
@@ -1616,32 +2653,13 @@ const CP = (() => {
     // --- Deploy section (worker-aware) ---
     const hasDocker = svc.docker && svc.docker.image;
     if (hasDocker) {
-      const envFields = (svc.docker.env || []).map(env => {
-        const inputType = env.secret ? 'password' : 'text';
-        return `
-        <div class="form-group">
-          <label class="form-label">${escapeHtml(env.label)}</label>
-          <input class="form-input" type="${inputType}" data-slug="${svc.slug}" data-key="${env.key}"
-                 placeholder="${escapeHtml(env.description || '')}" value="${escapeHtml(env.default || '')}"
-                 ${env.required ? 'required' : ''}>
-        </div>`;
-      }).join('');
+      const envFields = envInputFields(svc, svc.docker.env, { withId: false, withHint: false });
 
       // Worker deploy targets
       const onlineWorkers = (workers || []).filter(w => w.status === 'online');
       let workerRows = '';
       let allDeployed = true;
-      for (const w of onlineWorkers) {
-        const slugs = (w.containers || []).map(c => c.slug);
-        const deployed = slugs.includes(svc.slug);
-        if (!deployed) allDeployed = false;
-        workerRows += `
-        <label style="display:flex; align-items:center; gap:8px; padding:6px 0; ${deployed ? 'opacity:0.5;' : ''}">
-          <input type="checkbox" class="deploy-worker-cb" data-wid="${w.id}" ${deployed ? 'disabled checked' : ''}>
-          <span>${escapeHtml(w.name)}</span>
-          ${deployed ? '<span class="badge badge-deployed" style="font-size:0.75rem;">Deployed</span>' : '<span class="badge badge-available" style="font-size:0.75rem;">Available</span>'}
-        </label>`;
-      }
+      ({ rows: workerRows, allDeployed } = workerCheckboxList(svc, onlineWorkers, 'deploy-worker-cb'));
 
       if (onlineWorkers.length === 0) {
         workerRows = '<p style="color:var(--text-muted); font-size:0.85rem;">No workers online.</p>';
@@ -1649,6 +2667,13 @@ const CP = (() => {
 
       html += `<h4 style="margin-bottom: 12px; font-size: 0.95rem;">Deploy</h4>`;
       html += envFields;
+
+      // Earnings tracking uses SEPARATE credentials (Settings → Collectors).
+      // The fields above only configure the container that earns; they don't
+      // let CashPilot read your balance. Make that explicit at deploy time.
+      if (svc.has_collector) {
+        html += collectorCredentialsNotice(svc.slug);
+      }
 
       if (allDeployed && onlineWorkers.length > 0) {
         html += `<p style="color:var(--success); font-size:0.9rem; margin:12px 0;">Deployed on all nodes.</p>`;
@@ -1659,7 +2684,7 @@ const CP = (() => {
           <div id="deploy-worker-list">${workerRows}</div>
         </div>
         <div style="display:flex; gap:8px; align-items:center;">
-          <button class="btn btn-success" onclick="CP.deployServiceToWorkers('${svc.slug}')"${_canWrite ? '' : ' disabled title="Writer access required"'}>Deploy</button>
+          <button class="btn btn-success" data-action="deployServiceToWorkers" data-a1="${svc.slug}"${_isOwner ? '' : ' disabled title="Owner access required"'}>Deploy</button>
           <span id="deploy-status-${svc.slug}" style="font-size:0.85rem;"></span>
         </div>`;
       }
@@ -1685,10 +2710,10 @@ const CP = (() => {
           <strong style="min-width:100px;">${escapeHtml(inst.worker.name)}</strong>
           <span class="badge ${badgeClass}" style="font-size:0.75rem;">${escapeHtml(s)}</span>
           ${_canWrite ? `<div style="margin-left:auto; display:flex; gap:4px;">
-            <button class="btn btn-secondary btn-sm" onclick="CP.workerAction('${svc.slug}','restart',${inst.worker.id})">Restart</button>
-            <button class="btn btn-secondary btn-sm" onclick="CP.workerAction('${svc.slug}','stop',${inst.worker.id})">Stop</button>
-            <button class="btn btn-ghost btn-sm" onclick="CP.loadWorkerLogs('${svc.slug}',${inst.worker.id},'logs-${svc.slug}-${inst.worker.id}')">Logs</button>
-            <button class="btn btn-danger btn-sm" onclick="CP.removeWorkerService('${svc.slug}',${inst.worker.id},'${escapeHtml(inst.worker.name)}')">Remove</button>
+            <button class="btn btn-secondary btn-sm" data-action="workerAction" data-a1="${svc.slug}" data-a2="restart" data-a3="${inst.worker.id}">Restart</button>
+            <button class="btn btn-secondary btn-sm" data-action="workerAction" data-a1="${svc.slug}" data-a2="stop" data-a3="${inst.worker.id}">Stop</button>
+            <button class="btn btn-ghost btn-sm" data-action="loadWorkerLogs" data-a1="${svc.slug}" data-a2="${inst.worker.id}" data-a3="logs-${svc.slug}-${inst.worker.id}">Logs</button>
+            <button class="btn btn-danger btn-sm" data-action="removeWorkerService" data-a1="${svc.slug}" data-a2="${inst.worker.id}" data-a3="${escapeHtml(inst.worker.name)}">Remove</button>
           </div>` : ''}
         </div>
         <div class="log-viewer" id="logs-${svc.slug}-${inst.worker.id}" style="display:none; max-height:200px;"></div>`;
@@ -1759,43 +2784,7 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
   }
 
   async function deployServiceToWorkers(slug) {
-    const statusEl = document.getElementById(`deploy-status-${slug}`);
-    const checkboxes = document.querySelectorAll('.deploy-worker-cb:checked:not(:disabled)');
-    const workerIds = Array.from(checkboxes).map(cb => parseInt(cb.dataset.wid));
-
-    if (workerIds.length === 0) {
-      if (statusEl) statusEl.textContent = 'Select at least one node.';
-      return;
-    }
-
-    // Collect env vars
-    const envInputs = document.querySelectorAll(`input[data-slug="${slug}"]`);
-    const env = {};
-    envInputs.forEach(input => { if (input.dataset.key) env[input.dataset.key] = input.value; });
-
-    if (statusEl) statusEl.innerHTML = '<span class="spinner" style="display:inline-block;width:14px;height:14px;vertical-align:middle;"></span> Deploying...';
-
-    let ok = 0, fail = 0;
-    const failures = [];
-    for (const wid of workerIds) {
-      try {
-        await api(`/api/deploy/${slug}?worker_id=${wid}`, { method: 'POST', body: { env } });
-        ok++;
-      } catch (err) {
-        fail++;
-        failures.push(err.message);
-      }
-    }
-    if (statusEl) {
-      if (fail === 0) {
-        statusEl.textContent = `Deployed to ${ok} node(s)`;
-        statusEl.style.color = 'var(--success)';
-      } else {
-        statusEl.textContent = `${ok} ok, ${fail} failed: ${failures[0]}`;
-        statusEl.style.color = 'var(--error)';
-        toast(`Deploy failed: ${failures[0]}`, 'error');
-      }
-    }
+    await _deployToWorkers(slug, _selectedWorkerIds(`.deploy-worker-cb[data-slug="${slug}"]:checked:not(:disabled)`));
   }
 
   async function removeWorkerService(slug, workerId, workerName) {
@@ -1834,7 +2823,7 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
       // Refresh the modal
       openServiceDetail(slug);
     } catch (err) {
-      alert(`${action} failed: ${err.message}`);
+      toast(`${action} failed: ${err.message}`, 'error');
     }
   }
 
@@ -1873,8 +2862,82 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
   // -----------------------------------------------------------
   // Settings
   // -----------------------------------------------------------
+  // Which stored credentials are about to stop working.
+  //
+  // Several providers issue session cookies measured in hours. When one dies,
+  // collection stops and nothing says so — the dashboard keeps showing the last
+  // balance it managed to read, which is indistinguishable from a service that
+  // simply is not earning. This is the warning before that, not after.
+  //
+  // Worst first, because the only rows that need acting on are the bad ones.
+  const CREDENTIAL_STATUS = {
+    likely_expired: {rank: 0, label: 'Likely expired', tone: 'var(--danger)'},
+    expiring_soon: {rank: 1, label: 'Expiring soon', tone: 'var(--warning)'},
+    no_known_expiry: {rank: 2, label: 'No known expiry', tone: 'var(--text-muted)'},
+    fresh: {rank: 3, label: 'Fresh', tone: 'var(--success)'},
+  };
+
+  async function loadCredentialHealth() {
+    const card = document.getElementById('credential-health-card');
+    const body = document.getElementById('credential-health-body');
+    if (!card || !body) return;
+
+    let rows;
+    try {
+      rows = await api('/api/credentials/health');
+    } catch (err) {
+      // Leave it hidden. An empty "Credential health" heading would read as
+      // "nothing is configured", which is a different and reassuring claim.
+      console.warn('Could not load credential health:', err);
+      return;
+    }
+    if (!Array.isArray(rows) || !rows.length) {
+      card.style.display = 'none';
+      return;
+    }
+
+    const meta = status => CREDENTIAL_STATUS[status] || CREDENTIAL_STATUS.no_known_expiry;
+    rows.sort((a, b) => meta(a.status).rank - meta(b.status).rank);
+
+    card.style.display = '';
+    body.innerHTML = rows.map(row => {
+      const info = meta(row.status);
+      const age = row.age_hours >= 48
+        ? `${Math.round(row.age_hours / 24)} days old`
+        : `${Math.round(row.age_hours)} hours old`;
+      const lifetime = row.expected_lifetime_hours
+        ? ` · expected to last about ${row.expected_lifetime_hours >= 48
+            ? `${Math.round(row.expected_lifetime_hours / 24)} days`
+            : `${row.expected_lifetime_hours} hours`}`
+        : '';
+      // The durable alternative is the actual fix, not a nag: swapping to it
+      // ends the expiry cycle instead of restarting it.
+      const durable = (row.durable_alternative_missing || []).length
+        ? `<div class="credential-health-hint">A longer-lived credential exists for this service (${escapeHtml(row.durable_alternative_missing.join(', '))}) — setting it means not having to do this again.</div>`
+        : '';
+      const why = row.why ? `<div class="credential-health-hint">${escapeHtml(row.why)}</div>` : '';
+      const needsAction = row.status === 'likely_expired' || row.status === 'expiring_soon';
+      return `
+        <div class="credential-health-item">
+          <div>
+            <div class="credential-health-name">${escapeHtml(row.service)} <span style="color:var(--text-muted); font-weight:400;">· ${escapeHtml(String(row.field).replace(/_/g, ' '))}</span></div>
+            <div class="credential-health-detail">${escapeHtml(age)}${escapeHtml(lifetime)}</div>
+            ${why}${durable}
+          </div>
+          <div class="credential-health-actions">
+            <span class="credential-health-status" style="color:${info.tone};">${escapeHtml(info.label)}</span>
+            ${needsAction && _isOwner ? `<button class="btn btn-ghost btn-sm" data-action="openCredentialModal" data-a1="${escapeHtml(row.service)}">Update</button>` : ''}
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
   async function loadSettings() {
     populateCurrencyDropdown();
+    // Independent of /api/config on purpose: a failed config load must not
+    // leave the update card stuck on "Loading..." — it has its own error path.
+    loadUpdateCard();
     try {
       const [config, envInfo, collectorsMeta] = await Promise.all([
         api('/api/config'),
@@ -1883,8 +2946,140 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
       ]);
       renderEnvVars(envInfo, config);
       renderCollectors(collectorsMeta, config);
+      loadCredentialHealth();
     } catch (err) {
-      // Settings may not be available yet
+      // Say what happened. /api/env-info and /api/collectors/meta each carry
+      // their own .catch, so the only call that can reject is /api/config —
+      // and its rejection aborts the whole Promise.all before either render
+      // runs. Both panels then keep the template's "Loading..." forever, and
+      // this catch used to be empty, so nothing ever corrected it: an expired
+      // session or a restarting server looked like a page that simply never
+      // finished loading (CashPilot-cn3).
+      //
+      // Every other loader here writes a reason into its own container; this
+      // one was the outlier.
+      settingsPanelsFailed(err);
+    }
+  }
+
+  // Exported for the harness: the message is the whole point of the fix, so it
+  // has to be reachable without a browser.
+  function settingsLoadFailureMessage(err) {
+    const detail = (err && err.message) ? String(err.message) : '';
+    return `Could not load settings${detail ? `: ${detail}` : ''}. Your session may have expired — `
+      + `reload the page, and sign in again if you are asked to.`;
+  }
+
+  function settingsPanelsFailed(err) {
+    const message = settingsLoadFailureMessage(err);
+    ['env-vars-container', 'collectors-container'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = `<p style="color:var(--error);font-size:0.85rem;">${escapeHtml(message)}</p>`;
+    });
+  }
+
+  // --- About & Updates (issue #342) ---------------------------------------
+
+  // The worker whose install the card inspects/updates. Multi-worker fleets
+  // get a selector; _resolve_worker_id would otherwise 400 the whole card.
+  let updateCardWorkerId = null;
+
+  async function loadUpdateCard() {
+    const container = document.getElementById('update-card-container');
+    if (!container) return;
+    try {
+      const workers = await api('/api/workers').catch(() => []);
+      const online = (workers || []).filter(w => w.status === 'online');
+      if (!online.length) {
+        container.innerHTML = `<p style="color:var(--text-muted);font-size:0.85rem;">No worker is online, so the install cannot be inspected or updated right now.</p>`;
+        return;
+      }
+      if (!online.some(w => w.id === updateCardWorkerId)) updateCardWorkerId = online[0].id;
+      const info = await api(`/api/update-info?worker_id=${updateCardWorkerId}`);
+      renderUpdateCard(info, online);
+    } catch (err) {
+      // The card must render something honest even with the worker down — the
+      // rest of the settings page is still usable.
+      const detail = (err && err.message) ? `: ${err.message}` : '';
+      container.innerHTML = `<p style="color:var(--text-muted);font-size:0.85rem;">${escapeHtml(`Could not read update state${detail}. The local worker may be unreachable.`)}</p>`;
+    }
+  }
+
+  function selectUpdateWorker(sel) {
+    updateCardWorkerId = parseInt(sel.value, 10);
+    loadUpdateCard();
+  }
+
+  function renderUpdateCard(info, onlineWorkers) {
+    const container = document.getElementById('update-card-container');
+    if (!container) return;
+    const current = info.current_display || info.current || 'dev';
+    const latest = (info.known && info.latest) ? `v${String(info.latest).replace(/^v/, '')}` : null;
+    const line = (label, value) => `
+      <div style="display:grid;grid-template-columns:220px 1fr;gap:12px;padding:8px 0;border-bottom:1px solid var(--border-color);">
+        <div style="font-weight:600;font-size:0.9rem;color:var(--text-primary);">${escapeHtml(label)}</div>
+        <div style="font-size:0.9rem;color:var(--text-secondary);font-family:monospace;">${escapeHtml(value)}</div>
+      </div>`;
+    let html = '';
+    if ((onlineWorkers || []).length > 1) {
+      const options = onlineWorkers.map(w =>
+        `<option value="${escapeHtml(String(w.id))}" ${w.id === updateCardWorkerId ? 'selected' : ''}>${escapeHtml(w.name || `worker ${w.id}`)}</option>`
+      ).join('');
+      html += `
+      <div style="display:grid;grid-template-columns:220px 1fr;gap:12px;padding:8px 0;border-bottom:1px solid var(--border-color);">
+        <div style="font-weight:600;font-size:0.9rem;color:var(--text-primary);">Server</div>
+        <div><select id="update-worker-select" class="form-input" style="max-width:280px;">${options}</select></div>
+      </div>`;
+    }
+    html += line('Running', current);
+    if (info.worker_image) html += line('Worker image', info.worker_image);
+    if (info.ui_image) html += line('Dashboard image', info.ui_image);
+    html += line('Latest release', latest || 'unknown — check disabled, not yet run, or GitHub unreachable');
+
+    let action;
+    if (info.updater_running) {
+      action = `<p style="font-size:0.85rem;color:var(--text-secondary);margin-top:12px;">An update is already running — the dashboard may restart at any moment. Reload this page in a minute.</p>`;
+    } else if (!info.compose_managed) {
+      action = `<p style="font-size:0.85rem;color:var(--text-muted);margin-top:12px;">This install is not managed by Docker Compose, so CashPilot cannot update itself. Update manually: pull the new images, then recreate the <code>cashpilot-ui</code> and <code>cashpilot-worker</code> containers the way you created them.</p>`;
+    } else {
+      let label; let note;
+      if (info.patch_available) {
+        label = `Update to ${latest}`;
+        note = 'Installs the newest patch of your pinned series and recreates the CashPilot containers.';
+      } else if (info.behind) {
+        label = 'Pull newest patches';
+        note = `A newer series (${latest}) exists — moving to it means editing the image tags in your compose file. This button installs the newest patch of the series you currently pin.`;
+      } else {
+        label = 'Re-pull images';
+        note = latest
+          ? 'You are on the newest known release. The button re-runs the documented pull anyway.'
+          : 'The newest release is unknown; the button still runs the documented pull for your pinned series.';
+      }
+      action = `
+      <div style="display:flex;gap:12px;align-items:center;margin-top:14px;">
+        <button class="btn btn-primary" data-action="runSelfUpdate">${escapeHtml(label)}</button>
+        <span id="update-run-status" style="font-size:0.85rem;color:var(--text-muted);"></span>
+      </div>
+      <div class="form-hint" style="margin-top:8px;">${escapeHtml(note)}</div>`;
+    }
+    container.innerHTML = html + action;
+    const sel = container.querySelector('#update-worker-select');
+    if (sel) sel.addEventListener('change', e => selectUpdateWorker(e.target));
+  }
+
+  async function runSelfUpdate() {
+    if (!confirm('Update CashPilot now? This pulls the newest images of your pinned series and recreates the CashPilot containers — the dashboard will briefly go away.')) return;
+    const status = document.getElementById('update-run-status');
+    if (status) status.textContent = 'Starting update…';
+    try {
+      // Same worker the card inspected — info and action must not diverge.
+      const q = updateCardWorkerId != null ? `?worker_id=${updateCardWorkerId}` : '';
+      await api(`/api/update${q}`, { method: 'POST' });
+      if (status) status.textContent = 'Update started — the dashboard will restart. Reload this page in a minute.';
+    } catch (err) {
+      // A 409 carries the worker's honest refusal (e.g. not compose-managed,
+      // or an update already running) — show it verbatim, it IS the answer.
+      if (status) status.textContent = (err && err.message) ? err.message : 'Update failed to start.';
     }
   }
 
@@ -1899,7 +3094,10 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
       const fromEnv = v.set_via_env;
       const locked = fromEnv || v.read_only;
       const dbVal = config[v.key] || '';
-      const displayVal = dbVal || v.value;
+      // Secret rows never carry a plaintext value from the API — render empty and
+      // drive status off the is_set flag. Non-secret rows still show their value.
+      const isSet = v.secret ? !!v.is_set : !!(dbVal || v.value);
+      const displayVal = v.secret ? '' : (dbVal || v.value);
       const inputType = v.secret ? 'password' : 'text';
       const lockIcon = locked
         ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2" style="vertical-align:middle;margin-left:6px;"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>'
@@ -1907,9 +3105,18 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
       let badge;
       if (fromEnv) badge = '<span class="badge badge-deployed" style="font-size:0.7rem;margin-left:8px;">ENV</span>';
       else if (v.read_only) badge = '<span class="badge" style="font-size:0.7rem;margin-left:8px;opacity:0.6;">Read-only</span>';
-      else if (dbVal) badge = '<span class="badge badge-category" style="font-size:0.7rem;margin-left:8px;">DB</span>';
-      else if (v.value) badge = '<span class="badge" style="font-size:0.7rem;margin-left:8px;opacity:0.5;">Default</span>';
+      // No "DB" badge. It asserted that a stored value was in force, and
+      // nothing reads these from the database: every one is resolved once from
+      // the environment at import (main.py:639-640, auth.py, fleet_key.py), so
+      // a saved value could never take effect. A stored-but-inert value is
+      // worth flagging as exactly that.
+      else if (dbVal) badge = '<span class="badge badge-warning" style="font-size:0.7rem;margin-left:8px;" title="Stored in the database but NOT in use — these are read from the environment at startup">Stored, not applied</span>';
+      else if (isSet) badge = '<span class="badge" style="font-size:0.7rem;margin-left:8px;opacity:0.5;">Default</span>';
       else badge = '<span class="badge" style="font-size:0.7rem;margin-left:8px;opacity:0.5;">Not set</span>';
+      // Secret fields render empty; placeholder communicates whether a value is stored.
+      const placeholder = v.secret
+        ? (isSet ? '•••••••• (set — leave blank to keep)' : 'Not set')
+        : v.description;
       return `
       <div style="display:grid;grid-template-columns:220px 1fr;gap:12px;align-items:start;padding:10px 0;border-bottom:1px solid var(--border-color);">
         <div>
@@ -1921,20 +3128,25 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
             <input class="form-input env-var-input" type="${inputType}" id="env-${v.key}"
                    data-env-key="${escapeHtml(v.key)}"
                    value="${escapeHtml(displayVal)}"
-                   placeholder="${escapeHtml(v.description)}"
+                   placeholder="${escapeHtml(placeholder)}"
+                   ${v.secret ? 'autocomplete="new-password"' : ''}
                    style="flex:1;${locked ? 'opacity:0.6;cursor:not-allowed;' : ''}"
                    ${locked ? 'disabled' : ''}>
-            ${v.secret && displayVal ? `<button type="button" class="btn btn-ghost btn-sm" onclick="CP.toggleEnvSecret('env-${v.key}', this)" title="Show" style="white-space:nowrap;padding:6px 8px;">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-            </button>` : ''}
           </div>
           <div class="form-hint">${escapeHtml(v.description)}</div>
         </div>
       </div>`;
     }).join('');
     container.innerHTML = rows + `
+    <div class="form-hint" style="margin-top:12px;">
+      These are read from the environment when CashPilot starts, so changing one
+      here does not take effect. Set it in your <code>docker-compose.yml</code>
+      (or Unraid template) and restart the container. Saving stores the value but
+      nothing reads it back — the field is kept so an existing stored value stays
+      visible rather than disappearing.
+    </div>
     <div style="display:flex;justify-content:flex-end;margin-top:12px;">
-      <button class="btn btn-primary" onclick="CP.saveEnvSettings()">Save Variables</button>
+      <button class="btn btn-ghost" data-action="saveEnvSettings" title="Stores the value; it will not take effect until it is set in the environment and the container restarts">Save anyway</button>
     </div>`;
   }
 
@@ -1954,7 +3166,7 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     const data = {};
     inputs.forEach(input => {
       const val = input.value.trim();
-      if (val && val !== '********') {
+      if (val) {
         data[input.dataset.envKey] = val;
       }
     });
@@ -1977,21 +3189,36 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
       container.innerHTML = '<p style="color:var(--text-muted);font-size:0.85rem;">No collectors available.</p>';
       return;
     }
+    const secrets = config._secrets || {};
     const items = meta.map(col => {
-      const configured = col.fields.some(f => {
-        const val = config[f.key];
-        return val && val.trim() !== '';
-      });
-      const statusBadge = configured
+      // A collector is "configured" if any secret field has a stored value
+      // (per _secrets) or any non-secret field carries a real value.
+      // EVERY required field, not any field.
+      //
+      // `.some` meant a service needing an email AND a password showed
+      // "Configured" with only the email set — while the server's own
+      // make_collectors skipped it for the missing one, so it silently never
+      // collected. The badge asserted the opposite of what was happening.
+      const isSet = f => (f.secret ? !!secrets[f.key] : !!(config[f.key] || '').trim());
+      const required = col.fields.filter(f => f.required);
+      const setCount = required.filter(isSet).length;
+      const configured = required.length > 0 && setCount === required.length;
+      const partial = setCount > 0 && setCount < required.length;
+      const statusBadge = partial
+        ? '<span class="badge badge-warning" title="Some required credentials are missing, so this service is not being collected">Incomplete</span>'
+        : configured
         ? '<span class="badge badge-deployed">Configured</span>'
         : '<span class="badge badge-category">Not configured</span>';
       const fields = col.fields.map(f => {
-        const savedVal = config[f.key] || '';
+        // Secret fields never receive a plaintext value from /api/config — render
+        // them empty (write-only). Submitting blank preserves the stored secret.
+        const isSecretSet = f.secret && !!secrets[f.key];
+        const savedVal = f.secret ? '' : (config[f.key] || '');
         const inputType = f.secret ? 'password' : 'text';
         const inputId = `cred-${f.key}`;
-        const showBtn = f.secret && savedVal ? `<button type="button" class="btn btn-ghost btn-sm" onclick="CP.toggleEnvSecret('${inputId}', this)" title="Show" style="white-space:nowrap;padding:6px 8px;">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-            </button>` : '';
+        const placeholder = f.secret
+          ? (isSecretSet ? '•••••••• (set — leave blank to keep)' : 'Not set')
+          : f.label;
         return `
         <div class="form-group" style="margin-bottom:8px;">
           <label class="form-label" style="font-size:0.8rem;">${escapeHtml(f.label)}${f.required ? '' : ' <span style="opacity:0.5;">(optional)</span>'}</label>
@@ -1999,14 +3226,14 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
             <input class="form-input collector-input" type="${inputType}" id="${inputId}"
                    data-config="${escapeHtml(f.key)}"
                    value="${escapeHtml(savedVal)}"
-                   placeholder="${escapeHtml(f.label)}"
+                   placeholder="${escapeHtml(placeholder)}"
+                   ${f.secret ? 'autocomplete="new-password"' : ''}
                    style="flex:1;">
-            ${showBtn}
           </div>
         </div>`;
       }).join('');
       const clearBtn = configured && _isOwner
-        ? `<div style="margin-top:8px; text-align:right;"><button class="btn btn-ghost btn-sm" style="color:#ef4444; font-size:0.75rem;" onclick="CP.clearServiceCredentials('${escapeHtml(col.slug)}', '${escapeHtml(col.name)}')">Clear Credentials</button></div>`
+        ? `<div style="margin-top:8px; text-align:right;"><button class="btn btn-ghost btn-sm" style="color:var(--error); font-size:0.75rem;" data-action="clearServiceCredentials" data-a1="${escapeHtml(col.slug)}" data-a2="${escapeHtml(col.name)}">Clear Credentials</button></div>`
         : '';
       return `
       <details class="collector-section" id="collector-${col.slug}">
@@ -2015,6 +3242,7 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
           ${statusBadge}
         </summary>
         <div class="collector-body">
+          ${col.hint ? `<div class="form-hint" style="margin-bottom:12px;">${sanitizeHint(col.hint)}</div>` : ''}
           ${fields}
           ${clearBtn}
         </div>
@@ -2029,7 +3257,7 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     inputs.forEach(input => {
       const key = input.dataset.config;
       const val = input.value.trim();
-      if (val && val !== '********') {
+      if (val) {
         data[key] = val;
       }
     });
@@ -2053,6 +3281,9 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     try {
       await api(`/api/config/${encodeURIComponent(slug)}`, { method: 'DELETE' });
       toast(`${name} credentials cleared`, 'success');
+      // The caller used to close the modal in a second inline call; folded in
+      // here so the button declares one action rather than two.
+      closeModal('cred-modal');
       loadSettings();
     } catch (err) {
       toast(`Clear failed: ${err.message}`, 'error');
@@ -2075,6 +3306,24 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
   // -----------------------------------------------------------
   // Utility
   // -----------------------------------------------------------
+  // Which currency formatCurrency will ACTUALLY label its result as.
+  //
+  // Not the same question as "what is the display currency": an unpriced token
+  // is shown raw, and a display currency with no fiat rate falls back to USD.
+  // Callers that want to avoid printing the same figure twice need the answer
+  // to this, not to the simpler question — comparing against _displayCurrency
+  // printed "24.90 USD (≈ $24.90)" whenever the rate was missing.
+  function effectiveDisplayCurrency(nativeCurrency) {
+    nativeCurrency = nativeCurrency || 'USD';
+    const priced = nativeCurrency === 'USD'
+      || (_exchangeRates.crypto_usd && _exchangeRates.crypto_usd[nativeCurrency]);
+    if (!priced) return nativeCurrency;
+    if (_displayCurrency !== 'USD' && _exchangeRates.fiat && _exchangeRates.fiat[_displayCurrency]) {
+      return _displayCurrency;
+    }
+    return 'USD';
+  }
+
   function formatCurrency(val, nativeCurrency) {
     nativeCurrency = nativeCurrency || 'USD';
     const amount = parseFloat(val || 0);
@@ -2090,21 +3339,35 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
       return amount.toFixed(2) + ' ' + nativeCurrency;
     }
 
-    // Convert USD to display currency
+    // Convert USD to the display currency — but ONLY label it as the display
+    // currency if a rate was actually applied.
+    //
+    // This used to stamp the display currency's symbol on an unconverted USD
+    // figure whenever its rate was missing, so $24.90 rendered as "£24.90": not
+    // a conversion, the same number wearing a different sign. Caught in a
+    // browser against a freshly restarted server, which is exactly when it
+    // bites — rates are fetched asynchronously, so on every page load before
+    // they arrive EVERY figure on the dashboard was mislabelled, and a user
+    // whose currency simply has no rate saw it permanently.
     let displayAmount = usdAmount;
-    if (_displayCurrency !== 'USD' && _exchangeRates.fiat && _exchangeRates.fiat[_displayCurrency]) {
+    let currency = 'USD';
+    if (_displayCurrency === 'USD') {
+      currency = 'USD';
+    } else if (_exchangeRates.fiat && _exchangeRates.fiat[_displayCurrency]) {
       displayAmount = usdAmount * _exchangeRates.fiat[_displayCurrency];
+      currency = _displayCurrency;
     }
+    // else: no rate, so the value stays in USD and says so.
 
     try {
       return new Intl.NumberFormat(undefined, {
         style: 'currency',
-        currency: _displayCurrency,
+        currency,
         minimumFractionDigits: 2,
         maximumFractionDigits: 2,
       }).format(displayAmount);
     } catch {
-      return displayAmount.toFixed(2) + ' ' + _displayCurrency;
+      return displayAmount.toFixed(2) + ' ' + currency;
     }
   }
 
@@ -2122,6 +3385,15 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
   function setChangeIndicator(id, pct) {
     const el = document.getElementById(id);
     if (!el) return;
+    // null means the comparison was never computed — not "no change".
+    // month_change used to be a hardcoded 0.0, so this rendered "+0.0%" in the
+    // positive style forever, and `pct.toFixed` would now throw on the honest
+    // null. Blank is the only truthful rendering of an unmeasured figure.
+    if (pct === null || pct === undefined || Number.isNaN(Number(pct))) {
+      el.textContent = '';
+      el.className = 'stat-change';
+      return;
+    }
     const sign = pct >= 0 ? '+' : '';
     el.textContent = `${sign}${pct.toFixed(1)}%`;
     el.className = `stat-change ${pct >= 0 ? 'positive' : 'negative'}`;
@@ -2157,6 +3429,61 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     // Fetch alerts now and every 60s
     loadCollectorAlerts();
     setInterval(loadCollectorAlerts, 60000);
+
+    // Once per page load. The server refreshes daily; polling more often would
+    // only re-read the same cached value.
+    checkForUpdate();
+  }
+
+  // A newer release is available (CashPilot-w0ss).
+  //
+  // Three rules, and they are what keep this from being unwelcome:
+  //   * SILENT when unknown. Offline, disabled, never-run, or a dev build all
+  //     produce `known: false`, and an unknown state renders NOTHING -- never a
+  //     spinner, an error, or a reassuring "up to date" it has not earned.
+  //   * NEVER auto-updates. It tells you; you decide.
+  //   * Dismissible PER VERSION. Dismiss 1.20.1 and it stays gone until 1.20.2
+  //     exists, so it cannot become wallpaper.
+  async function checkForUpdate() {
+    const banner = document.getElementById('update-banner');
+    if (!banner) return;
+    let state;
+    try {
+      state = await api('/api/update-status');
+    } catch (err) {
+      return; // Unknown. Say nothing at all.
+    }
+    if (!state || !state.known || !state.behind || !state.latest) return;
+
+    // Per-version dismissal. Keyed on the version so a NEW release re-appears.
+    let dismissed = null;
+    try {
+      dismissed = localStorage.getItem('cp-update-dismissed');
+    } catch (err) {
+      dismissed = null; // private mode / storage disabled: just show it
+    }
+    if (dismissed === state.latest) return;
+
+    const text = document.getElementById('update-banner-text');
+    const link = document.getElementById('update-banner-link');
+    if (text) {
+      text.textContent = `CashPilot ${state.latest} is available \u2014 you are running ${state.current}.`;
+    }
+    if (link) {
+      link.href = `https://github.com/GeiserX/CashPilot/releases/tag/${encodeURIComponent(state.latest)}`;
+    }
+    const dismiss = document.getElementById('update-banner-dismiss');
+    if (dismiss) {
+      dismiss.onclick = () => {
+        banner.hidden = true;
+        try {
+          localStorage.setItem('cp-update-dismissed', state.latest);
+        } catch (err) {
+          /* storage disabled: it will reappear next load, which is acceptable */
+        }
+      };
+    }
+    banner.hidden = false;
   }
 
   async function loadCollectorAlerts() {
@@ -2166,39 +3493,124 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     if (!container || !badge || !list) return;
 
     try {
-      const alerts = await api('/api/collector-alerts');
-      if (!alerts || alerts.length === 0) {
+      // Warn BEFORE the gap, not after it (CashPilot-5bdm): a credential the
+      // lifetime table says is about to lapse (or already past it, which is
+      // strictly worse and must not vanish from the bell the moment the
+      // forecast comes true) joins the bell while collection may still be
+      // working. The endpoint is any-authenticated and value-free; a failed
+      // fetch just means no early warnings, never a broken bell. A forecast
+      // gets its OWN category ('expiring') — it is a prediction, not an
+      // observed rejection, and the bell must not assert a 401 that never
+      // happened.
+      const [payload, health] = await Promise.all([
+        api('/api/collector-alerts'),
+        api('/api/credentials/health').catch(() => []),
+      ]);
+      const alerts = payload.alerts || [];
+      for (const row of (Array.isArray(health) ? health : [])) {
+        if (row.status !== 'expiring_soon' && row.status !== 'likely_expired') continue;
+        if (alerts.some(a => a.platform === row.service && a.kind === 'collector')) continue;
+        alerts.push({
+          kind: 'collector',
+          category: 'expiring',
+          platform: row.service,
+          error: row.status === 'likely_expired'
+            ? `Credential is past its usual lifetime — renew it (${row.field || 'credential'})`
+            : `Credential likely expires soon — renew it before collection stops (${row.field || 'credential'})`,
+        });
+      }
+      // Clear any muted "alerts unavailable" styling left over from a prior
+      // failed poll now that the fetch succeeded.
+      badge.style.background = '';
+      badge.title = '';
+      if (alerts.length === 0) {
         badge.style.display = 'none';
-        list.innerHTML = '<div class="notify-empty">All collectors healthy</div>';
+        // "Healthy" is a claim about something that was CHECKED. On a fresh
+        // install, or after a restart before the first collection, nothing has
+        // been — and saying so is the same absent-equals-true this codebase
+        // rejects everywhere else. The bell's failure path already gets this
+        // right ("Alerts unavailable"), which made the never-ran case the
+        // outlier (CashPilot-tb5).
+        // "Healthy" additionally requires the collection machinery to be
+        // ALIVE: the collected latch is permanent, so after a scheduler death
+        // the bell would otherwise affirm health forever on the strength of a
+        // collection that stopped happening. The server decides staleness.
+        if (payload.collected && payload.collection_stale) {
+          const mins = Math.floor((payload.last_run_age_seconds || 0) / 60);
+          list.innerHTML = `<div class="notify-empty">No collection in ${mins} minutes — status unknown. Check the server.</div>`;
+          return;
+        }
+        list.innerHTML = payload.collected
+          ? '<div class="notify-empty">All collectors healthy</div>'
+          : '<div class="notify-empty">No collection has run yet — nothing has been checked.</div>';
         return;
       }
 
       badge.style.display = '';
       badge.textContent = alerts.length;
-      list.innerHTML = alerts.map(a => `
-        <div class="notify-item" data-platform="${escapeHtml(a.platform)}">
-          <div class="notify-item-icon">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+      // A bell full of nothing but forecasts is advice, not an incident: mute
+      // the badge so a healthy install with an ageing cookie is not shown the
+      // same red count as a broken one.
+      if (alerts.every(a => a.category === 'expiring')) {
+        badge.style.background = 'var(--text-muted)';
+      }
+      // A payout is a question, not a fault. Rendering it with the warning
+      // triangle and an "Update credentials" button would tell the user
+      // something is broken at the exact moment they got paid.
+      const WARNING_ICON = '<path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>';
+      const PAYOUT_ICON = '<circle cx="12" cy="12" r="10"/><path d="M12 6v12M15 9.5a2.5 2.5 0 00-2.5-1.5h-1a2 2 0 000 4h1a2 2 0 010 4h-1A2.5 2.5 0 019 14.5"/>';
+      // A notice is a caveat about a reading that WORKED — "this figure is
+      // withdrawable balance only", not "this is broken". Same reasoning as the
+      // payout case above: the warning triangle and an "Update credentials"
+      // button would tell the user something is wrong and point them at the one
+      // action that cannot help.
+      const NOTICE_ICON = '<circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/>';
+      list.innerHTML = alerts.map(a => {
+        const isPayout = a.kind === 'payout';
+        const isNotice = a.kind === 'notice';
+        // The failure TAXONOMY (CashPilot-5bdm). Only 'auth' means "your
+        // credential needs replacing"; a transient provider outage self-heals
+        // and a shape change is our bug, so pointing the user at their
+        // credential for either teaches them the one alert that DOES need
+        // them is ignorable. Absent means unknown — the button stays, because
+        // unknown might be an auth failure the collector could not classify.
+        const category = a.category || '';
+        const isTransient = category === 'transient';
+        const isShape = category === 'shape';
+        const isAuth = category === 'auth';
+        const isExpiring = category === 'expiring';
+        const icon = isPayout ? PAYOUT_ICON : (isNotice || isTransient) ? NOTICE_ICON : WARNING_ICON;
+        const suffix = isPayout ? ' — payout?'
+          : isNotice ? ' — note'
+          : isAuth ? ' — credential expired'
+          : isExpiring ? ' — credential expiring'
+          : isTransient ? ' — provider unreachable'
+          : isShape ? ' — page changed (our bug)'
+          : '';
+        const muted = isNotice || isTransient;
+        const showFix = !isPayout && !isNotice && !isTransient && !isShape && _isOwner;
+        return `
+        <div class="notify-item" data-platform="${escapeHtml(a.platform)}" data-kind="${escapeHtml(a.kind || 'collector')}"${category ? ` data-category="${escapeHtml(category)}"` : ''}>
+          <div class="notify-item-icon"${muted ? ' style="color:var(--text-muted);"' : ''}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${icon}</svg>
           </div>
           <div class="notify-item-body">
-            <div class="notify-item-platform">${escapeHtml(a.platform)}</div>
+            <div class="notify-item-platform">${escapeHtml(a.platform)}${suffix}</div>
             <div class="notify-item-msg" title="${escapeHtml(a.error)}">${escapeHtml(a.error)}</div>
           </div>
-          ${_isOwner ? `<button class="btn btn-ghost btn-sm" onclick="event.stopPropagation(); CP.openCredentialModal('${escapeHtml(a.platform)}')" style="font-size:0.65rem; padding:2px 6px; white-space:nowrap; flex-shrink:0;">Update</button>` : ''}
+          ${showFix ? `<button class="btn btn-ghost btn-sm" data-action="openCredentialModal" data-stop="1" data-a1="${escapeHtml(a.platform)}" style="font-size:0.65rem; padding:2px 6px; white-space:nowrap; flex-shrink:0;">${isAuth ? 'Fix credential' : 'Update'}</button>` : ''}
         </div>
-      `).join('');
+      `;
+      }).join('');
     } catch {
-      badge.style.display = 'none';
-    }
-  }
-
-  function goToCollectorSettings(platform) {
-    // Navigate to settings and open the relevant collector section
-    if (window.location.pathname === '/settings') {
-      // Already on settings — just open the section
-      openCollectorSection(platform);
-    } else {
-      window.location.href = '/settings?highlight=' + encodeURIComponent(platform);
+      // The bell's own fetch failed — this is unknown, not healthy. Show a
+      // neutral/muted indicator rather than hiding the badge (which would
+      // read as "all collectors healthy").
+      badge.style.display = '';
+      badge.style.background = 'var(--text-muted)';
+      badge.textContent = '?';
+      badge.title = 'Alerts unavailable';
+      list.innerHTML = '<div class="notify-empty">Alerts unavailable — could not reach the server</div>';
     }
   }
 
@@ -2243,6 +3655,9 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
       _displayCurrency = select.value;
       localStorage.setItem('cp-display-currency', select.value);
       toast(`Display currency set to ${select.value}`, 'success');
+      // The fiat half of the staleness notice depends on which currency is being
+      // read, so it has to be recomputed when that changes.
+      renderStaleRateNotice();
       const topbarSelect = document.getElementById('topbar-currency');
       if (topbarSelect) topbarSelect.value = select.value;
     });
@@ -2278,6 +3693,20 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
   function initAvatarDropdown() {
     const toggle = document.getElementById('avatar-toggle');
     const dropdown = document.getElementById('avatar-dropdown');
+
+    // Submit the change-password modal on Enter from any of its fields.
+    ['chpw-current', 'chpw-new', 'chpw-confirm'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            submitPasswordChange();
+          }
+        });
+      }
+    });
+
     if (!toggle || !dropdown) return;
     toggle.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -2320,6 +3749,7 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     select.addEventListener('change', () => {
       _displayCurrency = select.value;
       localStorage.setItem('cp-display-currency', select.value);
+      renderStaleRateNotice();
       // Re-render dashboard if on that page
       if (document.body.dataset.page === 'dashboard') {
         loadDashboardStats();
@@ -2508,8 +3938,29 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
   // -----------------------------------------------------------
   // Public API
   // -----------------------------------------------------------
+  // The frontend had NO date formatting of any kind — grep for toLocaleString,
+  // toLocaleDateString or `new Date(` across app.js and fleet.html returned zero
+  // hits — so every timestamp reached the user as whatever the server
+  // serialised. The DB writes datetime('now'), which SQLite produces in UTC, and
+  // it was rendered raw and unlabelled: a viewer in CEST read a worker that
+  // heartbeated five minutes ago as two hours stale, right next to the words
+  // "This host is not reachable" and one click from Remove (CashPilot-2dh).
+  function fmtTimestamp(value) {
+    if (!value) return { text: 'never', title: '' };
+    // SQLite's "YYYY-MM-DD HH:MM:SS" carries no zone designator, so Date.parse
+    // treats it as LOCAL time and silently shifts it. Say UTC explicitly.
+    const iso = String(value).trim().replace(' ', 'T');
+    const parsed = new Date(/[Zz]|[+-]\d{2}:?\d{2}$/.test(iso) ? iso : `${iso}Z`);
+    if (Number.isNaN(parsed.getTime())) {
+      // Unparseable is not a licence to invent a time. Show what we were given.
+      return { text: String(value), title: 'CashPilot could not read this timestamp' };
+    }
+    return { text: parsed.toLocaleString(), title: `${value} UTC` };
+  }
+
   return {
     api,
+    checkForUpdate,
     toast,
     openModal,
     closeModal,
@@ -2534,7 +3985,7 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     filterCatalog,
     refreshServices,
     openClaimModal,
-    goToCollectorSettings,
+    loadServicesTable,
     toggleInstances,
     deployServiceToWorkers,
     workerAction,
@@ -2547,5 +3998,21 @@ NOT encrypt the stored default. Full reference: services/_schema.yml.</div>
     saveServiceSpec,
     resetServiceSpec,
     validateServiceSpec,
+    openChangePasswordModal,
+    submitPasswordChange,
+    loadPayoutQueue,
+    loadCredentialHealth,
+    loadPayoutProgress,
+    loadDeployRisk,
+    confirmPayout,
+    rejectPayout,
+    runSelfUpdate,
+    // Exposed for fleet.html, which rendered running costs with a bare
+    // Number(v).toFixed(2) — no unit at all, on figures that mixed USD earnings
+    // with a tariff in the user's own currency. The API is canonical USD now,
+    // and this is the one place that knows the viewer's display currency.
+    formatCurrency,
+    // Shared, so the next timestamp added does not repeat CashPilot-2dh.
+    fmtTimestamp,
   };
 })();

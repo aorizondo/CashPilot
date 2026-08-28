@@ -10,10 +10,11 @@ import os
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 os.environ.setdefault("CASHPILOT_API_KEY", "test-fleet-key")
 
 import httpx
-import pytest
 import yaml
 
 from app import catalog, database
@@ -217,14 +218,14 @@ class TestMakeCollectorsEdgeCases:
 
 
 # ---------------------------------------------------------------------------
-# bytelixir.py — _make_client, parse balance edge cases
+# bytelixir.py — _get_client, parse balance edge cases
 # ---------------------------------------------------------------------------
 
 
-class TestBytelixirMakeClient:
-    """Cover lines 59-77: _make_client with remember_web and xsrf_token."""
+class TestBytelixirGetClient:
+    """Cover _get_client with remember_web and xsrf_token."""
 
-    def test_make_client_with_all_cookies(self):
+    def test_get_client_with_all_cookies(self):
         from app.collectors.bytelixir import BytelixirCollector
 
         c = BytelixirCollector(
@@ -232,7 +233,7 @@ class TestBytelixirMakeClient:
             remember_web="remember-val",
             xsrf_token="xsrf-val",
         )
-        client = c._make_client()
+        client = c._get_client()
         assert isinstance(client, httpx.AsyncClient)
         # Verify cookies are set
         cookies = dict(client.cookies)
@@ -241,11 +242,11 @@ class TestBytelixirMakeClient:
         assert "XSRF-TOKEN" in cookies
         asyncio.run(client.aclose())
 
-    def test_make_client_session_only(self):
+    def test_get_client_session_only(self):
         from app.collectors.bytelixir import BytelixirCollector
 
         c = BytelixirCollector(session_cookie="sess-only")
-        client = c._make_client()
+        client = c._get_client()
         cookies = dict(client.cookies)
         assert "bytelixir_session" in cookies
         assert c._REMEMBER_COOKIE not in cookies
@@ -303,6 +304,19 @@ def _no_auth():
     return patch("app.main.auth.get_current_user", return_value=None)
 
 
+@pytest.fixture(autouse=True)
+def _no_recorded_deployment_spec():
+    """Default these tests to "this service has never been deployed".
+
+    The deploy route now reads the previously recorded spec so a redeploy
+    reproduces the container that is actually running. Returning None keeps the
+    pre-existing behaviour these tests assert on - build the spec from the
+    catalog - without each of them having to mock the database.
+    """
+    with patch("app.main.database.get_deployment_spec", new_callable=AsyncMock, return_value=None):
+        yield
+
+
 @pytest.fixture
 def client():
     from app.main import app
@@ -338,15 +352,18 @@ class TestMainHealthCheckWithContainers:
         mock_record = AsyncMock()
         with (
             patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=workers),
-            patch("app.main.database.record_health_event", mock_record),
+            patch("app.main.database.get_deployments", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.record_health_events", mock_record),
         ):
             asyncio.run(_run_health_check())
 
-        # Should record check_ok for honeygain (running) and check_down for earnapp (stopped)
-        calls = mock_record.call_args_list
-        slugs_events = [(c.args[0], c.args[1]) for c in calls]
-        assert ("honeygain", "check_ok") in slugs_events
-        assert ("earnapp", "check_down") in slugs_events
+        # One batched write carrying check_ok for honeygain (running) and check_down for
+        # earnapp (stopped).
+        mock_record.assert_awaited_once()
+        events = mock_record.call_args.args[0]
+        pairs = [(e[0], e[1]) for e in events]
+        assert ("honeygain", "check_ok") in pairs
+        assert ("earnapp", "check_down") in pairs
 
 
 class TestMainStaleWorkers:
@@ -369,10 +386,18 @@ class TestMainRunCollectionException:
     """Cover line 167: _run_collection total failure."""
 
     def test_run_collection_total_exception(self):
+        import app.main as main_mod
         from app.main import _run_collection
 
+        # Seed a stale clean alert state; a total crash must REPLACE it with a
+        # synthetic "collection failed" alert (not leave the bell showing green).
+        main_mod._collector_alerts = []
         with patch("app.main.database.get_deployments", new_callable=AsyncMock, side_effect=Exception("DB down")):
             asyncio.run(_run_collection())  # Should not raise
+
+        assert main_mod._collector_alerts, "crash must publish a synthetic alert"
+        assert main_mod._collector_alerts[0]["platform"] == "collection"
+        assert "failed" in main_mod._collector_alerts[0]["error"].lower()
 
 
 class TestMainDeployCommandEdgeCases:
@@ -605,46 +630,115 @@ class TestMainPerNodeEarnings:
             assert resp.status_code == 200
 
 
-class TestMainSetConfigExternalDeploySkip:
-    """Cover lines 1456, 1460: config set that skips services with images."""
+class TestMainSetConfigCreatesTrackingRows:
+    """An image-backed service DOES get a tracking row from credentials alone.
 
-    def test_set_config_skips_docker_service(self, client):
-        """When all required keys are provided for a docker-image service, don't auto-deploy."""
+    This class previously asserted the opposite — "for a docker-image service,
+    don't auto-deploy" — which is the defect CashPilot-1f8 describes. Collection
+    is driven by deployment rows, so skipping image-backed services meant
+    saving credentials for 12 of the 15 collectors did nothing at all, while
+    Settings promised it was enough.
+
+    The row is a placeholder with an empty container id and status "external".
+    It does not deploy anything; api_deploy replaces it if the user later
+    deploys through CashPilot.
+    """
+
+    def test_an_image_backed_service_gets_a_tracking_row(self, client):
         svc = {"slug": "honeygain", "docker": {"image": "hg:latest"}}
+        merged = {"honeygain_email": "test@test.com", "honeygain_password": "pass"}
         with (
             _auth_owner(),
             patch("app.main.database.set_config_bulk", new_callable=AsyncMock),
+            patch("app.main.database.get_config", new_callable=AsyncMock, return_value=merged),
             patch("app.main.catalog.get_service", return_value=svc),
-            patch("app.main.database.get_deployment", new_callable=AsyncMock),
+            patch("app.main.database.get_deployment", new_callable=AsyncMock, return_value=None),
             patch("app.main.database.save_deployment", new_callable=AsyncMock) as mock_save,
         ):
-            resp = client.post(
-                "/api/config",
-                json={
-                    "data": {
-                        "honeygain_email": "test@test.com",
-                        "honeygain_password": "pass",
-                    }
-                },
-            )
+            resp = client.post("/api/config", json={"data": merged})
+            assert resp.status_code == 200
+            mock_save.assert_called_once()
+            assert mock_save.await_args.kwargs["status"] == "external"
+            assert mock_save.await_args.kwargs["container_id"] == ""
+
+    def test_an_existing_deployment_is_not_overwritten(self, client):
+        """A real deployment must keep its container id and status."""
+        svc = {"slug": "honeygain", "docker": {"image": "hg:latest"}}
+        merged = {"honeygain_email": "test@test.com", "honeygain_password": "pass"}
+        with (
+            _auth_owner(),
+            patch("app.main.database.set_config_bulk", new_callable=AsyncMock),
+            patch("app.main.database.get_config", new_callable=AsyncMock, return_value=merged),
+            patch("app.main.catalog.get_service", return_value=svc),
+            patch(
+                "app.main.database.get_deployment",
+                new_callable=AsyncMock,
+                return_value={"slug": "honeygain", "status": "running", "container_id": "abc"},
+            ),
+            patch("app.main.database.save_deployment", new_callable=AsyncMock) as mock_save,
+        ):
+            resp = client.post("/api/config", json={"data": merged})
             assert resp.status_code == 200
             mock_save.assert_not_called()
 
 
 class TestMainClearConfigWithDockerService:
-    """Cover main.py clear config for docker-based service."""
+    """Clearing credentials removes the tracking placeholder — and nothing else.
 
-    def test_clear_config_docker_service_no_deployment_removed(self, client):
+    The rule is now the deployment's STATUS, not whether the service has an
+    image. Image-backed services DO get an auto-created "external" row when
+    their credentials are saved (that is what makes tracking-only work), so
+    gating on the image would either leave placeholders behind or, worse,
+    delete the row of a container the user really deployed.
+    """
+
+    def test_a_real_deployment_is_never_removed(self, client):
+        """Clearing credentials must not orphan a running container."""
         svc = {"slug": "honeygain", "docker": {"image": "hg:latest"}}
         with (
             _auth_owner(),
             patch("app.main.database.delete_config_keys", new_callable=AsyncMock),
             patch("app.main.catalog.get_service", return_value=svc),
+            patch(
+                "app.main.database.get_deployment",
+                new_callable=AsyncMock,
+                return_value={"slug": "honeygain", "status": "running", "container_id": "abc123"},
+            ),
             patch("app.main.database.remove_deployment", new_callable=AsyncMock) as mock_rm,
         ):
             resp = client.delete("/api/config/honeygain")
             assert resp.status_code == 200
-            # Docker services don't auto-create external deployments, so no removal
+            mock_rm.assert_not_called()
+
+    def test_the_tracking_placeholder_is_removed(self, client):
+        """An "external" row exists only because credentials were saved."""
+        svc = {"slug": "honeygain", "docker": {"image": "hg:latest"}}
+        with (
+            _auth_owner(),
+            patch("app.main.database.delete_config_keys", new_callable=AsyncMock),
+            patch("app.main.catalog.get_service", return_value=svc),
+            patch(
+                "app.main.database.get_deployment",
+                new_callable=AsyncMock,
+                return_value={"slug": "honeygain", "status": "external", "container_id": ""},
+            ),
+            patch("app.main.database.remove_deployment", new_callable=AsyncMock) as mock_rm,
+        ):
+            resp = client.delete("/api/config/honeygain")
+            assert resp.status_code == 200
+            mock_rm.assert_called_once()
+
+    def test_no_deployment_at_all_is_a_no_op(self, client):
+        svc = {"slug": "honeygain", "docker": {"image": "hg:latest"}}
+        with (
+            _auth_owner(),
+            patch("app.main.database.delete_config_keys", new_callable=AsyncMock),
+            patch("app.main.catalog.get_service", return_value=svc),
+            patch("app.main.database.get_deployment", new_callable=AsyncMock, return_value=None),
+            patch("app.main.database.remove_deployment", new_callable=AsyncMock) as mock_rm,
+        ):
+            resp = client.delete("/api/config/honeygain")
+            assert resp.status_code == 200
             mock_rm.assert_not_called()
 
 
@@ -696,7 +790,7 @@ class TestMainWorkerCommandHttpError:
         mock_client.post.return_value = error_resp
 
         with (
-            _auth_writer(),
+            _auth_owner(),  # deploy via command is owner-gated
             patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
             patch("app.main.httpx.AsyncClient", return_value=mock_client),
             patch("app.main.FLEET_API_KEY", "test-key"),
@@ -726,7 +820,10 @@ class TestMainEarningsSummaryWithWorkerException:
         ):
             resp = client.get("/api/earnings/summary")
             assert resp.status_code == 200
-            assert resp.json()["active_services"] == 0
+            # None, not 0. The count could not be TAKEN — reporting zero here
+            # says "nothing is running" about a fleet nobody could read
+            # (CashPilot-45k).
+            assert resp.json()["active_services"] is None
 
 
 class TestMainServicesDeployedMultiStatus:
@@ -886,18 +983,14 @@ class TestCollectorSmallGaps:
         # Should either succeed with 0 or have an error
         assert isinstance(result, EarningsResult)
 
-    def test_earnfm_login_response_missing_token(self):
-        """Cover earnfm.py lines 53, 59: login without access_token."""
+    def test_earnfm_empty_credentials(self):
+        """Cover earnfm.py: empty credentials returns error."""
         from app.collectors.earnfm import EarnFMCollector
 
-        login_resp = _mock_response(200, {})  # missing access_token
-        client = _make_async_client()
-        client.post.return_value = login_resp
-
-        with patch("app.collectors.earnfm.httpx.AsyncClient", return_value=client):
-            c = EarnFMCollector(email="test@test.com", password="pass")
-            result = asyncio.run(c.collect())
-        assert isinstance(result, EarningsResult)
+        c = EarnFMCollector(email="", password="")
+        result = asyncio.run(c.collect())
+        assert result.error is not None
+        assert "No credentials" in result.error
 
     def test_bitping_login_missing_cookie(self):
         """Cover bitping.py lines 45-48: login without cookie set."""
@@ -914,18 +1007,20 @@ class TestCollectorSmallGaps:
             result = asyncio.run(c.collect())
         assert result.error is not None
 
-    def test_traffmonetizer_login_missing_token(self):
-        """Cover traffmonetizer.py line 45: login response without token."""
+    def test_traffmonetizer_403_returns_expired_error(self):
+        """Cover traffmonetizer.py: 403 response returns token expired error."""
         from app.collectors.traffmonetizer import TraffmonetizerCollector
 
-        login_resp = _mock_response(200, {"data": {}})
+        resp_403 = MagicMock()
+        resp_403.status_code = 403
         client = _make_async_client()
-        client.post.return_value = login_resp
+        client.get.return_value = resp_403
 
         with patch("app.collectors.traffmonetizer.httpx.AsyncClient", return_value=client):
-            c = TraffmonetizerCollector(email="test@test.com", password="pass")
+            c = TraffmonetizerCollector(token="some-jwt")
             result = asyncio.run(c.collect())
         assert isinstance(result, EarningsResult)
+        assert "expired" in result.error.lower()
 
     def test_repocket_login_missing_token(self):
         """Cover repocket.py lines 49, 55: login without idToken."""
@@ -1087,3 +1182,211 @@ class TestAuthOSError:
             result = auth._resolve_secret_key()
             # Should generate a new key since reading failed
             assert len(result) > 20
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator: volume cleanup on remove
+# ---------------------------------------------------------------------------
+
+
+docker = pytest.importorskip("docker")
+
+
+class TestOrchestratorVolumeCleanup:
+    """Cover orchestrator.remove_service with delete_volumes flag."""
+
+    def test_remove_without_volumes(self):
+        from app import orchestrator
+
+        container = MagicMock()
+        container.name = "cashpilot-test"
+        container.attrs = {"Mounts": []}
+
+        with patch.object(orchestrator, "_find_container", return_value=container):
+            result = orchestrator.remove_service("test")
+
+        container.remove.assert_called_once_with(force=True)
+        assert result["container"] == "cashpilot-test"
+        assert result["deleted_volumes"] == []
+        assert result["failed_volumes"] == []
+
+    def test_remove_with_delete_volumes_named(self):
+        from app import orchestrator
+
+        container = MagicMock()
+        container.name = "cashpilot-honeygain"
+        container.attrs = {
+            "Mounts": [
+                {"Type": "volume", "Name": "honeygain_data"},
+                {"Type": "bind", "Source": "/host/path"},
+                {"Type": "volume", "Name": "honeygain_config"},
+            ]
+        }
+
+        mock_vol = MagicMock()
+        mock_client = MagicMock()
+        mock_client.volumes.get.return_value = mock_vol
+
+        with (
+            patch.object(orchestrator, "_find_container", return_value=container),
+            patch.object(orchestrator, "_get_client", return_value=mock_client),
+        ):
+            result = orchestrator.remove_service("honeygain", delete_volumes=True)
+
+        container.remove.assert_called_once_with(force=True)
+        assert "honeygain_data" in result["deleted_volumes"]
+        assert "honeygain_config" in result["deleted_volumes"]
+        assert result["failed_volumes"] == []
+        assert mock_vol.remove.call_count == 2
+
+    def test_remove_volume_not_found_counts_as_deleted(self):
+        from docker.errors import NotFound
+
+        from app import orchestrator
+
+        container = MagicMock()
+        container.name = "cashpilot-honeygain"
+        # A real, non-critical slug: remove_service refuses to delete volumes for a
+        # slug it cannot find in the catalog, since it cannot tell whether the data
+        # is irreplaceable. That guard is covered in test_critical_volumes.py.
+        container.attrs = {"Mounts": [{"Type": "volume", "Name": "gone_vol", "Destination": "/data"}]}
+
+        mock_client = MagicMock()
+        mock_client.volumes.get.side_effect = NotFound("gone")
+
+        with (
+            patch.object(orchestrator, "_find_container", return_value=container),
+            patch.object(orchestrator, "_get_client", return_value=mock_client),
+        ):
+            result = orchestrator.remove_service("honeygain", delete_volumes=True)
+
+        assert "gone_vol" in result["deleted_volumes"]
+        assert result["failed_volumes"] == []
+
+    def test_remove_volume_api_error_recorded(self):
+        from docker.errors import APIError
+
+        from app import orchestrator
+
+        container = MagicMock()
+        container.name = "cashpilot-honeygain"
+        container.attrs = {"Mounts": [{"Type": "volume", "Name": "busy_vol", "Destination": "/data"}]}
+
+        mock_vol = MagicMock()
+        mock_vol.remove.side_effect = APIError("volume in use")
+        mock_client = MagicMock()
+        mock_client.volumes.get.return_value = mock_vol
+
+        with (
+            patch.object(orchestrator, "_find_container", return_value=container),
+            patch.object(orchestrator, "_get_client", return_value=mock_client),
+        ):
+            result = orchestrator.remove_service("honeygain", delete_volumes=True)
+
+        assert result["deleted_volumes"] == []
+        assert "busy_vol" in result["failed_volumes"]
+
+    def test_delete_volumes_false_skips_volume_inspection(self):
+        from app import orchestrator
+
+        container = MagicMock()
+        container.name = "cashpilot-test"
+        container.attrs = {"Mounts": [{"Type": "volume", "Name": "keep_me"}]}
+
+        with patch.object(orchestrator, "_find_container", return_value=container):
+            result = orchestrator.remove_service("test", delete_volumes=False)
+
+        assert result["deleted_volumes"] == []
+        assert result["failed_volumes"] == []
+
+
+class TestDockerAvailable:
+    """Cover orchestrator.docker_available: cached-True fast path + re-probe on failure."""
+
+    def test_cached_true_short_circuits(self):
+        from app import orchestrator
+
+        orig = orchestrator._docker_available
+        try:
+            orchestrator._docker_available = True
+            # Must return True without touching docker.from_env at all.
+            with patch.object(orchestrator.docker, "from_env", side_effect=AssertionError("should not probe")):
+                assert orchestrator.docker_available() is True
+        finally:
+            orchestrator._docker_available = orig
+
+    def test_reprobes_and_succeeds(self):
+        from app import orchestrator
+
+        orig = orchestrator._docker_available
+        try:
+            orchestrator._docker_available = False  # negative state must re-probe
+            mock_client = MagicMock()
+            with patch.object(orchestrator.docker, "from_env", return_value=mock_client):
+                assert orchestrator.docker_available() is True
+            mock_client.ping.assert_called_once()
+        finally:
+            orchestrator._docker_available = orig
+
+    def test_reprobe_failure_stays_false(self):
+        from app import orchestrator
+
+        orig = orchestrator._docker_available
+        try:
+            orchestrator._docker_available = False
+            with patch.object(orchestrator.docker, "from_env", side_effect=Exception("no socket")):
+                assert orchestrator.docker_available() is False
+        finally:
+            orchestrator._docker_available = orig
+
+
+class TestBytelixirCookieFieldsAreOffered:
+    """The durable cookies must be declared, or they are silently unusable.
+
+    BytelixirCollector already accepted remember_web and xsrf_token, but the
+    registry declared only session_cookie — so the settings UI never asked for
+    them and make_collectors() never passed them. Since bytelixir_session
+    expires ~2h after issue, that made the collector die the same afternoon it
+    was configured, with the fix (remember_web, a year-long cookie) sitting
+    unreachable in the code.
+    """
+
+    def test_optional_cookies_are_declared(self):
+        from app.collectors import _COLLECTOR_ARGS
+
+        args = _COLLECTOR_ARGS["bytelixir"]
+        assert "session_cookie" in args
+        assert "?remember_web" in args, "durable cookie must be offered in the UI"
+        assert "?xsrf_token" in args
+
+    def test_they_are_optional_so_setup_is_not_blocked(self):
+        from app.main import _collector_needs_setup
+
+        cfg = {"bytelixir_session_cookie": "abc"}
+        assert _collector_needs_setup("bytelixir", cfg) is False
+
+    def test_missing_required_cookie_still_flags_setup(self):
+        from app.main import _collector_needs_setup
+
+        assert _collector_needs_setup("bytelixir", {}) is True
+
+    def test_declared_cookies_reach_the_collector(self):
+        from app.collectors import make_collectors
+
+        cols = make_collectors(
+            [{"slug": "bytelixir"}],
+            {
+                "bytelixir_session_cookie": "sess",
+                "bytelixir_remember_web": "rem",
+                "bytelixir_xsrf_token": "xsrf",
+            },
+        )
+        c = next(c for c in cols if c.platform == "bytelixir")
+        assert c.remember_web == "rem", "remember_web must be passed through, not dropped"
+        assert c.xsrf_token == "xsrf"
+
+    def test_all_three_are_encrypted_at_rest(self):
+        from app.database import _is_secret_key
+
+        for k in ("bytelixir_session_cookie", "bytelixir_remember_web", "bytelixir_xsrf_token"):
+            assert _is_secret_key(k), f"{k} must be encrypted and masked"

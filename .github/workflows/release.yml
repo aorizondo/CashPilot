@@ -5,12 +5,12 @@ on:
     branches: [main]
     paths:
       - 'Dockerfile'
+      - 'entrypoint.sh'
       - 'Dockerfile.worker'
-      - 'requirements.txt'
-      - 'requirements-worker.txt'
+      - 'pyproject.toml'
+      - 'uv.lock'
       - 'app/**'
       - 'services/**'
-      - 'docker-compose*.yml'
   workflow_dispatch:
 
 permissions:
@@ -20,24 +20,39 @@ permissions:
 jobs:
   ci:
     name: Verify CI passes
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
         with:
-          python-version: '3.12'
-          cache: 'pip'
+          # The same tags test.yml needs. tests/test_compose_image_pins.py
+          # compares the pinned image tag against the newest RELEASED version,
+          # and fails loudly rather than skipping when it finds no tags — so
+          # without this the whole release is blocked by a test that is working
+          # exactly as designed. It blocked v1.11.4 after six merges.
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@v7.0.0
+        with:
+          # The interpreter the images ship (Dockerfile:2, Dockerfile.worker:2),
+          # and the one test.yml uses. This job is what the release is actually
+          # gated on -- test.yml gates nothing -- so on 3.12 a commit could be
+          # tagged and pushed to Docker Hub while its 3.14 suite was red.
+          # uv sync --frozen resolves markers per interpreter, so the two really
+          # did install different wheels. Same class as CashPilot-de1.
+          python-version: '3.14'
+      - name: Install uv
+        run: pip install uv --quiet
       - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-dev.txt --quiet
+        run: uv sync --frozen --extra dev
       - name: Lint
-        run: ruff check . && ruff format --check .
+        run: uv run ruff check . && uv run ruff format --check .
       - name: Test
-        run: pytest
+        run: uv run pytest
 
   release:
     needs: ci
     name: Bump version and release
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     if: "!contains(github.event.head_commit.message, '[skip ci]')"
     outputs:
       new_tag: ${{ steps.version.outputs.new_tag }}
@@ -45,29 +60,110 @@ jobs:
       build_worker: ${{ steps.changes.outputs.worker }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
+
+      # The change detector asks uv what the no-dev resolution was at the last
+      # tag. Without uv on PATH the script says "changed" and is fail-safe but
+      # useless, so install it before anything reads its answer.
+      #
+      # The SAME uv the images build with, read out of the Dockerfile rather
+      # than restated here: uv guarantees lockfile compatibility within a minor
+      # release, and a detector on a different one would be judging a
+      # resolution nobody ships. Warns rather than fails if it cannot read the
+      # version -- an unpinned uv still compares both refs with one binary, so
+      # the answer stays sound; tests/test_release_triggers.py is what keeps the
+      # Dockerfile readable. (CodeRabbit, PR #354.)
+      - name: Install uv
+        run: |
+          UV_VERSION=$(grep -oE 'astral-sh/uv:[0-9]+\.[0-9]+\.[0-9]+' Dockerfile | head -1 | cut -d: -f2)
+          if [ -z "$UV_VERSION" ]; then
+            echo "::warning::could not read the uv version from Dockerfile; installing the newest"
+            pip install uv --quiet
+          else
+            echo "Installing uv $UV_VERSION, the version Dockerfile builds with"
+            pip install "uv==$UV_VERSION" --quiet
+          fi
 
       - name: Detect what changed
         id: changes
         run: |
-          CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          # Diff across everything since the last RELEASE, not just the last
+          # commit. A release contains every commit since the previous tag, and
+          # HEAD~1 only sees the newest one -- so a release whose app changes
+          # landed in earlier commits (anything merged with [skip ci], or a
+          # workflow_dispatch run) detected "nothing to build", skipped the
+          # version step, and silently produced no tag and no image while the
+          # run still reported success.
+          LAST_TAG=$(git tag -l 'v*.*.*' --sort=-v:refname | head -1)
+          if [ -n "$LAST_TAG" ]; then
+            CHANGED=$(git diff --name-only "$LAST_TAG"..HEAD 2>/dev/null || echo "")
+            echo "Comparing $LAST_TAG..HEAD"
+          else
+            CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+            echo "No previous tag; comparing HEAD~1..HEAD"
+          fi
           echo "Changed files: $CHANGED"
 
           BUILD_UI=false
           BUILD_WORKER=false
 
-          if echo "$CHANGED" | grep -qE '^(Dockerfile|requirements\.txt|app/(main|database|catalog|auth|compose_generator|exchange_rates|constants|collectors|templates|static))'; then
+          # The UI image does `COPY app/ ./app/` — the WHOLE directory — so ANY
+          # change under app/ belongs in a UI build. The hand-maintained module
+          # allowlist that used to live here named 13 of 27 modules, so a change
+          # to any of the other 14 (payouts, preflight, power, egress,
+          # lan_isolation, notify, ...) produced a GREEN release run that
+          # published nothing at all: no tag, no GitHub Release, no images.
+          # Skipped steps do not fail a run, so it looked like a success.
+          # uv.lock and pyproject.toml hold the DEV group too, and both images
+          # build with `uv sync --frozen --no-dev`. Matching on the filename
+          # meant a pytest or ruff bump -- the most frequent dependency PR there
+          # is -- cut a full release. v1.36.4 was exactly that: 78 entries in
+          # site-packages, not one of them different from v1.36.3, and three
+          # containers restarted on the fleet for a version label.
+          #
+          # So the manifests do not trigger by name. The script exports the
+          # no-dev resolution at both refs with the real resolver and compares,
+          # and every way of not knowing answers "changed".
+          RUNTIME_CHANGED=false
+          if echo "$CHANGED" | grep -qE '^(pyproject\.toml|uv\.lock)$'; then
+            if [ -n "$LAST_TAG" ]; then
+              RUNTIME_CHANGED=$(python3 scripts/runtime_deps_changed.py "$LAST_TAG" HEAD || echo true)
+            else
+              RUNTIME_CHANGED=true
+            fi
+          fi
+          echo "Runtime dependencies changed: $RUNTIME_CHANGED"
+
+          if echo "$CHANGED" | grep -qE '^(Dockerfile|entrypoint\.sh|app/)'; then
             BUILD_UI=true
+          fi
+          if [ "$RUNTIME_CHANGED" = true ]; then
+            BUILD_UI=true
+            BUILD_WORKER=true
           fi
           if echo "$CHANGED" | grep -qE '^services/'; then
             BUILD_UI=true
-          fi
-
-          if echo "$CHANGED" | grep -qE '^(Dockerfile\.worker|requirements-worker\.txt|app/(worker_api|orchestrator|constants)\.py)'; then
             BUILD_WORKER=true
           fi
+
+          # The worker image copies an explicit list of modules, so its trigger
+          # is DERIVED FROM Dockerfile.worker rather than restated here. The
+          # previous hand-written list omitted egress.py and state_backup.py —
+          # both COPY'd into the worker and imported by worker_api at runtime —
+          # so a change to either published a worker image tagged with the new
+          # version while containing the previous release's code.
+          WORKER_MODULES=$(grep -oE '^COPY[^#]*app/([a-z_]+)\.py' Dockerfile.worker \
+            | grep -oE 'app/[a-z_]+\.py' | sort -u)
+          echo "Worker modules (from Dockerfile.worker):"; echo "$WORKER_MODULES"
+          if echo "$CHANGED" | grep -qE '^(Dockerfile\.worker|entrypoint\.sh)'; then
+            BUILD_WORKER=true
+          fi
+          while IFS= read -r mod; do
+            [ -n "$mod" ] || continue
+            if echo "$CHANGED" | grep -qxF "$mod"; then BUILD_WORKER=true; fi
+          done <<< "$WORKER_MODULES"
 
           if echo "$CHANGED" | grep -qE '^app/__init__\.py'; then
             BUILD_UI=true
@@ -98,36 +194,235 @@ jobs:
           MAJOR=$(echo "$VERSION" | cut -d. -f1)
           MINOR=$(echo "$VERSION" | cut -d. -f2)
           PATCH=$(echo "$VERSION" | cut -d. -f3)
-          NEW_PATCH=$((PATCH + 1))
-          NEW_TAG="v${MAJOR}.${MINOR}.${NEW_PATCH}"
+
+          # Choose the bump from conventional-commit markers in the commits since
+          # the last tag: a "BREAKING CHANGE" footer or a "type!:" subject -> major;
+          # a "feat:" -> minor; otherwise patch. Still fully automated — no manual tags.
+          if [ "$LATEST" = "v0.0.0" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${LATEST}..HEAD"
+          fi
+          LOG=$(git log --format='%s%n%b' "$RANGE")
+          if echo "$LOG" | grep -qE '^BREAKING CHANGE:|^[a-z]+(\([^)]*\))?!:'; then
+            MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
+            LEVEL="major"
+          elif echo "$LOG" | grep -qE '^feat(\([^)]*\))?:'; then
+            MINOR=$((MINOR + 1)); PATCH=0
+            LEVEL="minor"
+          else
+            PATCH=$((PATCH + 1))
+            LEVEL="patch"
+          fi
+          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
           echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
-          echo "Bumping $LATEST -> $NEW_TAG"
+          echo "Bumping $LATEST -> $NEW_TAG ($LEVEL)"
 
-      - name: Create and push tag
-        if: steps.version.outputs.new_tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ steps.version.outputs.new_tag }}" -m "Release ${{ steps.version.outputs.new_tag }}"
-          git push origin "${{ steps.version.outputs.new_tag }}"
 
-      - name: Create GitHub Release
-        if: steps.version.outputs.new_tag
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.new_tag }}
-          generate_release_notes: true
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     needs: release
     if: needs.release.outputs.new_tag
     uses: ./.github/workflows/build.yml
     with:
-      build_ui: ${{ needs.release.outputs.build_ui == 'true' }}
-      build_worker: ${{ needs.release.outputs.build_worker == 'true' }}
+      # BOTH images are built on every release, deliberately.
+      #
+      # The change detection above still decides whether to release AT ALL; it
+      # no longer decides whether to build. When it said "the worker did not
+      # change", build.yml re-tagged the previous image by copying its manifest
+      # -- and the version is BAKED INTO THAT IMAGE (Dockerfile ARG -> ENV). So
+      # the copy was not equivalent: cashpilot-worker:1.13.0, :1.14.0 and
+      # :1.14.1 all resolved to ONE digest that reported itself as 1.13.0, and
+      # every worker on the fleet page showed a version it was not running.
+      # A wrong version reads as a MATCH, which hides exactly the staleness
+      # version reporting exists to reveal.
+      #
+      # These are ~94MB Alpine images with a warm buildx cache, so the saving
+      # was small and the correctness cost was real. This file already records
+      # two incidents where skipping a build produced a green run that published
+      # nothing; this is the third of that family.
+      build_ui: true
+      build_worker: true
       version: ${{ needs.release.outputs.new_tag }}
     secrets: inherit
+
+  # Nothing is announced until the images exist.
+  #
+  # The tag was pushed and the GitHub Release published BEFORE this build ran,
+  # so any failure in it — a Docker Hub outage, a rate limit, or the arm64 QEMU
+  # emulation, which is the slowest and most failure-prone step — left an
+  # announced version with no images. A user saw the release notification,
+  # edited their compose, ran docker compose pull and got "manifest unknown".
+  #
+  # Recovery was manual and the repo's own CLAUDE.md flags the trap: re-running
+  # release.yml fails at `git tag -a` with already_exists, so someone had to
+  # hand-dispatch build.yml with the version. Publishing last removes the whole
+  # failure mode, and the tag step below is idempotent so a re-run after a
+  # partial failure works rather than erroring on a tag it created itself.
+  # (CashPilot-85s)
+  publish:
+    needs: [release, build]
+    if: needs.release.outputs.new_tag
+    name: Tag and announce
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # For the compose-pin bump, which must go through a PR because main is
+      # protected. Nothing else in this job needs it.
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Create and push tag
+        run: |
+          TAG="${{ needs.release.outputs.new_tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Idempotent: a re-run after a failed build must not die on the tag it
+          # pushed the first time round.
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists locally; not recreating it."
+          else
+            git tag -a "$TAG" -m "Release $TAG"
+          fi
+          if git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG is already on the remote."
+          else
+            git push origin "$TAG"
+          fi
+
+      # The example compose files pin the major.minor series, and nothing moved
+      # them. So every minor release left docker-compose.yml and
+      # docker-compose.fleet.yml a series behind, and
+      # tests/test_compose_image_pins.py -- which is right to fail, a stale pin
+      # is what gave issue #188 a version with a first-run bug fixed months
+      # earlier -- went red on EVERY open branch until someone bumped them by
+      # hand. It blocked two unrelated PRs within hours of v1.15.0.
+      #
+      # The check was a tripwire on other people's work when it should have been
+      # a guard on the release. Now the release moves the pin itself, straight
+      # after the tag it is pinning to. (CashPilot-9fg.)
+      - name: Bump the example compose pins to this series
+        env:
+          # gh needs a token; the job already holds contents: write, and
+          # pull-requests: write is added on the job below for the PR itself.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.release.outputs.new_tag }}"
+          SERIES="${TAG#v}"; SERIES="${SERIES%.*}"   # v1.16.2 -> 1.16
+
+          # Read the pins from BOTH files, and tolerate finding none.
+          #
+          # `|| true` is load-bearing twice over. Under `set -o pipefail` a grep
+          # that matches nothing fails the whole pipeline, so `set -e` would kill
+          # this step -- and this step runs AFTER the tag is pushed, so it would
+          # turn a successful release into a red one over a cosmetic edit. That
+          # is the exact failure this step's retry/warning logic exists to avoid,
+          # reappearing three lines earlier.
+          CURRENT=$(grep -ohE 'drumsergio/cashpilot(-worker)?:[0-9]+\.[0-9]+' \
+                      docker-compose.yml docker-compose.fleet.yml \
+                    | cut -d: -f2 | sort -u | tr '\n' ' ' || true)
+          CURRENT=$(echo "$CURRENT" | xargs || true)   # trim
+
+          if [ -z "$CURRENT" ]; then
+            echo "::warning::found no pinned cashpilot image in the compose files; leaving them alone"
+            exit 0
+          fi
+          if [ "$CURRENT" = "$SERIES" ]; then
+            # A patch release does not change the series. Committing an
+            # unchanged file would push an empty commit on every patch.
+            #
+            # Both files are read, not just docker-compose.yml: if one had
+            # drifted and the other had not, reading only the first would report
+            # "already on $SERIES" and leave the other stale forever -- a silent
+            # no-op that looks exactly like success.
+            echo "Pins already on $SERIES; nothing to do."
+            exit 0
+          fi
+          echo "Bumping the example pins [$CURRENT] -> $SERIES"
+
+          sed -i -E "s|(drumsergio/cashpilot(-worker)?):[0-9]+\.[0-9]+|\1:$SERIES|g" \
+            docker-compose.yml docker-compose.fleet.yml
+
+          # Prove the edit did what it claims before committing it. A silently
+          # unmatched sed would otherwise commit nothing and report success,
+          # leaving the drift in place with no red build to reveal it.
+          #
+          # Plain ERE, no negative lookahead: that needs -P, and GNU grep
+          # REFUSES -E and -P together ("conflicting matchers specified"). The
+          # first version of this used both and appeared to work locally only
+          # because that shell's `grep` is a ugrep shim, which accepts it.
+          STRAY=$(grep -ohE 'drumsergio/cashpilot(-worker)?:[0-9]+\.[0-9]+' \
+                    docker-compose.yml docker-compose.fleet.yml \
+                  | cut -d: -f2 | sort -u | grep -vx "$SERIES" || true)
+          if [ -n "$STRAY" ]; then
+            echo "::error::a pin did not move to $SERIES (still on: $STRAY)"; exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docker-compose.yml docker-compose.fleet.yml
+          # No skip-CI marker, deliberately. `test` is a required check on
+          # main now, and a skipped run never reports -- the check would sit
+          # "Expected" forever and this PR could never merge. What stops a
+          # second release is the paths filter at the top of this workflow,
+          # which does not list the compose files. Keep it that way: widening it
+          # to cover them would make every pin bump cut a release.
+          #
+          # And do not write the marker out in full anywhere it can reach a
+          # commit message, not even to explain it. GitHub reads the string
+          # ANYWHERE in a HEAD commit message, body included, and skips every
+          # workflow for that commit -- no runs, no annotation, nothing to
+          # notice. A commit explaining the removal of the marker skipped all
+          # three checks on this branch and left the PR permanently BLOCKED on a
+          # required check that could never report.
+          git commit -m "chore(compose): pin the examples to $SERIES"
+
+          # THROUGH A PULL REQUEST, because main is protected.
+          #
+          # The first version pushed straight to main and was rejected three
+          # times with "Changes must be made through a pull request" (GH006) --
+          # observed in the v1.16.0 run, which shipped green only because the
+          # failure warns instead of failing. Branch protection is not going
+          # away, so the mechanism has to change rather than the retry count.
+          #
+          # Merged with --auto, not immediately: main requires `test` to pass,
+          # and an immediate merge would be rejected while it is still running.
+          # Auto-merge lands the PR the moment the check goes green. If merging
+          # fails for any other reason the warning fires and the release still
+          # ships -- which is the behaviour to keep.
+          BRANCH="chore/compose-pins-$SERIES"
+          git checkout -b "$BRANCH"
+          # --force-with-lease so a re-run reuses the branch instead of dying on
+          # it. Protection covers main, not this branch.
+          if ! git push --force-with-lease origin "$BRANCH"; then
+            echo "::warning::could not push $BRANCH; bump the compose pins to $SERIES by hand"
+            exit 0
+          fi
+
+          if ! gh pr create --base "${GITHUB_REF_NAME}" --head "$BRANCH" \
+                 --title "chore(compose): pin the examples to $SERIES" \
+                 --body "Automated by the $TAG release. The example compose files pin the major.minor series, and tests/test_compose_image_pins.py compares that pin against the newest released series -- so without this every open branch goes red until someone bumps them by hand."; then
+            echo "::warning::could not open the pin-bump PR for $SERIES; merge $BRANCH by hand"
+            exit 0
+          fi
+
+          if ! gh pr merge "$BRANCH" --squash --delete-branch --auto; then
+            echo "::warning::opened the pin-bump PR for $SERIES but could not merge it; merge it by hand"
+            exit 0
+          fi
+          echo "Pins bumped to $SERIES via $BRANCH (auto-merges when tests pass)."
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        with:
+          tag_name: ${{ needs.release.outputs.new_tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

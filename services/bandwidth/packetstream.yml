@@ -13,21 +13,25 @@ short_description: Bandwidth sharing - simple CID-based setup
 
 referral:
   signup_url: "https://packetstream.io/?psr=7xgZ"
+  code: "7xgZ"
 
 docker:
   image: packetstream/psclient
   platforms: [linux/amd64]
+  resources:
+    mem_limit: "128m"
+    oom_score_adj: 300
   env:
     - key: CID
       label: "Client ID"
       required: true
       secret: false
-      description: "Your PacketStream Client ID (found in Dashboard > Setup)"
+      description: "Log in at <a href=\"https://packetstream.io/dashboard\">packetstream.io/dashboard</a> → click Setup in the sidebar → your CID is displayed in the Docker command"
   ports: []
   volumes: []
   command: ""
   network_mode: ""
-  privileged: true
+  privileged: false
 
 requirements:
   residential_ip: true
@@ -59,3 +63,8 @@ platforms: [docker, windows, linux, android]
 collector:
   type: scrape
   notes: "Dashboard is CAPTCHA-protected. May need manual JWT from browser session for API access."
+  credential_hint: "Log in at <a href='https://packetstream.io' target='_blank'>packetstream.io</a>, press F12 → Application → Cookies, copy the <b>auth</b> cookie value (it’s a JWT)."
+
+payout:
+  model: internal
+  notes: "Balance held by PacketStream; withdrawn on request."

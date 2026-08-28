@@ -34,6 +34,10 @@ The key differentiator: a browser-based setup wizard guides you through account 
 - **Simple two-container setup** -- UI + Worker, no dependencies to install
 - **Service catalog** with earning estimates, requirements, and platform details
 
+> **Every setting, and which source wins:** [Configuration reference](docs/configuration.md)
+
+> **Upgrading an existing install?** Read [UPGRADING.md](UPGRADING.md) first. It lists only the releases that need you to do something.
+
 ## Quick Start
 
 With Docker Compose (recommended):
@@ -48,7 +52,9 @@ This starts two containers:
 - **cashpilot-ui** -- Web dashboard, earnings collection, service catalog (port 8080)
 - **cashpilot-worker** -- Docker agent that deploys and monitors service containers (port 8081, requires Docker socket)
 
-Then open [http://localhost:8080](http://localhost:8080) and follow the setup wizard.
+Then open [http://localhost:8080](http://localhost:8080) and follow the setup wizard. On first start, CashPilot prints a one-time **setup token** to the `cashpilot-ui` container logs (`docker compose logs cashpilot-ui`) — enter it on the registration form to create the first (owner) account. See [Getting Started](https://geiserx.github.io/CashPilot/getting-started/) for details.
+
+> **Security — network exposure.** By default the dashboard is published on **loopback only** (`127.0.0.1:8080`), because it can command the Docker-socket worker. To reach it from another machine, set `CASHPILOT_BIND_ADDR` to a specific interface (e.g. a Tailscale/VPN IP) or, preferably, run an authenticating reverse proxy in front. **Never publish the worker's port (`8081`) on a public interface** — it exposes a Docker-socket API equivalent to root on the host.
 
 > **Note:** The worker container requires access to the Docker socket (`/var/run/docker.sock`) to deploy and manage service containers. Both containers are required for full functionality.
 
@@ -58,64 +64,77 @@ Then open [http://localhost:8080](http://localhost:8080) and follow the setup wi
 
 Services CashPilot can deploy and manage automatically via Docker.
 
-| Service | Guide | Residential IP | VPS IP | Devices / Acct | Devices / IP | Payout |
+<!-- BEGIN GENERATED: docker-services -->
+| Service | Guide | Residential IP required | VPS allowed | Devices / Acct | Devices / IP | Payout |
 |---------|-------|:-:|:-:|:-:|:-:|--------|
-| [Anyone Protocol](https://anyone.io) | [Guide](docs/guides/anyone-protocol.md) | ✅ | ✅ | Unlimited | 1 | Crypto (ANYONE) |
-| [Bitping](https://app.bitping.com) | [Guide](docs/guides/bitping.md) | ✅ | ✅ | Unlimited | 1 | Crypto (SOL) |
-| [Earn.fm](https://earn.fm/ref/GEISYB91) | [Guide](docs/guides/earnfm.md) | ✅ | ✅ | Unlimited | 1 | Crypto |
-| [EarnApp](https://earnapp.com/i/TSMD9wSm) | [Guide](docs/guides/earnapp.md) | ✅ | ❌ | 15 | 1 | PayPal, Gift Cards, Wise |
+| [Anyone Protocol](https://anyone.io) | [Guide](docs/guides/anyone-protocol.md) | ❌ | ✅ | ? \*\*\* | ? \*\*\* | Crypto |
+| [Bitping](https://app.bitping.com) | [Guide](docs/guides/bitping.md) | ❌ | ✅ | ? \*\*\* | ? \*\*\* | Crypto (SOL) |
+| [Earn.fm](https://earn.fm/ref/GEISYB91) | [Guide](docs/guides/earnfm.md) | ✅ | ✅ | ? \*\*\* | 1 | Crypto |
+| [EarnApp](https://earnapp.com/i/TSMD9wSm) \*\*\*\* | [Guide](docs/guides/earnapp.md) | ✅ | ❌ | 15 | ? \*\*\* | PayPal, Amazon Gift Card, Wise |
 | [Honeygain](https://dashboard.honeygain.com/ref/SERGIB4014) | [Guide](docs/guides/honeygain.md) | ✅ | ❌ | 10 | 1 | PayPal, Crypto |
-| [IPRoyal Pawns](https://pawns.app?r=19266874) | [Guide](docs/guides/iproyal.md) | ✅ | ❌ | Unlimited | 1 | PayPal, Crypto, Bank Transfer |
-| [MystNodes](https://mystnodes.co/?referral_code=do7v7YOoBBpbOstKQovX2pUvZYKia4ZhH3QIdNtE) | [Guide](docs/guides/mysterium.md) | ✅ | ✅ | Unlimited | Unlimited | Crypto (MYST) |
-| [PacketStream](https://packetstream.io/?psr=7xgZ) | [Guide](docs/guides/packetstream.md) | ✅ | ❌ | Unlimited | 1 | PayPal |
-| [Presearch](https://presearch.com/signup?rid=4872322) | [Guide](docs/guides/presearch.md) | ✅ | ✅ | Unlimited | 1 | Crypto (PRE) |
-| [ProxyBase](https://peer.proxybase.org?referral=nXzS3c6iTO) | [Guide](docs/guides/proxybase.md) | ✅ | ❌ | Unlimited | 1 | Crypto |
-| [ProxyLite](https://proxylite.ru/?r=KMUPRZIZ) | [Guide](docs/guides/proxylite.md) | ✅ | ✅ | Unlimited | 1 | Crypto, PayPal |
-| [ProxyRack](https://peer.proxyrack.com/ref/mpwiok3xlaxeycnn5znqlg7ipjeutxyxr6xl7vmn) | [Guide](docs/guides/proxyrack.md) | ✅ | ✅ | 500 | 1 | PayPal, Crypto |
-| [Repocket](https://repocket.com/) | [Guide](docs/guides/repocket.md) | ✅ | ❌ | 5 | 2 | PayPal, Crypto |
-| [Storj](https://www.storj.io/node) | [Guide](docs/guides/storj.md) | ✅ | ✅ | Unlimited | 1 \* | Crypto (STORJ) |
-| [Traffmonetizer](https://traffmonetizer.com/?aff=2111758) | [Guide](docs/guides/traffmonetizer.md) | ✅ | ✅ \*\* | Unlimited | Unlimited | Crypto (USDT), PayPal |
-| [URnetwork](https://ur.io/?referral_code=1Q3G19) | [Guide](docs/guides/urnetwork.md) | ✅ | ✅ | Unlimited | 1 | Crypto |
+| [IPRoyal Pawns](https://pawns.app?r=19266874) | [Guide](docs/guides/iproyal.md) | ✅ | ❌ | ? \*\*\* | 1 | PayPal, Crypto, Bank Transfer |
+| [MystNodes](https://mystnodes.co/?referral_code=do7v7YOoBBpbOstKQovX2pUvZYKia4ZhH3QIdNtE) | [Guide](docs/guides/mysterium.md) | ❌ | ✅ | ? \*\*\* | Unlimited | Crypto |
+| [PacketStream](https://packetstream.io/?psr=7xgZ) | [Guide](docs/guides/packetstream.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | PayPal |
+| [ProxyBase](https://peer.proxybase.org?referral=nXzS3c6iTO) | [Guide](docs/guides/proxybase.md) | ❌ | ✅ | ? \*\*\* | ? \*\*\* | Crypto |
+| [ProxyBase Markets](https://proxybase.xyz?referral=nXzS3c6iTO) | [Guide](docs/guides/proxybase-xyz.md) | ❌ | ✅ | ? \*\*\* | ? \*\*\* | Crypto (USDC) |
+| [ProxyLite](https://proxylite.ru/?r=KMUPRZIZ) | [Guide](docs/guides/proxylite.md) | ❌ | ✅ | ? \*\*\* | ? \*\*\* | Crypto, PayPal |
+| [ProxyRack](https://peer.proxyrack.com/ref/mpwiok3xlaxeycnn5znqlg7ipjeutxyxr6xl7vmn) | [Guide](docs/guides/proxyrack.md) | ❌ | ✅ | 500 | ? \*\*\* | PayPal, Crypto |
+| [Repocket](https://repocket.com/) | [Guide](docs/guides/repocket.md) | ✅ | ❌ | 5 | ? \*\*\* | PayPal, Crypto |
+| [Storj](https://storj.dev/node/get-started/setup) | [Guide](docs/guides/storj.md) | ❌ | ✅ | ? \*\*\* | ? \*\*\* | Crypto |
+| [Traffmonetizer](https://traffmonetizer.com/?aff=2111758) | [Guide](docs/guides/traffmonetizer.md) | ❌ | ✅ | ? \*\*\* | Unlimited | Crypto (USDT), PayPal |
+| [URnetwork](https://ur.io/?referral_code=1Q3G19) | [Guide](docs/guides/urnetwork.md) | ❌ | ✅ | ? \*\*\* | ? \*\*\* | Crypto |
+<!-- END GENERATED: docker-services -->
 
 > \* Storj nodes on the same /24 subnet share data allocation, reducing per-node earnings.
 >
 > \*\* Traffmonetizer ToS requires residential IP, but VPS nodes are accepted in practice.
+>
+> \*\*\*\* EarnApp's help centre **prohibits** Docker containers, VMs, hosting services and home servers, with account termination and cancellation of pending payments as the stated penalty — which is exactly how CashPilot deploys it. Read the [guide](docs/guides/earnapp.md) before deploying.
+>
+> \*\*\* `?` means the catalog does not record this, so nobody has verified it against the provider. It is **not** a synonym for "no limit" — see [per-IP device limits](docs/research/per-ip-device-limits.md) for the values that are sourced. A number widely repeated on review sites is not a source.
+>
+> These tables are **generated from the service YAML** by `scripts/generate_readme_tables.py` and checked in CI, so they cannot drift from the catalog. Edit the YAML, not the table.
 
 ### Browser Extension / Desktop Only
 
 These services have no Docker image. CashPilot lists them in the catalog with signup links and earning estimates, but cannot deploy or monitor them.
 
-| Service | Guide | Residential IP | VPS IP | Devices / Acct | Devices / IP | Payout | Status |
+<!-- BEGIN GENERATED: extension-services -->
+| Service | Guide | Residential IP required | VPS allowed | Devices / Acct | Devices / IP | Payout | Status |
 |---------|-------|:-:|:-:|:-:|:-:|--------|--------|
-| [Bytelixir](https://bytelixir.com/r/OYEIRE0VSZBZ) | [Guide](docs/guides/bytelixir.md) | ✅ | ❌ | Unlimited | 1 | Crypto | Active |
-| [Dawn Internet](https://dawninternet.com/?code=2QLQV97F) | [Guide](docs/guides/dawn.md) | ✅ | ❌ | Unlimited | 1 | Crypto (DAWN) | Active |
-| [Deeper Network](https://deeper.network) | [Guide](docs/guides/deeper-network.md) | ✅ | ❌ | Unlimited | 1 | Crypto (DPR) | Active |
-| [Ebesucher](https://www.ebesucher.com/?ref=geiserx) | [Guide](docs/guides/ebesucher.md) | ✅ | ✅ | Unlimited | 1 | PayPal | Active |
-| [Gradient Network](https://app.gradient.network/signup?referralCode=YSKMY7) | [Guide](docs/guides/gradient.md) | ✅ | ❌ | Unlimited | 1 | Crypto (GRADIENT) | Active |
-| [Grass](https://app.grass.io/register?referralCode=kn8FNEPnUr2tMqE) | [Guide](docs/guides/grass.md) | ✅ | ❌ | Unlimited | 1 | Crypto (GRASS) | Active |
-| [Helium](https://helium.com) | [Guide](docs/guides/helium.md) | ✅ | ❌ | Unlimited | 1 | Crypto (HNT) | Active |
-| [Nodepay](https://app.nodepay.ai/register?ref=0wzzyznen64j9zx) | [Guide](docs/guides/nodepay.md) | ✅ | ❌ | Unlimited | 1 | Crypto (NC) | Active |
-| [Nodle](https://nodle.com) | [Guide](docs/guides/nodle.md) | ✅ | ✅ | Unlimited | 1 | Crypto (NODL) | Active |
-| [PassiveApp](https://passiveapp.com/i/bqpC4M) | [Guide](docs/guides/passiveapp.md) | ✅ | ❌ | Unlimited | 1 | Crypto, PayPal | Active |
-| [Sentinel dVPN](https://sentinel.co) | [Guide](docs/guides/sentinel-dvpn.md) | ✅ | ✅ | Unlimited | 1 | Crypto (DVPN) | Active |
-| [Spide](https://spide.network/register.html?f3bc51) | [Guide](docs/guides/spide.md) | ✅ | ❌ | Unlimited | 1 | Crypto | Active |
-| [Teneo Protocol](https://dashboard.teneo.pro/?code=CAqef) | [Guide](docs/guides/teneo.md) | ✅ | ❌ | Unlimited | 1 | Crypto (TENEO) | Active |
-| [Theta Edge Node](https://thetatoken.org) | [Guide](docs/guides/theta-edge.md) | ✅ | ✅ | Unlimited | 1 | Crypto (TFUEL) | Active |
-| [Titan Network](https://edge.titannet.info/signup?inviteCode=2GKKJ495) | [Guide](docs/guides/titan.md) | ✅ | ❌ | Unlimited | 1 | Crypto (TNT) | Active |
-| [Uprock](https://link.uprock.com/i/33e8492e) | [Guide](docs/guides/uprock.md) | ✅ | ❌ | Unlimited | 1 | Crypto | Active |
+| [Bytebenefit](https://bytebenefit.io/invited?ref=Brl4z3) | [Guide](docs/guides/bytebenefit.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | PayPal | Active |
+| [Bytelixir](https://bytelixir.com/r/OYEIRE0VSZBZ) | [Guide](docs/guides/bytelixir.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [Dawn Internet](https://dawninternet.com/?code=2QLQV97F) | [Guide](docs/guides/dawn.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [Deeper Network](https://deeper.network) | [Guide](docs/guides/deeper-network.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [Ebesucher](https://www.ebesucher.com/?ref=geiserx) | [Guide](docs/guides/ebesucher.md) | ✅ | ❌ | ? \*\*\* | 1 | PayPal | Active |
+| [Gradient Network](https://app.gradient.network/signup?referralCode=YSKMY7) | [Guide](docs/guides/gradient.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [Grass](https://app.grass.io/register?referralCode=kn8FNEPnUr2tMqE) | [Guide](docs/guides/grass.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [Helium](https://helium.com) | [Guide](docs/guides/helium.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [Nodepay](https://app.nodepay.ai/register?ref=0wzzyznen64j9zx) | [Guide](docs/guides/nodepay.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [Nodle](https://nodle.com) | [Guide](docs/guides/nodle.md) | ❌ | ✅ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [PassiveApp](https://passiveapp.com/i/bqpC4M) | [Guide](docs/guides/passiveapp.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | Crypto, PayPal | Active |
+| [Sentinel dVPN](https://sentinel.co) | [Guide](docs/guides/sentinel-dvpn.md) | ❌ | ✅ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [Spide](https://spide.network/register.html?f3bc51) | [Guide](docs/guides/spide.md) | ✅ | ❌ | ? \*\*\* | 1 | Crypto | Active |
+| [Teneo Protocol](https://dashboard.teneo.pro/?code=CAqef) | [Guide](docs/guides/teneo.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [Theta Edge Node](https://thetatoken.org) | [Guide](docs/guides/theta-edge.md) | ❌ | ✅ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [Titan Network](https://edge.titannet.info/signup?inviteCode=2GKKJ495) | [Guide](docs/guides/titan.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+| [Uprock](https://link.uprock.com/i/33e8492e) | [Guide](docs/guides/uprock.md) | ✅ | ❌ | ? \*\*\* | ? \*\*\* | Crypto | Active |
+<!-- END GENERATED: extension-services -->
 
 ### GPU Compute
 
 GPU-intensive computing services. Requires compatible hardware.
 
-| Service | Guide | Residential IP | GPU | Min Storage | Payout | Status |
+<!-- BEGIN GENERATED: gpu-services -->
+| Service | Guide | Residential IP required | GPU | Min Storage | Payout | Status |
 |---------|-------|:-:|:-:|:-:|--------|--------|
-| [Flux](https://runonflux.io) | [Guide](docs/guides/flux.md) | ✅ | ❌ | 220GB | Crypto (FLUX) | Active |
-| [Golem Network](https://golem.network) | [Guide](docs/guides/golem.md) | ✅ | ❌ | 20GB | Crypto (GLM) | Active |
-| [io.net](https://io.net) | [Guide](docs/guides/ionet.md) | ✅ | ✅ | N/A | Crypto (IO) | Active |
-| [Nosana](https://nosana.io) | [Guide](docs/guides/nosana.md) | ✅ | ✅ | 50GB | Crypto (NOS) | Active |
+| [Flux](https://runonflux.io) | [Guide](docs/guides/flux.md) | ❌ | ❌ | 220GB | Crypto | Active |
+| [Golem Network](https://golem.network) | [Guide](docs/guides/golem.md) | ❌ | ❌ | 20GB | Crypto | Active |
+| [io.net](https://io.net) | [Guide](docs/guides/ionet.md) | ❌ | ✅ | N/A | Crypto | Active |
+| [Nosana](https://nosana.io) | [Guide](docs/guides/nosana.md) | ❌ | ✅ | 50GB | Crypto | Active |
 | [Salad](https://salad.io) | [Guide](docs/guides/salad.md) | ✅ | ✅ | N/A | PayPal, Gift Cards | Active |
-| [Vast.ai](https://cloud.vast.ai/?ref_id=452772) | [Guide](docs/guides/vast-ai.md) | ✅ | ✅ | 100GB | Crypto, Bank Transfer | Active |
+| [Vast.ai](https://cloud.vast.ai/?ref_id=452772) | [Guide](docs/guides/vast-ai.md) | ❌ | ✅ | 100GB | Crypto, Bank Transfer | Active |
+<!-- END GENERATED: gpu-services -->
 
 > **Note:** Earnings vary widely by location, hardware, and demand -- see individual guide pages in `docs/guides/` for details.
 
@@ -156,10 +175,15 @@ cashpilot/
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TZ` | `UTC` | Timezone for scheduling and display |
-| `CASHPILOT_SECRET_KEY` | *(auto-generated)* | Encryption key for stored credentials |
-| `CASHPILOT_API_KEY` | -- | Shared secret between UI and workers for API authentication |
-| `CASHPILOT_COLLECTION_INTERVAL` | `3600` | Seconds between earnings collection cycles |
-| `CASHPILOT_PORT` | `8080` | Web UI port inside the container |
+| `CASHPILOT_SECRET_KEY` | *(auto-generated)* | Signing key for login sessions. Persisted at `/data/.secret_key`. **Does not encrypt credentials** |
+| `CASHPILOT_ENCRYPTION_KEY` | *(auto-generated)* | Fernet key encrypting stored credentials at rest. Persisted at `/data/.fernet_key`. Set this only to restore a backup — see [Backing up the encryption key](#backing-up-the-encryption-key) |
+| `CASHPILOT_ALLOW_EPHEMERAL_KEY` | `false` | Allow startup when the encryption key cannot be written to disk. Credentials are then lost on restart, so this is off by default |
+| `CASHPILOT_API_KEY` | -- | Enrollment/bootstrap key; each worker then gets its own key (per-worker fleet keys, v1.0.0+) |
+| `CASHPILOT_COLLECT_INTERVAL` | `60` | Minutes between earnings collection cycles |
+| `CASHPILOT_METRICS_ENABLED` | `false` | Set to `true` to expose Prometheus metrics at `/metrics` |
+| `CASHPILOT_BIND_ADDR` | `127.0.0.1` | Host interface the UI port is published on. Loopback by default; set a specific IP (e.g. a VPN address) or `0.0.0.0` to expose it — prefer a reverse proxy with auth |
+
+The UI's web port inside the container is fixed at `8080` (set via the container's `CMD`); `CASHPILOT_BIND_ADDR` controls only which host interface it is published on.
 
 ### Worker Environment Variables
 
@@ -169,6 +193,33 @@ cashpilot/
 | `CASHPILOT_UI_URL` | -- | URL of the UI container, e.g. `http://cashpilot-ui:8080` |
 | `CASHPILOT_API_KEY` | -- | Must match the UI's API key |
 | `CASHPILOT_WORKER_NAME` | *(hostname)* | Display name for this worker in the fleet dashboard |
+| `CASHPILOT_WORKER_URL` | *(auto-detected)* | URL the UI uses to reach this worker, e.g. `http://192.168.10.50:8081`. Set explicitly for remote/cross-host workers |
+| `CASHPILOT_WORKER_BIND_ADDR` | `127.0.0.1` | Host interface the worker's Docker-socket API port is published on. Loopback by default — for a remote worker set a private/VPN interface, **never** a public IP |
+| `CASHPILOT_PORT` | `8081` | Port the worker **advertises** to the UI. It does *not* change the listen port, which is fixed by the image's `CMD` — see the [configuration reference](docs/configuration.md) |
+| `CASHPILOT_WORKER_NETWORK` | *(detected)* | `residential` or `hosting`. Overrides the hardware-based guess used to warn about residential-only services |
+| `CASHPILOT_EGRESS_DETECT` | on | Set to `off` to stop this worker looking up its own public IP (see below) |
+| `CASHPILOT_EGRESS_IP` | -- | State this worker's public IP directly instead of looking it up. Must be a public address |
+| `CASHPILOT_EGRESS_IP_URL` | -- | Use your own IP-echo endpoint (returning a bare IP) instead of the public ones. Used **exclusively** — no fallback |
+
+#### Why the worker looks up its public IP
+
+Bandwidth providers cap earnings **per IP address, not per machine**. Two
+workers behind one home connection are two rows on your dashboard and *one*
+customer to the provider, so the second one usually earns nothing. To warn you
+before that happens, each worker asks a public IP-echo service what address it
+comes from — one request per hour.
+
+That is the only outbound call CashPilot makes purely to learn about your setup.
+Turn it off with `CASHPILOT_EGRESS_DETECT=off`, point it at your own endpoint
+with `CASHPILOT_EGRESS_IP_URL`, or skip the lookup entirely by stating the
+address with `CASHPILOT_EGRESS_IP`. With detection off, the fleet simply reports
+that worker's exit as undetermined and raises no conflict warnings for it.
+
+Known limitation: grouping matches on the exact address, so on a **native-IPv6**
+connection each machine has its own global address and no conflict is detected.
+The check is therefore best-effort — it can miss a conflict, but it will not
+invent one.
+
 
 ## Multi-Node Fleet Management
 
@@ -197,10 +248,18 @@ On each additional server, deploy only a worker pointing to the UI:
 ```yaml
 services:
   cashpilot-worker:
-    image: drumsergio/cashpilot-worker:latest
+    image: drumsergio/cashpilot-worker:1.19
+    pull_policy: always
     container_name: cashpilot-worker
     ports:
-      - "8081:8081"
+      # The worker's API is backed by the Docker socket -- deploy, stop or
+      # remove ANY container -- so publishing it is publishing full control of
+      # this host. It binds LOOPBACK by default for that reason.
+      #
+      # A remote UI does need to reach it, so set CASHPILOT_WORKER_BIND_ADDR to
+      # this server's PRIVATE or VPN address (a Tailscale IP, say). Never a
+      # public one, and never 0.0.0.0.
+      - "${CASHPILOT_WORKER_BIND_ADDR:-127.0.0.1}:8081:8081"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - cashpilot_worker_data:/data
@@ -209,6 +268,7 @@ services:
       - CASHPILOT_UI_URL=http://main-server:8080
       - CASHPILOT_API_KEY=your-shared-api-key
       - CASHPILOT_WORKER_NAME=server-b
+      - CASHPILOT_WORKER_URL=http://server-b:8081
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -217,7 +277,7 @@ volumes:
   cashpilot_worker_data:
 ```
 
-Workers connect outbound to the UI via HTTP -- no port forwarding needed on the worker side. The UI's fleet dashboard shows all connected workers, their containers, and live status. The UI can push commands (deploy, stop, restart) to any worker remotely.
+Communication goes both ways: workers connect outbound to the UI via HTTP for heartbeats, and the UI connects outbound to each worker's `:8081` API to push commands (deploy, stop, restart). This means **the worker must be reachable from the UI** (LAN, Tailscale, or port forwarding) -- set `CASHPILOT_WORKER_URL` to the address the UI should use, since auto-detection falls back to the container's own network interface, which is often unreachable from another host. The UI's fleet dashboard shows all connected workers, their containers, and live status.
 
 ## FAQ
 
@@ -227,7 +287,7 @@ Bandwidth sharing services generally route legitimate traffic (market research, 
 
 **How much can I earn?**
 
-Earnings vary widely based on location, number of devices, and which services you run. A realistic expectation for a single residential server running 10-15 services is **$30 - $100/month**. Adding more servers or GPU compute services can increase this significantly. The dashboard shows your actual earnings over time so you can optimize.
+Earnings vary widely based on location, ISP, number of devices, and which services you run. The dashboard tracks your actual earnings over time so you can optimize your setup.
 
 **Can I run on a VPS or cloud server?**
 
@@ -235,7 +295,27 @@ Some services require a residential IP and will not pay (or will ban) VPS/datace
 
 **How are credentials stored?**
 
-All service credentials are encrypted at rest in the SQLite database using your `CASHPILOT_SECRET_KEY`. The database file lives in the mounted Docker volume (`cashpilot_data:/data`). No credentials are ever sent anywhere except to the service containers themselves.
+All service credentials are encrypted at rest in the SQLite database using a Fernet key stored at `/data/.fernet_key`, which is generated automatically on first run. The database file lives in the mounted Docker volume (`cashpilot_data:/data`). No credentials are ever sent anywhere except to the service containers themselves.
+
+Note that this is a different key from `CASHPILOT_SECRET_KEY`, which only signs login sessions.
+
+### Backing up the encryption key
+
+Your credentials are only as recoverable as `/data/.fernet_key`. If you lose that file you will have to re-enter every credential, because there is no way to decrypt the stored values without it.
+
+```bash
+# Back it up
+docker exec cashpilot-ui cat /data/.fernet_key
+
+# Restore onto a fresh volume: pass the saved value when starting CashPilot.
+# It must reach the container, so put it on the same command line (or export it,
+# or set it in your .env) - a bare shell assignment on its own line does nothing.
+CASHPILOT_ENCRYPTION_KEY=<the value you saved> docker compose up -d
+```
+
+The file always takes precedence over the environment variable, so setting `CASHPILOT_ENCRYPTION_KEY` on an instance that already has a key changes nothing and is safe. It is adopted only when no key file exists, which is exactly the restore case.
+
+If the key cannot be written to disk at all — an unwritable or unmounted `/data` — CashPilot refuses to start rather than encrypting your credentials under a key that disappears on the next restart. Set `CASHPILOT_ALLOW_EPHEMERAL_KEY=true` if that is genuinely what you want.
 
 **What about security?**
 
@@ -277,6 +357,7 @@ Services that were evaluated but are no longer listed in the catalog due to bein
 
 | Service | Status | Reason | Last checked |
 |---------|--------|--------|:------------:|
+| Presearch | Dead | Company shut down July 24-28, 2026; node program and backend decommissioned | Aug 2026 |
 | SpeedShare | Dead | Project confirmed dead in Discord | Mar 2026 |
 | Peer2Profit | Dead | Domain unreachable | Mar 2026 |
 | PacketShare | Dead | Signup process broken, no progress | Mar 2026 |
@@ -286,25 +367,23 @@ Services that were evaluated but are no longer listed in the catalog due to bein
 | Network3 | Broken | No SSL, no updates in months | Mar 2026 |
 | GagaNode | Shady | Poorly made website, untrustworthy | Mar 2026 |
 | BlockMesh (Perceptron) | Dropped | Rebranded, requires browser dev mode, shady | Mar 2026 |
-| Bytebenefit | Dead | Domain sold/parked on marketplace | Mar 2026 |
 | Wipter | Dead | Domain resolves to DNS sinkhole, infrastructure gone | Mar 2026 |
 | Filecoin | Not viable | Enterprise-only (10 TiB min, datacenter infrastructure required) | Mar 2026 |
 | AntGain | Dead | Telegram channel unavailable | Mar 2026 |
 
 ## How CashPilot Compares
 
-| Feature | CashPilot | money4band | CashFactory | income-generator | InternetIncome |
-|---------|:---------:|:----------:|:-----------:|:----------------:|:--------------:|
-| Web UI with guided setup | **Yes** | No (CLI) | Partial (links only) | No (CLI) | No (CLI) |
-| One-click container deploy | **Yes** | No (compose) | No (compose) | No | No (compose) |
-| Earnings dashboard | **Yes** | No | No | No | No |
-| Historical charts | **Yes** | No | No | No | No |
-| Multi-node fleet management | **Yes** | No | No | No | No |
-| Service catalog with guides | **49 services** | 17 | 8 | 14 | 8 |
-| Automated earnings collection | **13 collectors** | 0 | 0 | 0 | 0 |
-| Multi-arch (amd64 + arm64) | **Yes** | Yes | Yes | No | No |
-| Credential encryption | **Yes** | No | No | No | No |
-| Compose export | **Yes** | Yes | Yes | Yes | Yes |
+There are several good open-source projects in this space, and the honest summary is that they overlap more than they differ. [money4band](https://github.com/MRColorR/money4band) is the most mature of them: it supports 20+ apps, ships a web dashboard, and is actively developed. If you want to run a handful of bandwidth-sharing apps on one machine, it is a perfectly good choice and has been doing this longer than CashPilot has.
+
+CashPilot is built around three things that shape its whole design:
+
+- **A fleet, not a machine.** One dashboard holds the state for many servers, each running a worker. Earnings are collected centrally exactly once, so nothing is double-counted, and every figure drills down per server and per service.
+- **Earnings pulled from the providers themselves.** 15 collectors authenticate against provider APIs and dashboards and record real balances into a local history, rather than reporting that a container is running. That is what makes "running but not earning" detectable at all.
+- **Breadth beyond bandwidth.** 50 catalogued services spanning bandwidth sharing, DePIN, storage and GPU compute, each with a setup guide, a payout method, and a status that is re-checked weekly in CI.
+
+If none of those matter to you, use whichever tool you prefer — they will all start the same containers.
+
+> **On this section.** It deliberately avoids a feature matrix claiming what other projects lack. Those tables go stale the moment someone ships a release, and a comparison a reader can falsify in thirty seconds is worse than no comparison at all. If anything above is out of date, please open an issue.
 
 ## License
 

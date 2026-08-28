@@ -10,18 +10,38 @@
 # === Deploy on main server (e.g., server-a) ===
 services:
   cashpilot-ui:
-    image: drumsergio/cashpilot:latest
+    image: drumsergio/cashpilot:1.36
+    pull_policy: always
     container_name: cashpilot-ui
+    # Loopback by default (the UI commands the Docker-socket worker). Set
+    # CASHPILOT_BIND_ADDR to a specific interface (e.g. a Tailscale/VPN IP) to reach
+    # it from another machine, or 0.0.0.0 to publish on all interfaces. Prefer an
+    # authenticating reverse proxy over binding the raw port publicly.
     ports:
-      - "8080:8080"
+      - "${CASHPILOT_BIND_ADDR:-127.0.0.1}:8080:8080"
     volumes:
       - cashpilot_data:/data
       - cashpilot_fleet:/fleet
     environment:
       - TZ=${TZ:-UTC}
       - CASHPILOT_SECRET_KEY=${CASHPILOT_SECRET_KEY}
+      # Optional: only needed to RESTORE credentials onto a fresh volume.
+      # An existing /data/.fernet_key always wins, so setting this is safe.
+      - CASHPILOT_ENCRYPTION_KEY=${CASHPILOT_ENCRYPTION_KEY:-}
+      - CASHPILOT_ALLOW_EPHEMERAL_KEY=${CASHPILOT_ALLOW_EPHEMERAL_KEY:-false}
       - CASHPILOT_API_KEY=${CASHPILOT_API_KEY}
     init: true
+    # The image declares its own HEALTHCHECK, so `docker ps` will show
+    # "(unhealthy)" when the app stops answering. NOTHING ACTS ON THAT BY
+    # DEFAULT: `restart: unless-stopped` restarts a container that EXITS, and a
+    # container failing its healthcheck is still running. It will sit there
+    # unhealthy indefinitely. (Docker Swarm reschedules unhealthy tasks; plain
+    # Compose does not.)
+    #
+    # To act on it, either alert on it -- see the CashPilotDown rule in
+    # docs/guides/prometheus-metrics.md -- or add an autoheal sidecar, which is
+    # documented in the same place along with the fact that it needs the Docker
+    # socket, i.e. root on the host.
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
@@ -29,12 +49,65 @@ services:
       - /tmp:size=64M
 
   cashpilot-worker:
-    image: drumsergio/cashpilot-worker:latest
+    image: drumsergio/cashpilot-worker:1.36
+    pull_policy: always
     container_name: cashpilot-worker
+    # The worker exposes a Docker-socket-backed API (deploy/stop/remove any
+    # container = full host control), so it is bound to LOOPBACK by default and must
+    # NEVER be published on 0.0.0.0. On this main server the co-located UI reaches it
+    # over the compose network (cashpilot-worker:8081), not this published port —
+    # only a REMOTE UI needs it published. If you must, set CASHPILOT_WORKER_BIND_ADDR
+    # to a private/VPN interface (e.g. a Tailscale IP), never a public one, and keep
+    # CASHPILOT_API_KEY secret.
     ports:
-      - "8081:8081"
+      - "${CASHPILOT_WORKER_BIND_ADDR:-127.0.0.1}:8081:8081"
+      # GPU passthrough. COMMENTED OUT ON PURPOSE: Docker refuses to start a
+      # container when a listed device does not exist, so uncommenting this on a
+      # host with no GPU breaks the worker outright (verified: `docker run
+      # --device /dev/does-not-exist` fails).
+      #
+      # Uncomment on a Linux host that HAS a GPU. Without it the worker cannot
+      # see the hardware, so CashPilot reports the GPU as *unknown* and cannot
+      # tell you whether Salad, Nosana, io.net or Vast.ai would earn here. Worse,
+      # a GPU service deployed without the device starts, looks healthy, and
+      # earns nothing -- the same shape as the Mysterium /dev/net/tun failure.
+      #
+      # Intel / AMD -- the kernel exposes the GPU as a DRM render node:
+      # devices:
+      #   - /dev/dri:/dev/dri
+      #
+      # NVIDIA is a DIFFERENT mechanism. /dev/dri does nothing for it, and
+      # installing the NVIDIA Container Toolkit is only the prerequisite -- the
+      # toolkit alone does NOT hand the GPU to a Compose service. You must also
+      # ask for it, with EITHER of these (both are Compose-spec attributes):
+      #
+      # gpus: all
+      #
+      # deploy:
+      #   resources:
+      #     reservations:
+      #       devices:
+      #         - driver: nvidia
+      #           count: all
+      #           capabilities: [gpu]
+      #
+      # Both of these also fail on a host with no NVIDIA GPU (verified: exit 1,
+      # "could not select device driver"), which is why they are commented out
+      # too. Pick ONE; do not set both.
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      # SEPARATE FROM THE UI'S /data, DELIBERATELY. This container has the
+      # Docker socket, which is root on the host. The UI's /data holds
+      # cashpilot.db and .fernet_key -- the credential store and the only key
+      # that can decrypt it -- and the component that can start any container
+      # on the machine has no business being able to read them.
+      #
+      # /fleet IS shared on purpose: it holds only the shared enrolment key,
+      # which both sides need by definition.
+      #
+      # Consolidating these into one volume is the obvious "simplification" and
+      # it silently removes that boundary. tests/test_beads_batch_69.py fails if
+      # anyone does.
       - cashpilot_worker_data:/data
       - cashpilot_fleet:/fleet
     environment:
@@ -55,10 +128,15 @@ services:
 #
 #  services:
 #    cashpilot-worker:
-#      image: drumsergio/cashpilot-worker:latest
+#      image: drumsergio/cashpilot-worker:1.36
+#      pull_policy: always
 #      container_name: cashpilot-worker
+#      # Docker-socket-backed API = full host control. Bind a PRIVATE/VPN interface
+#      # (e.g. the server's Tailscale IP), NEVER 0.0.0.0 or a public IP. The UI
+#      # authenticates with the fleet key, but the socket API must not be internet-
+#      # reachable. CASHPILOT_WORKER_BIND_ADDR defaults to loopback.
 #      ports:
-#        - "8081:8081"
+#        - "${CASHPILOT_WORKER_BIND_ADDR:-100.x.y.z}:8081:8081"  # this server's private/VPN IP
 #      volumes:
 #        - /var/run/docker.sock:/var/run/docker.sock
 #        - cashpilot_worker_data:/data

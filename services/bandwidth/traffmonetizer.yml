@@ -13,16 +13,20 @@ short_description: Bandwidth sharing - works on VPS, token-based auth
 
 referral:
   signup_url: "https://traffmonetizer.com/?aff=2111758"
+  code: "2111758"
 
 docker:
   image: traffmonetizer/cli_v2
   platforms: [linux/amd64, linux/arm64]
+  resources:
+    mem_limit: "128m"
+    oom_score_adj: 300
   env:
     - key: TRAFFMONETIZER_TOKEN
       label: "Token"
       required: true
       secret: true
-      description: "Your Traffmonetizer account token (found in Dashboard > Docker run command)"
+      description: "Log in at <a href=\"https://app.traffmonetizer.com\">app.traffmonetizer.com</a>, press F12 → Application → Local Storage → click <code>https://app.traffmonetizer.com</code> → copy the <code>token</code> value (a long JWT starting with eyJ)"
     - key: TRAFFMONETIZER_DEVICE_NAME
       label: "Device name"
       required: false
@@ -33,7 +37,7 @@ docker:
   volumes: []
   command: "start accept --token ${TRAFFMONETIZER_TOKEN} --device-name ${TRAFFMONETIZER_DEVICE_NAME}"
   network_mode: ""
-  privileged: true
+  privileged: false
 
 requirements:
   residential_ip: false
@@ -68,4 +72,9 @@ platforms: [docker, windows, macos, android]
 
 collector:
   type: api
-  notes: "API at api.traffmonetizer.com/api/dashboard. Bearer token auth. Returns balance in USD."
+  notes: "reCAPTCHA blocks programmatic login. Token extracted from browser Local Storage at app.traffmonetizer.com (same as deployment token)."
+  credential_hint: "Log in at <a href='https://app.traffmonetizer.com' target='_blank'>app.traffmonetizer.com</a>, press F12 → Application → Local Storage → <b>token</b> value (a long JWT starting with <code>eyJ</code>)."
+
+payout:
+  model: internal
+  notes: "USDT, but the CHAIN IS CHOSEN PER WITHDRAWAL (Arbitrum/Tron/Solana/TON), so there is no persistent on-chain identity to register."

@@ -6,9 +6,10 @@ is not possible. Users must extract session cookies from their browser.
 To get the cookie: open dash.bytelixir.com, log in (tick "Remember Me"),
 press F12 > Application > Cookies, and copy the `bytelixir_session` value.
 
-Earnings are obtained by scraping the server-rendered dashboard HTML,
-which contains ``data-balance`` attributes on Alpine.js ``Balance()``
-components.  The ``/api/v1/user`` endpoint only returns the
+Earnings are obtained by scraping the server-rendered dashboard HTML.
+Balances are rendered as split ``<span>`` tags (a ``$`` span, the
+integer+decimal text, then a trailing precision span), which a regex
+extracts and reassembles.  The ``/api/v1/user`` endpoint only returns the
 *withdrawable* balance (always 0 until the payout threshold is reached),
 **not** the total earned amount shown on the dashboard.
 
@@ -21,10 +22,12 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Any
 from urllib.parse import unquote
 
 import httpx
 
+from app.collectors import base
 from app.collectors.base import BaseCollector, EarningsResult
 
 logger = logging.getLogger(__name__)
@@ -46,6 +49,7 @@ class BytelixirCollector(BaseCollector):
         remember_web: str = "",
         xsrf_token: str = "",
     ) -> None:
+        super().__init__()
         self.session_cookie = unquote(session_cookie)
         self.remember_web = unquote(remember_web) if remember_web else ""
         self.xsrf_token = unquote(xsrf_token) if xsrf_token else ""
@@ -54,31 +58,33 @@ class BytelixirCollector(BaseCollector):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _make_client(self) -> httpx.AsyncClient:
-        """Build an httpx client with all session cookies pre-set."""
-        cookies = httpx.Cookies()
-        cookies.set(
-            "bytelixir_session",
-            self.session_cookie,
-            domain="dash.bytelixir.com",
-        )
-        if self.remember_web:
+    def _get_client(self, **kwargs: Any) -> httpx.AsyncClient:
+        """Return a reusable httpx client with all session cookies pre-set."""
+        if self._client is None or self._client.is_closed:
+            cookies = httpx.Cookies()
             cookies.set(
-                self._REMEMBER_COOKIE,
-                self.remember_web,
+                "bytelixir_session",
+                self.session_cookie,
                 domain="dash.bytelixir.com",
             )
-        if self.xsrf_token:
-            cookies.set(
-                "XSRF-TOKEN",
-                self.xsrf_token,
-                domain="dash.bytelixir.com",
+            if self.remember_web:
+                cookies.set(
+                    self._REMEMBER_COOKIE,
+                    self.remember_web,
+                    domain="dash.bytelixir.com",
+                )
+            if self.xsrf_token:
+                cookies.set(
+                    "XSRF-TOKEN",
+                    self.xsrf_token,
+                    domain="dash.bytelixir.com",
+                )
+            self._client = httpx.AsyncClient(
+                timeout=30,
+                cookies=cookies,
+                follow_redirects=True,
             )
-        return httpx.AsyncClient(
-            timeout=30,
-            cookies=cookies,
-            follow_redirects=True,
-        )
+        return self._client
 
     @staticmethod
     def _browser_headers(*, accept: str = "text/html") -> dict[str, str]:
@@ -131,43 +137,51 @@ class BytelixirCollector(BaseCollector):
     async def collect(self) -> EarningsResult:
         """Fetch current Bytelixir earnings.
 
-        Primary method: scrape the dashboard HTML for ``data-balance``.
+        Primary method: scrape the dashboard HTML, reassembling the balance
+        from split ``<span>`` tags via regex.
         Fallback: ``/api/v1/user`` JSON endpoint.
         """
         try:
-            async with self._make_client() as client:
-                # --- 1. Try scraping the dashboard HTML ---------------
-                # Use the root URL — when authenticated it redirects to
-                # the localised dashboard (e.g. /en).  When not
-                # authenticated it redirects to /login.
-                html_resp = await client.get(
+            client = self._get_client()
+
+            # --- 1. Try scraping the dashboard HTML ---------------
+            # Use the root URL — when authenticated it redirects to
+            # the localised dashboard (e.g. /en).  When not
+            # authenticated it redirects to /login.
+            async def _fetch_html() -> httpx.Response:
+                return await client.get(
                     f"{API_BASE}/",
                     headers=self._browser_headers(),
                 )
 
-                # A 302 to /login means the session cookie is expired.
-                if "login" in str(html_resp.url):
+            html_resp = await self._retry(_fetch_html)
+
+            # A redirect to /login means session expired.
+            final_path = html_resp.url.path
+            if final_path.startswith("/login"):
+                return EarningsResult(
+                    platform=self.platform,
+                    balance=0.0,
+                    error="Session expired — refresh bytelixir_session cookie in Settings",
+                    error_kind=base.KIND_AUTH,
+                )
+
+            if html_resp.status_code == 200:
+                scraped = self._parse_balance_from_html(html_resp.text)
+                if scraped is not None:
+                    logger.info(
+                        "Bytelixir balance from HTML scrape: %s",
+                        scraped,
+                    )
                     return EarningsResult(
                         platform=self.platform,
-                        balance=0.0,
-                        error=("Session expired — refresh bytelixir_session cookie in Settings"),
+                        balance=round(scraped, 4),
+                        currency="USD",
                     )
 
-                if html_resp.status_code == 200:
-                    scraped = self._parse_balance_from_html(html_resp.text)
-                    if scraped is not None:
-                        logger.info(
-                            "Bytelixir balance from HTML scrape: %s",
-                            scraped,
-                        )
-                        return EarningsResult(
-                            platform=self.platform,
-                            balance=round(scraped, 4),
-                            currency="USD",
-                        )
-
-                # --- 2. Fallback: JSON API ----------------------------
-                api_resp = await client.get(
+            # --- 2. Fallback: JSON API ----------------------------
+            async def _fetch_api() -> httpx.Response:
+                return await client.get(
                     f"{API_BASE}/api/v1/user",
                     headers=self._browser_headers(accept="application/json")
                     | {
@@ -177,33 +191,41 @@ class BytelixirCollector(BaseCollector):
                     },
                 )
 
-                if api_resp.status_code == 401:
-                    return EarningsResult(
-                        platform=self.platform,
-                        balance=0.0,
-                        error=("Session expired — refresh bytelixir_session cookie in Settings"),
-                    )
+            api_resp = await self._retry(_fetch_api)
 
-                api_resp.raise_for_status()
-                data = api_resp.json()
-
-                # Response shape: {"data": {"balance": "0.0000000000", ...}}
-                # NOTE: /api/v1/user returns *withdrawable* balance only, not
-                # total earned.  Flag this so the user knows it's approximate.
-                user_data = data.get("data", {})
-                balance_str = user_data.get("balance", "0")
-                balance = float(balance_str)
-
+            if api_resp.status_code == 401:
                 return EarningsResult(
                     platform=self.platform,
-                    balance=round(balance, 4),
-                    currency="USD",
-                    error="Withdrawable balance only (HTML scrape failed, using API fallback)",
+                    balance=0.0,
+                    error="Session expired — refresh bytelixir_session cookie in Settings",
+                    error_kind=base.KIND_AUTH,
                 )
+
+            api_resp.raise_for_status()
+            data = api_resp.json()
+
+            # Response shape: {"data": {"balance": "0.0000000000", ...}}
+            # NOTE: /api/v1/user returns *withdrawable* balance only, not
+            # total earned.  Flag this so the user knows it's approximate.
+            user_data = data.get("data", {})
+            balance_str = user_data.get("balance", "0")
+            balance = float(balance_str)
+
+            return EarningsResult(
+                platform=self.platform,
+                balance=round(balance, 4),
+                currency="USD",
+                # A WARNING, not an error: this reading is real and worth
+                # storing. Reported as an error, the balance was discarded by
+                # the collection loop and the user saw "collector failed" for a
+                # collector that had just returned a correct number.
+                warning="Withdrawable balance only (HTML scrape failed, using API fallback)",
+            )
         except Exception as exc:
-            logger.error("Bytelixir collection failed: %s", exc)
+            base.log_failure(logger, "Bytelixir", exc)
             return EarningsResult(
                 platform=self.platform,
                 balance=0.0,
                 error=str(exc),
+                error_kind=base.classify_exception(exc),
             )

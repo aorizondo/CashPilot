@@ -88,3 +88,101 @@ def test_no_duplicate_slugs():
         slugs.append(data["slug"])
     duplicates = [s for s in slugs if slugs.count(s) > 1]
     assert not duplicates, f"Duplicate slugs found: {set(duplicates)}"
+
+
+def test_repocket_container_env_keys():
+    """Regression for #82: the repocket/repocket image reads RP_EMAIL + RP_API_KEY.
+
+    A prior 'audit' (PR #46) renamed these to REPOCKET_EMAIL/REPOCKET_PASSWORD to
+    match the earnings collector's auth model, which silently broke deployment —
+    the container ignores unknown env vars and logs 'User credentials are missing!'.
+    The container env contract is independent of the collector's Firebase login.
+    """
+    repocket = SERVICES_DIR / "bandwidth" / "repocket.yml"
+    with open(repocket) as f:
+        data = yaml.safe_load(f)
+    env_keys = {e["key"] for e in data["docker"]["env"]}
+    assert env_keys == {"RP_EMAIL", "RP_API_KEY"}, (
+        f"Repocket container env must be exactly RP_EMAIL + RP_API_KEY, got {env_keys}"
+    )
+    by_key = {e["key"]: e for e in data["docker"]["env"]}
+    assert by_key["RP_API_KEY"]["secret"] is True, "RP_API_KEY must be marked secret"
+    assert by_key["RP_API_KEY"]["required"] is True, "RP_API_KEY must be required"
+    assert by_key["RP_EMAIL"]["required"] is True, "RP_EMAIL must be required"
+
+
+def test_proxybase_container_contract():
+    """Regression for #103: ProxyBase migrated off Docker Hub to the GHCR peer-cli.
+
+    The current client (ghcr.io/proxybaseorg/peer-cli) reads env vars ID + NAME
+    (verified against the image's own --help: 'ProxyBase-Peer [<ID> [<NAME>]]',
+    'set env var ID' / 'set env var NAME'). It does NOT read the old
+    USER_ID/DEVICE_NAME, so a container built on those silently fails with
+    'Missing ID and NAME'. Pin by digest — never fall back to the retired
+    proxybase/proxybase image or a floating tag.
+    """
+    proxybase = SERVICES_DIR / "bandwidth" / "proxybase.yml"
+    with open(proxybase) as f:
+        data = yaml.safe_load(f)
+
+    image = data["docker"]["image"]
+    assert image.startswith("ghcr.io/proxybaseorg/peer-cli@sha256:"), (
+        f"ProxyBase must use the digest-pinned GHCR peer-cli image, got {image}"
+    )
+    assert "linux/arm64" in data["docker"]["platforms"], (
+        "ProxyBase must keep arm64 (the peer-cli image is multi-arch; Raspberry Pi support)"
+    )
+
+    env_keys = {e["key"] for e in data["docker"]["env"]}
+    assert env_keys == {"ID", "NAME"}, (
+        f"ProxyBase container env must be exactly ID + NAME (the peer-cli contract), got {env_keys}"
+    )
+    by_key = {e["key"]: e for e in data["docker"]["env"]}
+    assert by_key["ID"]["required"] is True, "ID (Access Token) must be required"
+    assert by_key["ID"]["secret"] is True, "ID (Access Token) must be marked secret (masked in the UI)"
+    assert by_key["NAME"]["required"] is True, "NAME (Device Name) must be required"
+
+    # Referral revenue guard: the signup URL must keep the referral code.
+    assert data["referral"]["signup_url"] == "https://peer.proxybase.org?referral=nXzS3c6iTO", (
+        f"ProxyBase signup_url must keep the referral code, got {data['referral']['signup_url']}"
+    )
+
+    # Datacenter/VPS IPs are accepted (per the ProxyBase team); drives the UI badge.
+    assert data["requirements"]["residential_ip"] is False, "ProxyBase no longer requires a residential IP"
+    assert data["requirements"]["vps_ip"] is True, "ProxyBase must mark VPS/datacenter IPs as supported"
+
+    # Domain migrated proxybase.io -> proxybase.org across every user-facing URL.
+    assert "proxybase.io" not in data["website"], "website must use proxybase.org"
+    for e in data["docker"]["env"]:
+        assert "proxybase.io" not in e.get("description", ""), f"env {e['key']} description still links proxybase.io"
+
+
+def test_proxybase_markets_referral_and_image_contract():
+    """Revenue + supply-chain guard for the ProxyBase Markets entry.
+
+    This service was contributed by the vendor, so the two things a vendor has
+    an incentive to change are pinned here:
+
+    - The signup URL must keep OUR referral code. It is the same code as the
+      sibling ProxyBase entry; a contributor swapping in their own code would
+      silently redirect every CashPilot signup's commission.
+    - The image must stay digest-pinned. A floating tag on a third-party image
+      that proxies traffic would let the published content change under us.
+    """
+    with open(SERVICES_DIR / "bandwidth" / "proxybase-xyz.yml") as f:
+        data = yaml.safe_load(f)
+
+    assert data["referral"]["signup_url"] == "https://proxybase.xyz?referral=nXzS3c6iTO", (
+        f"ProxyBase Markets signup_url must keep our referral code, got {data['referral']['signup_url']}"
+    )
+
+    image = data["docker"]["image"]
+    assert image.startswith("ghcr.io/proxybasehq/proxybase-cli@sha256:"), (
+        f"ProxyBase Markets must stay digest-pinned to the GHCR image, got {image}"
+    )
+    assert "linux/arm64" in data["docker"]["platforms"], (
+        "ProxyBase Markets must keep arm64 (the image is multi-arch; Raspberry Pi support)"
+    )
+
+    # Every service must tell the user how to get paid (contribution rule).
+    assert data["cashout"]["method"], "ProxyBase Markets must declare a cashout method"

@@ -23,6 +23,10 @@ on:
         description: 'Build Worker image'
         type: boolean
         default: true
+      version:
+        description: 'Version tag (e.g. v0.2.1) — leave empty for latest'
+        type: string
+        default: ''
 
 concurrency:
   group: build-${{ inputs.version || github.ref }}
@@ -30,34 +34,31 @@ concurrency:
 
 jobs:
   resolve-tags:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     outputs:
       ui_tags: ${{ steps.tags.outputs.ui_tags }}
       worker_tags: ${{ steps.tags.outputs.worker_tags }}
+      version: ${{ steps.tags.outputs.version }}
     steps:
-      - name: Compute Docker tags
-        id: tags
+      - id: tags
         run: |
           VERSION="${{ inputs.version }}"
           if [ -z "$VERSION" ]; then
             echo "ui_tags=drumsergio/cashpilot:latest" >> "$GITHUB_OUTPUT"
             echo "worker_tags=drumsergio/cashpilot-worker:latest" >> "$GITHUB_OUTPUT"
+            echo "version=latest" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Strip leading 'v'
           VER="${VERSION#v}"
           MAJOR_MINOR="$(echo "$VER" | cut -d. -f1).$(echo "$VER" | cut -d. -f2)"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
 
-          UI="drumsergio/cashpilot:latest"
-          UI="${UI}
-          drumsergio/cashpilot:${VER}"
-          UI="${UI}
+          UI="drumsergio/cashpilot:latest
+          drumsergio/cashpilot:${VER}
           drumsergio/cashpilot:${MAJOR_MINOR}"
 
-          WORKER="drumsergio/cashpilot-worker:latest"
-          WORKER="${WORKER}
-          drumsergio/cashpilot-worker:${VER}"
-          WORKER="${WORKER}
+          WORKER="drumsergio/cashpilot-worker:latest
+          drumsergio/cashpilot-worker:${VER}
           drumsergio/cashpilot-worker:${MAJOR_MINOR}"
 
           {
@@ -70,86 +71,180 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   lint:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
         with:
-          python-version: "3.12"
+          python-version: "3.14"
+      # The lockfile's ruff, not whatever released today. This job gates
+      # build-ui/build-worker/retag-*, so a floating ruff that adds a default
+      # rule turns the RELEASE red on a commit that changed nothing -- in the
+      # same run whose `ci` job just passed lint on the pinned version. Scope is
+      # `.` here too; `app/` alone let a scripts/ or tests/ violation pass one
+      # gate and fail another.
+      - run: pip install uv
+      - run: uv sync --frozen --extra dev
+      - run: uv run ruff check . && uv run ruff format --check .
 
-      - name: Install ruff
-        run: pip install ruff
-
-      - name: Lint and format check
-        run: ruff check app/ && ruff format --check app/
-
+  # Multi-arch build (amd64 + arm64) in a single QEMU-emulated job on the X64
+  # runner. buildx pushes the multi-platform manifest under all tags directly,
+  # so no separate ARM64 runner and no manifest-merge job are needed.
   build-ui:
     needs: [lint, resolve-tags]
     if: inputs.build_ui
-    runs-on: [self-hosted, linux, x64]
-    permissions:
-      contents: read
-      packages: write
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push UI image
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            CASHPILOT_VERSION=${{ needs.resolve-tags.outputs.version }}
           tags: ${{ needs.resolve-tags.outputs.ui_tags }}
-          cache-from: type=gha,scope=cashpilot-ui
-          cache-to: type=gha,mode=max,scope=cashpilot-ui
+          cache-from: type=gha,scope=ui
+          cache-to: type=gha,mode=max,scope=ui
 
+  # A release must publish BOTH images even when only one changed. The compose
+  # files pin them to the same tag, so a version that exists for one and not the
+  # other makes the documented quickstart reference a tag that is not there —
+  # `docker compose pull` then fails for anyone following the README.
+  #
+  # This is a manifest re-point, not a rebuild: imagetools copies the existing
+  # multi-arch descriptor to the new tags in seconds, so an unchanged image is
+  # never rebuilt just to satisfy a naming convention.
   build-worker:
     needs: [lint, resolve-tags]
     if: inputs.build_worker
-    runs-on: [self-hosted, linux, x64]
-    permissions:
-      contents: read
-      packages: write
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+      - uses: actions/checkout@v7.0.1
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push Worker image
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile.worker
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            CASHPILOT_VERSION=${{ needs.resolve-tags.outputs.version }}
           tags: ${{ needs.resolve-tags.outputs.worker_tags }}
-          cache-from: type=gha,scope=cashpilot-worker
-          cache-to: type=gha,mode=max,scope=cashpilot-worker
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,mode=max,scope=worker
+
+  # CI passed happily while cashpilot:1.7.0 existed and cashpilot-worker:1.7.0
+  # did not — the gap was only found by deploying. This closes that: if a tag
+  # this release claims to have published does not resolve, the run fails.
+  verify-tags:
+    needs: [resolve-tags, build-ui, build-worker]
+    if: ${{ always() && inputs.version != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      # This job is the only one in this file that talks to Docker Hub without
+      # logging in first. Anonymous pulls share a per-IP quota with every other
+      # project on the same GitHub-hosted runner egress, so a rate limit here
+      # reports "MISSING" for images that published perfectly — and because
+      # verify-tags failing fails release.yml's `build`, which `publish` needs,
+      # the run then withholds the git tag and the GitHub Release for a release
+      # that is actually complete.
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Every published tag must resolve
+        env:
+          UI_TAGS: ${{ needs.resolve-tags.outputs.ui_tags }}
+          WORKER_TAGS: ${{ needs.resolve-tags.outputs.worker_tags }}
+        run: |
+          # Written to a file and read WITHOUT a pipe: a `while` on the right of
+          # a pipe runs in a subshell, so a counter set inside it is lost. And
+          # the step runs under `bash -e`, where a plain `[ -s f ] && x=1` fails
+          # the whole step on the happy path when the file is absent.
+          printf '%s\n%s\n' "$UI_TAGS" "$WORKER_TAGS" > /tmp/tags.txt
+          missing=0
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            # Capture stderr instead of discarding it. `2>&1 >/dev/null` threw
+            # away the registry's actual answer, so a rate limit, a 5xx or a DNS
+            # failure all printed the single word MISSING and the ::error::
+            # below then asserted a cause that was not true.
+            if err=$(docker manifest inspect "$tag" 2>&1); then
+              echo "ok      $tag"
+            else
+              echo "MISSING $tag -- registry said: ${err}"
+              missing=1
+            fi
+          done < /tmp/tags.txt
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::A tag this release claims to have published did not resolve. Read the registry response printed above BEFORE assuming a partial build: an auth or rate-limit failure looks identical here. If the images really are missing, the compose files pin both to the same tag, so a partial release breaks the documented quickstart."
+            exit 1
+          fi
+
+      # A tag RESOLVING says nothing about WHAT it resolves to. That gap shipped
+      # three releases of one worker image: 1.13.0, 1.14.0 and 1.14.1 all pointed
+      # at a single digest reporting CASHPILOT_VERSION=1.13.0, and the guard
+      # above passed every time because each tag existed.
+      #
+      # This checks the ARTIFACT instead of the label: pull the image config and
+      # require the version baked into it to equal the version being released. It
+      # catches a re-tag, a stale build cache and a skipped build alike -- all
+      # three produce a tag whose image disagrees with its name.
+      - name: Every published image must report the version it is tagged with
+        env:
+          UI_TAGS: ${{ needs.resolve-tags.outputs.ui_tags }}
+          WORKER_TAGS: ${{ needs.resolve-tags.outputs.worker_tags }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # The release input is "v1.2.3"; the image bakes the bare number.
+          want="${VERSION#v}"
+          echo "expecting CASHPILOT_VERSION=${want}"
+          bad=0
+          # A here-string, not a pipe and not a temp file: a `while` on the right
+          # of a pipe runs in a subshell, so `bad` set inside it would be lost --
+          # which is why the step above uses a file. This avoids both.
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            # `docker buildx imagetools inspect --raw` returns the manifest, not
+            # the config, so the env is not in it. Pulling is the reliable way to
+            # read what the image actually declares.
+            #
+            # A FAILED PULL IS A FAILURE, not something to skip. An earlier draft
+            # `continue`d here on the reasoning that the resolve check above owns
+            # it -- but that check uses `docker manifest inspect`, which can
+            # succeed while a pull fails, so skipping left the version unverified
+            # and `bad` at 0. That is a check that cannot fail, which is worse
+            # than no check: the release would publish looking verified.
+            if ! err=$(docker pull -q "$tag" 2>&1); then
+              echo "PULL FAILED  $tag -- ${err}"
+              bad=1
+              continue
+            fi
+            got=$(docker image inspect "$tag" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+                  | sed -n 's/^CASHPILOT_VERSION=//p' | head -1)
+            if [ "$got" = "$want" ]; then
+              echo "ok      $tag reports ${got}"
+            else
+              echo "WRONG   $tag reports '${got}', expected '${want}'"
+              bad=1
+            fi
+          done <<< "$(printf '%s\n%s\n' "$UI_TAGS" "$WORKER_TAGS")"
+          if [ "$bad" -ne 0 ]; then
+            echo "::error::A published image reports a version other than the one it is tagged with. This is what a re-tagged or cache-stale image looks like: the tag resolves, so the check above passes, while every worker running it reports the WRONG version on the fleet page -- and a wrong version reads as a match, hiding the staleness version reporting exists to reveal. Do NOT fix this by re-tagging; rebuild the image. A PULL FAILED line above means the version could not be read at all -- that is also a failure here, because an unverified image must not ship looking verified."
+            exit 1
+          fi

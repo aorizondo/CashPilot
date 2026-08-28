@@ -9,6 +9,7 @@ No API keys required — both services are free-tier.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -24,49 +25,54 @@ logger = logging.getLogger(__name__)
 # intentionally do NOT map GRASS here.
 CRYPTO_IDS: dict[str, str] = {
     "MYST": "mysterium",
+    # Anyone Protocol. The id really is "airtor-protocol" — the project was
+    # renamed from ATOR and CoinGecko kept the original slug. Taken from the
+    # collector, which has been querying that id for the price all along.
+    "ANYONE": "airtor-protocol",
 }
 
 CACHE_TTL = 900  # 15 minutes
+# Rates are considered stale (refreshes are failing) after 2x the cache TTL.
+STALE_THRESHOLD = 2 * CACHE_TTL  # 30 minutes
 
 # In-memory caches
 _fiat_rates: dict[str, float] = {"USD": 1.0}
 _crypto_usd: dict[str, float] = {}
+# Crypto (CoinGecko) and fiat (Frankfurter) are independent sources with their own
+# staleness clocks, each advanced ONLY on that source's own HTTP 200 -- a failure
+# on one source must never mark the other source's rates stale, and must never be
+# papered over as "fresh" for the source that actually failed.
+_crypto_last_fetch: float = 0
+_fiat_last_fetch: float = 0
+# Aggregate clock kept for backward-compat callers (rates_stale()/get_all()). It
+# reflects the WORSE of the two sources (the older of the two timestamps), so a
+# partial failure is never reported as fully fresh.
 _last_fetch: float = 0
 
 
 async def refresh() -> None:
-    """Fetch latest exchange rates from external APIs."""
-    global _fiat_rates, _crypto_usd, _last_fetch
+    """Fetch latest exchange rates from external APIs.
+
+    Only a genuine HTTP 200 from a source advances THAT source's own last-fetch
+    time -- a non-200 (or an unreachable API) leaves it untouched so staleness is
+    tracked per-source and a partial failure can't mislabel the other source.
+    """
+    global _last_fetch
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            # --- Crypto rates from CoinGecko (free, no key) ---
-            if CRYPTO_IDS:
-                ids = ",".join(CRYPTO_IDS.values())
-                resp = await client.get(
-                    "https://api.coingecko.com/api/v3/simple/price",
-                    params={"ids": ids, "vs_currencies": "usd"},
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for token, cg_id in CRYPTO_IDS.items():
-                        price = (data.get(cg_id) or {}).get("usd")
-                        if price is not None:
-                            _crypto_usd[token] = float(price)
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            # Fetch both sources concurrently — they update independent state, so a slow
+            # provider no longer serializes behind the other. This roughly halves the
+            # worst case (two 15s-timeout calls: 30s -> 15s), which matters most on the
+            # startup path where refresh() is awaited before the app serves requests.
+            # return_exceptions so one source's network failure can't discard the other's
+            # success (each source still tracks its own last-fetch / non-200 internally).
+            results = await asyncio.gather(_fetch_crypto(client), _fetch_fiat(client), return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception):
+                logger.error("Exchange rate fetch failed: %s", r)
 
-            # --- Fiat rates from Frankfurter (free, no key) ---
-            resp = await client.get(
-                "https://api.frankfurter.app/latest",
-                params={"from": "USD"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                new_rates: dict[str, float] = {"USD": 1.0}
-                for code, rate in data.get("rates", {}).items():
-                    new_rates[code] = float(rate)
-                _fiat_rates = new_rates
-
-        _last_fetch = time.time()
+        _last_fetch = min(_crypto_last_fetch, _fiat_last_fetch)
         logger.info(
             "Exchange rates updated: %d fiat currencies, %d crypto tokens",
             len(_fiat_rates),
@@ -76,13 +82,101 @@ async def refresh() -> None:
         logger.error("Exchange rate fetch failed: %s", exc)
 
 
+async def _fetch_crypto(client: httpx.AsyncClient) -> None:
+    """Fetch crypto→USD from CoinGecko (free, no key). Updates crypto state in place."""
+    global _crypto_usd, _crypto_last_fetch
+    if not CRYPTO_IDS:
+        # Nothing to fetch -- don't let an empty crypto map hold the aggregate
+        # staleness clock back forever.
+        _crypto_last_fetch = time.time()
+        return
+    ids = ",".join(CRYPTO_IDS.values())
+    resp = await client.get(
+        "https://api.coingecko.com/api/v3/simple/price",
+        params={"ids": ids, "vs_currencies": "usd"},
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        for token, cg_id in CRYPTO_IDS.items():
+            price = (data.get(cg_id) or {}).get("usd")
+            if price is not None:
+                _crypto_usd[token] = float(price)
+        _crypto_last_fetch = time.time()
+    else:
+        logger.warning("exchange rate fetch got HTTP %s from %s", resp.status_code, "CoinGecko")
+
+
+async def _fetch_fiat(client: httpx.AsyncClient) -> None:
+    """Fetch USD→fiat from Frankfurter (free, no key). Updates fiat state in place."""
+    global _fiat_rates, _fiat_last_fetch
+    resp = await client.get(
+        "https://api.frankfurter.app/latest",
+        params={"from": "USD"},
+    )
+    if resp.status_code == 200:
+        data = resp.json()
+        new_rates: dict[str, float] = {"USD": 1.0}
+        for code, rate in data.get("rates", {}).items():
+            new_rates[code] = float(rate)
+        _fiat_rates = new_rates
+        _fiat_last_fetch = time.time()
+    else:
+        logger.warning("exchange rate fetch got HTTP %s from %s", resp.status_code, "Frankfurter")
+
+
+def rates_stale() -> bool:
+    """Return True if cached rates are stale (refreshes appear to be failing).
+
+    Rates are stale once more than ``STALE_THRESHOLD`` seconds have elapsed
+    since the last successful fetch (``_last_fetch`` is only updated on
+    success, and reflects the WORSE of the crypto/fiat sources -- see
+    ``crypto_rates_stale()``/``fiat_rates_stale()`` for the per-source signal).
+    A never-fetched cache (``_last_fetch == 0``) is also stale. Callers can use
+    this to avoid silently summing balances against rates that may be badly
+    out of date.
+    """
+    return time.time() - _last_fetch > STALE_THRESHOLD
+
+
+def crypto_rates_stale() -> bool:
+    """Return True if crypto rates are stale (CoinGecko refreshes are failing)."""
+    return time.time() - _crypto_last_fetch > STALE_THRESHOLD
+
+
+def fiat_rates_stale() -> bool:
+    """Return True if fiat rates are stale (Frankfurter refreshes are failing)."""
+    return time.time() - _fiat_last_fetch > STALE_THRESHOLD
+
+
 def get_all() -> dict[str, Any]:
     """Return all cached rates for the frontend."""
     return {
         "fiat": dict(_fiat_rates),
         "crypto_usd": dict(_crypto_usd),
         "last_updated": _last_fetch,
+        "stale": rates_stale(),
+        "crypto_stale": crypto_rates_stale(),
+        "fiat_stale": fiat_rates_stale(),
     }
+
+
+def from_usd(amount: float, currency: str) -> float | None:
+    """Convert a USD amount into *currency*. The inverse of :func:`to_usd`.
+
+    ``_fiat_rates`` stores USD->X rates, so this MULTIPLIES where ``to_usd``
+    divides. Getting that backwards would be worse than not converting at all,
+    which is why the two live next to each other.
+
+    Fiat only: a USD figure has no meaningful expression in a provider's token,
+    and inventing one would put a crypto amount where a currency belongs.
+    Returns None when no rate is available.
+    """
+    if currency == "USD":
+        return amount
+    rate = _fiat_rates.get(currency)
+    if rate and rate > 0:
+        return amount * rate
+    return None
 
 
 def to_usd(amount: float, currency: str) -> float | None:

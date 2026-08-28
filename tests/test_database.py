@@ -7,6 +7,7 @@ from unittest.mock import patch
 os.environ.setdefault("CASHPILOT_API_KEY", "test-fleet-key")
 
 import pytest
+from cryptography.fernet import Fernet
 
 from app import database
 
@@ -74,6 +75,96 @@ class TestEarnings:
             summary = await database.get_earnings_summary()
             hg = next(e for e in summary if e["platform"] == "honeygain")
             assert hg["balance"] == 7.0
+
+        asyncio.run(run())
+
+    def test_fx_rate_is_stored_with_the_reading(self, db):
+        # Rates are only cached live, so the rate at collection time must be stored
+        # alongside the balance or the historical USD value is unrecoverable.
+        async def run():
+            await database.upsert_earnings("mysterium", 8.0, "MYST", "2026-01-01", fx_rate_usd=0.25)
+            conn = await database._get_db()
+            try:
+                cur = await conn.execute(
+                    "SELECT balance, currency, fx_rate_usd FROM earnings WHERE platform = 'mysterium'"
+                )
+                row = await cur.fetchone()
+            finally:
+                await conn.close()
+            assert row["balance"] == 8.0
+            assert row["currency"] == "MYST"
+            assert row["fx_rate_usd"] == 0.25
+
+        asyncio.run(run())
+
+    def test_fx_rate_updates_on_conflict(self, db):
+        async def run():
+            await database.upsert_earnings("mysterium", 8.0, "MYST", "2026-01-01", fx_rate_usd=0.25)
+            await database.upsert_earnings("mysterium", 9.0, "MYST", "2026-01-01", fx_rate_usd=0.30)
+            conn = await database._get_db()
+            try:
+                cur = await conn.execute("SELECT balance, fx_rate_usd FROM earnings WHERE platform = 'mysterium'")
+                row = await cur.fetchone()
+            finally:
+                await conn.close()
+            assert row["balance"] == 9.0
+            assert row["fx_rate_usd"] == 0.30
+
+        asyncio.run(run())
+
+    def test_a_missing_rate_never_overwrites_a_known_one(self, db):
+        """Regression: the UPDATE assigned the new rate unconditionally.
+
+        If the rate lookup failed this cycle (provider outage after a restart cleared
+        the cache) the incoming value is None — and overwriting a good rate with NULL
+        would destroy the only record of what that reading was worth.
+        """
+
+        async def run():
+            await database.upsert_earnings("mysterium", 8.0, "MYST", "2026-01-01", fx_rate_usd=0.25)
+            await database.upsert_earnings("mysterium", 9.0, "MYST", "2026-01-01", fx_rate_usd=None)
+            conn = await database._get_db()
+            try:
+                cur = await conn.execute("SELECT balance, fx_rate_usd FROM earnings WHERE platform = 'mysterium'")
+                row = await cur.fetchone()
+            finally:
+                await conn.close()
+            assert row["balance"] == 9.0  # balance still advances
+            assert row["fx_rate_usd"] == 0.25  # rate preserved
+
+        asyncio.run(run())
+
+    def test_a_null_rate_can_still_be_back_filled(self, db):
+        """Regression: the balance guard skipped the whole UPDATE when the balance was
+        unchanged, so a row stored with a NULL rate could never gain one — for a
+        service whose balance moves once a day, that meant never."""
+
+        async def run():
+            await database.upsert_earnings("mysterium", 8.0, "MYST", "2026-01-01", fx_rate_usd=None)
+            # Same balance, rate now available.
+            await database.upsert_earnings("mysterium", 8.0, "MYST", "2026-01-01", fx_rate_usd=0.25)
+            conn = await database._get_db()
+            try:
+                cur = await conn.execute("SELECT fx_rate_usd FROM earnings WHERE platform = 'mysterium'")
+                row = await cur.fetchone()
+            finally:
+                await conn.close()
+            assert row["fx_rate_usd"] == 0.25
+
+        asyncio.run(run())
+
+    def test_fx_rate_defaults_to_null(self, db):
+        # Callers that don't supply a rate (or an unknown currency) store NULL rather
+        # than a wrong number.
+        async def run():
+            await database.upsert_earnings("hg", 1.0, "USD")
+            conn = await database._get_db()
+            try:
+                cur = await conn.execute("SELECT fx_rate_usd FROM earnings WHERE platform = 'hg'")
+                row = await cur.fetchone()
+            finally:
+                await conn.close()
+            assert row["fx_rate_usd"] is None
 
         asyncio.run(run())
 
@@ -300,6 +391,27 @@ class TestUsers:
 
         asyncio.run(run())
 
+    def test_create_first_owner_when_empty(self, db):
+        async def run():
+            uid = await database.create_first_owner("alice", "pw")
+            assert uid is not None
+            assert (await database.get_user_by_id(uid))["role"] == "owner"
+
+        asyncio.run(run())
+
+    def test_create_first_owner_loses_race_when_account_exists(self, db):
+        # The atomic INSERT ... WHERE NOT EXISTS makes a second first-run attempt a
+        # no-op (returns None) even with a different username — so a raced setup
+        # token cannot mint two owners.
+        async def run():
+            first = await database.create_first_owner("alice", "pw")
+            assert first is not None
+            second = await database.create_first_owner("bob", "pw")
+            assert second is None
+            assert len(await database.list_users()) == 1
+
+        asyncio.run(run())
+
 
 class TestUserPreferences:
     def test_save_and_get_preferences(self, db):
@@ -377,19 +489,134 @@ class TestWorkers:
 
         asyncio.run(run())
 
-    def test_get_worker_by_name(self, db):
-        async def run():
-            await database.upsert_worker("c1", "myworker")
-            worker = await database.get_worker_by_name("myworker")
-            assert worker is not None
-            assert worker["name"] == "myworker"
-
-        asyncio.run(run())
-
     def test_get_missing_worker(self, db):
         async def run():
             assert await database.get_worker(9999) is None
-            assert await database.get_worker_by_name("nope") is None
+
+        asyncio.run(run())
+
+
+class TestEarningsFxMigration:
+    def test_migration_adds_fx_column_to_existing_db(self, db_dir):
+        """An existing DB predating the column gains it, keeping its rows."""
+
+        async def run():
+            conn = await database._get_db()
+            try:
+                # Recreate the pre-migration shape (no fx_rate_usd) with a row in it.
+                await conn.executescript("""
+                    DROP TABLE IF EXISTS earnings;
+                    CREATE TABLE earnings (
+                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                        platform   TEXT    NOT NULL,
+                        balance    REAL    NOT NULL,
+                        currency   TEXT    NOT NULL DEFAULT 'USD',
+                        date       TEXT    NOT NULL,
+                        created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+                    );
+                    INSERT INTO earnings (platform, balance, currency, date)
+                    VALUES ('legacy', 4.2, 'USD', '2026-01-01');
+                """)
+                await conn.commit()
+                cur = await conn.execute("PRAGMA table_info(earnings)")
+                before = {row["name"] for row in await cur.fetchall()}
+            finally:
+                await conn.close()
+            assert "fx_rate_usd" not in before
+
+            await database.init_db()
+
+            conn = await database._get_db()
+            try:
+                cur = await conn.execute("PRAGMA table_info(earnings)")
+                after = {row["name"] for row in await cur.fetchall()}
+                cur = await conn.execute("SELECT balance, fx_rate_usd FROM earnings WHERE platform = 'legacy'")
+                row = await cur.fetchone()
+            finally:
+                await conn.close()
+            assert "fx_rate_usd" in after
+            # The pre-existing row survives; its unknown historical rate stays NULL
+            # rather than being back-filled with today's (wrong) rate.
+            assert row["balance"] == 4.2
+            assert row["fx_rate_usd"] is None
+
+        asyncio.run(run())
+
+    def test_migration_is_idempotent(self, db):
+        async def run():
+            await database.init_db()  # already migrated by the fixture
+            conn = await database._get_db()
+            try:
+                cur = await conn.execute("PRAGMA table_info(earnings)")
+                cols = [row["name"] for row in await cur.fetchall()]
+            finally:
+                await conn.close()
+            assert cols.count("fx_rate_usd") == 1
+
+        asyncio.run(run())
+
+
+class TestAlerts:
+    """Alerts must survive a restart and must not re-notify every hour."""
+
+    def test_first_alert_is_new_duplicate_is_not(self, db):
+        async def run():
+            assert isinstance(await database.record_alert("collector", "honeygain", "login failed"), int)
+            # Same failure an hour later: stored once, reported as not-new so the
+            # caller doesn't re-notify.
+            assert await database.record_alert("collector", "honeygain", "login failed") is None
+            assert len(await database.list_alerts()) == 1
+
+        asyncio.run(run())
+
+    def test_alternating_messages_do_not_defeat_the_cooldown(self, db):
+        """Regression: dedupe used to compare only against the LAST message.
+
+        Several collectors alternate between two error strings for one underlying
+        fault (grass flips between an expired token and a Cloudflare rate-limit), so
+        message-equality dedupe re-notified every hour and grew the table forever.
+        """
+
+        async def run():
+            assert isinstance(await database.record_alert("collector", "grass", "Token expired"), int)
+            assert await database.record_alert("collector", "grass", "Cloudflare rate limit") is None
+            assert await database.record_alert("collector", "grass", "Token expired") is None
+            assert len(await database.list_alerts()) == 1
+
+        asyncio.run(run())
+
+    def test_alerts_again_once_the_cooldown_has_passed(self, db):
+        async def run():
+            assert isinstance(await database.record_alert("collector", "hg", "boom"), int)
+            # A zero-length window models the cooldown having elapsed.
+            assert isinstance(await database.record_alert("collector", "hg", "boom", cooldown_hours=0), int)
+
+        asyncio.run(run())
+
+    def test_list_alerts_is_newest_first(self, db):
+        async def run():
+            await database.record_alert("collector", "a", "first")
+            await database.record_alert("collector", "b", "second")
+            alerts = await database.list_alerts()
+            assert [a["subject"] for a in alerts] == ["b", "a"]
+
+        asyncio.run(run())
+
+    def test_clear_by_subject_only_clears_that_subject(self, db):
+        async def run():
+            await database.record_alert("collector", "honeygain", "boom")
+            await database.record_alert("collector", "earnapp", "boom")
+            await database.clear_alerts("collector", "honeygain")
+            assert [a["subject"] for a in await database.list_alerts()] == ["earnapp"]
+
+        asyncio.run(run())
+
+    def test_recovery_then_failure_notifies_again(self, db):
+        # The point of clearing on recovery: the next failure must count as new.
+        async def run():
+            assert isinstance(await database.record_alert("collector", "hg", "boom"), int)
+            await database.clear_alerts("collector", "hg")
+            assert isinstance(await database.record_alert("collector", "hg", "boom"), int)
 
         asyncio.run(run())
 
@@ -415,12 +642,168 @@ class TestHealthEvents:
 
         asyncio.run(run())
 
+    def test_record_health_events_batched(self, db):
+        async def run():
+            # One batched write of several events across two services (the health-check
+            # path uses this instead of a commit per service).
+            await database.record_health_events(
+                [
+                    ("honeygain", "check_ok", ""),
+                    ("honeygain", "restart", ""),
+                    ("earnapp", "check_down", "stopped"),
+                ]
+            )
+            by_slug = {s["slug"]: s for s in await database.get_health_scores(7)}
+            assert set(by_slug) == {"honeygain", "earnapp"}
+            assert by_slug["honeygain"]["restarts"] == 1
+            # An empty batch is a no-op — no crash, nothing written.
+            await database.record_health_events([])
+            assert len(await database.get_health_scores(7)) == 2
+
+        asyncio.run(run())
+
+
+class TestWorkerKeys:
+    def test_workers_table_has_api_key_enc_column(self, db):
+        async def run():
+            conn = await database._get_db()
+            try:
+                cur = await conn.execute("PRAGMA table_info(workers)")
+                cols = {row["name"] for row in await cur.fetchall()}
+                assert "api_key_enc" in cols
+            finally:
+                await conn.close()
+
+        asyncio.run(run())
+
+    def test_set_and_get_worker_key_round_trip(self, db):
+        async def run():
+            await database.upsert_worker("c1", "w1")
+            assert await database.get_worker_key("c1") is None  # unenrolled
+            await database.set_worker_key("c1", "super-secret-key")
+            assert await database.get_worker_key("c1") == "super-secret-key"
+
+        asyncio.run(run())
+
+    def test_worker_key_stored_encrypted_at_rest(self, db):
+        async def run():
+            await database.upsert_worker("c1", "w1")
+            await database.set_worker_key("c1", "super-secret-key")
+            conn = await database._get_db()
+            try:
+                cur = await conn.execute("SELECT api_key_enc FROM workers WHERE client_id = 'c1'")
+                row = await cur.fetchone()
+                assert row["api_key_enc"].startswith("enc:")  # not stored in plaintext
+                assert "super-secret-key" not in row["api_key_enc"]
+            finally:
+                await conn.close()
+
+        asyncio.run(run())
+
+    def test_get_worker_key_missing_worker_is_none(self, db):
+        async def run():
+            assert await database.get_worker_key("nope") is None
+
+        asyncio.run(run())
+
+    def test_key_confirmation_lifecycle(self, db):
+        async def run():
+            await database.upsert_worker("c1", "w1")
+            # No key -> unenrolled + unconfirmed.
+            assert await database.get_worker_key_state("c1") == (None, False)
+            # Setting a key leaves it unconfirmed.
+            await database.set_worker_key("c1", "k1")
+            assert await database.get_worker_key_state("c1") == ("k1", False)
+            # Confirming flips the flag.
+            await database.confirm_worker_key("c1")
+            assert await database.get_worker_key_state("c1") == ("k1", True)
+            # Re-issuing a key resets confirmation.
+            await database.set_worker_key("c1", "k2")
+            assert await database.get_worker_key_state("c1") == ("k2", False)
+
+        asyncio.run(run())
+
+    def test_get_worker_key_state_missing_worker(self, db):
+        async def run():
+            assert await database.get_worker_key_state("nope") == (None, False)
+
+        asyncio.run(run())
+
+    def test_undecryptable_key_treated_as_unenrolled_not_empty_string(self, db):
+        """Regression: if CASHPILOT_SECRET_KEY changes/rotates, a previously
+        enrolled worker's encrypted key can no longer be decrypted.
+        decrypt_value() maps that failure to "" -- get_worker_key_state() must
+        NOT pass "" through as a real (never-matching) key, which would brick
+        the worker in both directions (it can't authenticate with its old key,
+        and it can't fall back to the shared bootstrap key either since it's
+        already confirmed). It must report "no usable key" (None) so callers
+        fall back to the shared key and the worker can re-enroll."""
+
+        async def run():
+            await database.upsert_worker("c1", "w1")
+            await database.set_worker_key("c1", "real-worker-key")
+            await database.confirm_worker_key("c1")
+
+            # Simulate CASHPILOT_SECRET_KEY having changed: the stored ciphertext
+            # was encrypted with the OLD key and can no longer be decrypted.
+            with patch.object(database, "_fernet", Fernet(Fernet.generate_key())):
+                key, confirmed = await database.get_worker_key_state("c1")
+                assert key is None  # NOT "" -- "" would look like a real key
+                assert confirmed is False
+                assert await database.get_worker_key("c1") is None
+
+        asyncio.run(run())
+
 
 class TestDataRetention:
     def test_purge_returns_count(self, db):
         async def run():
             result = await database.purge_old_data()
             assert result == 0  # nothing old to purge
+
+        asyncio.run(run())
+
+    def test_purge_trims_old_check_samples_but_keeps_lifecycle(self, db):
+        """check_ok/check_down samples are trimmed at HEALTH_CHECK_RETENTION_DAYS,
+        while lifecycle events (crash/restart/…) survive until RETENTION_DAYS and
+        recent samples are untouched."""
+
+        async def _insert(slug, event, days_ago):
+            conn = await database._get_db()
+            try:
+                await conn.execute(
+                    "INSERT INTO health_events (slug, event, created_at) VALUES (?, ?, datetime('now', ?))",
+                    (slug, event, f"-{days_ago} days"),
+                )
+                await conn.commit()
+            finally:
+                await conn.close()
+
+        async def run():
+            await _insert("hg", "check_ok", 1)  # recent sample -> kept
+            await _insert("hg", "check_ok", database.HEALTH_CHECK_RETENTION_DAYS + 10)  # old sample -> purged
+            await _insert("hg", "crash", 300)  # lifecycle < 400d -> kept
+            await _insert("hg", "crash", database.RETENTION_DAYS + 10)  # lifecycle > 400d -> purged
+
+            deleted = await database.purge_old_data()
+            assert deleted == 2  # the old sample + the ancient crash
+
+            conn = await database._get_db()
+            try:
+                cur = await conn.execute("SELECT event, COUNT(*) c FROM health_events GROUP BY event ORDER BY event")
+                rows = {r["event"]: r["c"] for r in await cur.fetchall()}
+            finally:
+                await conn.close()
+            assert rows == {"check_ok": 1, "crash": 1}  # one recent sample + the 300d crash
+
+        asyncio.run(run())
+
+    def test_vacuum_runs_clean(self, db):
+        async def run():
+            await database.record_health_event("hg", "check_ok")
+            # Must not raise (VACUUM cannot run inside a transaction — the impl
+            # commits first); a no-op-ish call on a small DB simply succeeds.
+            await database.vacuum_database()
 
         asyncio.run(run())
 

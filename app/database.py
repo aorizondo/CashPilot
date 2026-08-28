@@ -7,8 +7,13 @@ fallback to ./data/cashpilot.db for development.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import logging
+import math
 import os
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -41,6 +46,22 @@ SECRET_CONFIG_KEYS = {
     "brd_sess_id",
     "remember_web",
     "xsrf_token",
+    # Added after an audit found the at-rest boundary was a naming convention
+    # with nothing enforcing it: a collector argument called "cookie" or "seed"
+    # was silently stored in plaintext. Matching is by suffix and reads are
+    # backward compatible (a value without the "enc:" prefix is returned as-is),
+    # so widening this list only affects new writes.
+    "cookie",
+    "credential",
+    "bearer",
+    "jwt",
+    "passphrase",
+    "secret",
+    "seed",
+    "mnemonic",
+    "private_key",
+    "keyfile",
+    "refresh_token",
 }
 
 
@@ -50,28 +71,213 @@ def _is_secret_key(key: str) -> bool:
     return any(lower.endswith(s) for s in SECRET_CONFIG_KEYS)
 
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+# Set when CASHPILOT_ENCRYPTION_KEY is present but not a usable Fernet key.
+_fernet_key_error: str | None = None
+# Set when the key could not be written to disk, i.e. it dies with this process.
+_fernet_key_persist_error: str | None = None
+_fernet_key_is_ephemeral = False
+
+
 def _load_or_create_fernet() -> Fernet:
-    """Load or generate the Fernet encryption key."""
+    """Resolve the key used to encrypt stored credentials.
+
+    Precedence is deliberate, and file-first:
+
+      1. ``<data>/.fernet_key`` always wins when it exists.
+      2. Otherwise ``CASHPILOT_ENCRYPTION_KEY``, which is then persisted.
+      3. Otherwise a fresh key is generated and persisted.
+
+    Reading the file first is what makes the environment variable safe to
+    introduce. Env-first would mean anyone who sets it on a running instance
+    instantly loses every credential already encrypted under the file key. The
+    restore case is unaffected, because a wiped volume has no file for the
+    environment value to lose to.
+
+    Note this is NOT ``CASHPILOT_SECRET_KEY``, which signs sessions and lives at
+    ``<data>/.secret_key``. They are separate keys with separate jobs.
+    """
+    global _fernet_key_error, _fernet_key_persist_error, _fernet_key_is_ephemeral
+
+    env_raw = os.getenv("CASHPILOT_ENCRYPTION_KEY", "").strip()
+    env_key: bytes | None = None
+    env_invalid: str | None = None
+    if env_raw:
+        try:
+            Fernet(env_raw.encode())
+            env_key = env_raw.encode()
+        except (ValueError, TypeError) as exc:
+            # Do not quietly generate a replacement: that is the same silent
+            # failure this function exists to remove. Record it and let startup
+            # refuse.
+            # Recorded, not raised yet: if a valid key file exists it wins, and a
+            # malformed env value is then just as moot as a valid-but-different
+            # one. Only promote this to a startup failure if we would actually
+            # have to fall back to the environment.
+            env_invalid = (
+                f"CASHPILOT_ENCRYPTION_KEY is set but is not a valid Fernet key "
+                f"({exc or 'malformed'}). It must be a urlsafe-base64 32-byte key, as "
+                'produced by `python -c "from cryptography.fernet import Fernet; '
+                'print(Fernet.generate_key().decode())"`.'
+            )
+
+    # 1. An existing key file always wins.
+    unusable: str | None = None
     try:
         if _FERNET_KEY_FILE.is_file():
             raw = _FERNET_KEY_FILE.read_text().strip()
             if raw:
-                return Fernet(raw.encode())
-    except (OSError, ValueError):
-        pass
+                try:
+                    fernet = Fernet(raw.encode())
+                except (ValueError, TypeError) as exc:
+                    unusable = f"it is not a valid Fernet key ({exc})"
+                else:
+                    if env_invalid:
+                        _logger.warning(
+                            "%s Ignoring it: the key already stored at %s wins.",
+                            env_invalid,
+                            _FERNET_KEY_FILE,
+                        )
+                    if env_key and env_key != raw.encode():
+                        _logger.warning(
+                            "CASHPILOT_ENCRYPTION_KEY differs from the key already stored "
+                            "at %s. The stored key wins, because switching keys would make "
+                            "every existing credential unreadable. To adopt the environment "
+                            "key instead, remove the file and re-enter your credentials.",
+                            _FERNET_KEY_FILE,
+                        )
+                    return fernet
+            # An empty file means no key was ever stored, so replacing it loses
+            # nothing. Fall through and mint one.
+    except OSError as exc:
+        unusable = f"it could not be read ({exc})"
 
-    key = Fernet.generate_key()
+    if unusable:
+        # Refuse rather than overwrite. Credentials already in the database were
+        # encrypted under the key this file was meant to hold, so replacing it
+        # destroys the only artifact that could still decrypt them.
+        _fernet_key_error = (
+            f"the key file {_FERNET_KEY_FILE} exists but {unusable}. Refusing to "
+            "overwrite it: any credential already stored was encrypted under that "
+            "key, and replacing the file would make them permanently unreadable. "
+            "Restore the file from backup, or move it aside and re-enter your "
+            "credentials."
+        )
+        _logger.error("%s", _fernet_key_error)
+        # Return a working cipher so importing this module stays side-effect free;
+        # startup refuses via verify_encryption_key_persisted().
+        return Fernet(Fernet.generate_key())
+
+    if env_invalid:
+        # No usable file key, so the supplied value was the one that mattered.
+        # Generating a replacement would silently discard whatever the user was
+        # trying to restore.
+        _fernet_key_error = env_invalid
+        _logger.error("%s", _fernet_key_error)
+        return Fernet(Fernet.generate_key())
+
+    # 2/3. Adopt the supplied key, or mint one.
+    key = env_key if env_key else Fernet.generate_key()
     try:
         DB_DIR.mkdir(parents=True, exist_ok=True)
-        _FERNET_KEY_FILE.write_text(key.decode())
+        # Create with 0o600 up front rather than chmod-ing afterwards: writing
+        # first would leave the key briefly readable to anyone, depending on umask.
+        fd = os.open(_FERNET_KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, key)
+        finally:
+            os.close(fd)
+        # An existing file keeps its old mode, so tighten it regardless.
         _FERNET_KEY_FILE.chmod(0o600)
-        _logger.info("Generated new Fernet key at %s", _FERNET_KEY_FILE)
+        _logger.info(
+            "%s credential-encryption key at %s",
+            "Adopted the supplied" if env_key else "Generated a new",
+            _FERNET_KEY_FILE,
+        )
     except OSError as exc:
-        _logger.warning("Could not persist Fernet key: %s", exc)
+        _fernet_key_persist_error = str(exc)
+        # Ephemeral only when the key was MINTED here. A key supplied through
+        # CASHPILOT_ENCRYPTION_KEY is identical on every restart, so failing to
+        # cache it to disk loses nothing — the hazard this flag exists for
+        # (a fresh random key on next boot, silently orphaning every stored
+        # credential) cannot happen.
+        #
+        # Treating both cases the same made startup refuse to continue and told
+        # the user to "supply a key via CASHPILOT_ENCRYPTION_KEY" — which is
+        # exactly what they had already done.
+        _fernet_key_is_ephemeral = env_key is None
+        if env_key is None:
+            _logger.error(
+                "Could not persist the credential-encryption key to %s: %s. "
+                "Credentials encrypted now will be unreadable after a restart.",
+                _FERNET_KEY_FILE,
+                exc,
+            )
+        else:
+            # Same failure, different consequence. The key came from the
+            # environment, so the next boot gets the identical key and nothing
+            # is lost — as long as the variable stays set. Saying "unreadable
+            # after a restart" here would be simply untrue, and it is the sort
+            # of false alarm that teaches people to ignore the real one.
+            _logger.warning(
+                "Could not cache the credential-encryption key to %s: %s. "
+                "This is not data loss: the key came from CASHPILOT_ENCRYPTION_KEY and will be "
+                "read from there again on the next start. Keep that variable set — without the "
+                "cached file it is now the only copy.",
+                _FERNET_KEY_FILE,
+                exc,
+            )
     return Fernet(key)
 
 
 _fernet = _load_or_create_fernet()
+
+
+def verify_encryption_key_persisted() -> None:
+    """Raise unless the credential-encryption key will survive a restart.
+
+    Call this from application startup, never at import time: ``app.database``
+    is imported by the test suite with the default ``/data``, which does not
+    exist on a development machine, so importing must stay side-effect free.
+
+    Continuing with a key that cannot be persisted is not a kindness. Every
+    credential stored during this run becomes undecryptable the moment the
+    process restarts, and the symptom the user eventually sees is a provider
+    auth failure, which points nowhere near the real cause.
+    """
+    if _fernet_key_error:
+        raise RuntimeError(
+            f"{_fernet_key_error} Refusing to start rather than encrypting credentials under a throwaway key."
+        )
+
+    if not _fernet_key_is_ephemeral:
+        return
+
+    if os.getenv("CASHPILOT_ALLOW_EPHEMERAL_KEY", "").strip().lower() in _TRUTHY:
+        _logger.warning(
+            "Running with an EPHEMERAL credential-encryption key because "
+            "CASHPILOT_ALLOW_EPHEMERAL_KEY is set. Every stored credential will "
+            "become unreadable when this process restarts."
+        )
+        return
+
+    raise RuntimeError(
+        f"Cannot persist the credential-encryption key to {_FERNET_KEY_FILE}: "
+        f"{_fernet_key_persist_error}. Credentials encrypted now would be "
+        "permanently unreadable after a restart, so CashPilot is refusing to "
+        "start. Fix the permissions or the volume mount for the data directory "
+        "(CASHPILOT_DATA_DIR), supply a key via CASHPILOT_ENCRYPTION_KEY on a "
+        "writable volume, or set CASHPILOT_ALLOW_EPHEMERAL_KEY=true if you "
+        "genuinely want a throwaway instance."
+    )
+
+
+# Mirrors worker_api._AUTH_FAILURE_DISCARD_AFTER. Named rather than inlined so
+# the number in the operator-facing message above cannot drift away from the
+# behaviour it describes; a test asserts the two agree.
+_WORKER_KEY_DISCARD_AFTER = 10
+
 
 _ENC_PREFIX = "enc:"
 
@@ -88,7 +294,17 @@ def decrypt_value(value: str) -> str:
     try:
         return _fernet.decrypt(value[len(_ENC_PREFIX) :].encode()).decode()
     except InvalidToken:
-        _logger.warning("Failed to decrypt config value — key may have changed")
+        # Deliberately ERROR, not WARNING: this is unattended software, and the
+        # downstream symptom is a provider auth failure that points nowhere near
+        # the real cause.
+        _logger.error(
+            "Failed to decrypt a stored credential: the credential-encryption key "
+            "(CASHPILOT_ENCRYPTION_KEY / %s) does not match the key this value was "
+            "encrypted with. This is NOT a bad credential and NOT CASHPILOT_SECRET_KEY, "
+            "which only signs sessions. Restore the original encryption key to recover, "
+            "or re-enter the affected credentials.",
+            _FERNET_KEY_FILE,
+        )
         return ""
 
 
@@ -99,18 +315,69 @@ CREATE TABLE IF NOT EXISTS earnings (
     balance    REAL    NOT NULL,
     currency   TEXT    NOT NULL DEFAULT 'USD',
     date       TEXT    NOT NULL,
+    -- USD per 1 unit of `currency` when this reading was taken (so USD rows store
+    -- 1.0). Rates are only cached live, so without storing it here the historical
+    -- value of a non-USD balance (MYST, GRASS, ...) cannot be reconstructed later at
+    -- any accuracy — which is what a net-profit or tax export needs. NULL only when
+    -- the rate was genuinely unavailable, never a guess.
+    fx_rate_usd REAL,
+    -- WHO took this reading. 'server' is this CashPilot's own collectors; a
+    -- paired client pushing its history uses its own worker client_id.
+    --
+    -- Load-bearing, not bookkeeping. A balance is a RUNNING TOTAL and earnings
+    -- are the delta between CONSECUTIVE readings. Two samplers of one provider
+    -- account interleaved into a single series oscillate -- server 10, desktop
+    -- 9, server 11, desktop 10 -- and because a drop clamps to zero, the total
+    -- comes out SYSTEMATICALLY UNDERSTATED while looking entirely plausible.
+    -- Deltas are therefore taken per (platform, source) and only then summed.
+    source     TEXT    NOT NULL DEFAULT 'server',
     created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+-- NOTE: the (platform, source, date) unique index is created in the MIGRATION,
+-- not here. On an upgraded volume `CREATE TABLE IF NOT EXISTS earnings` is a
+-- no-op, so an index declared here would reference `source` before the ALTER
+-- adds it and every upgrade would fail on "no such column: source". The
+-- existing fx-migration test models exactly that volume and caught it.
 
+-- updated_at exists so a credential's AGE is knowable. Several collectors use
+-- values copied out of a browser and some expire in hours; without a timestamp
+-- the UI cannot say "this will stop working tonight" before it does, and a dead
+-- collector looks identical to a provider outage.
+-- updated_at is nullable with no default, deliberately, and this must MATCH
+-- what an upgraded volume gets. SQLite's ALTER TABLE ADD COLUMN cannot add a
+-- NOT NULL column without a default, and adding a default would back-fill --
+-- which is exactly the thing the migration refuses to do, because stamping
+-- every existing credential with the moment of the upgrade once made a
+-- Bytelixir cookie that had expired days earlier report as fresh.
+--
+-- So a fresh install had NOT NULL DEFAULT (datetime('now')) and an upgraded one
+-- had a plain nullable column, permanently. Nothing broke today because both
+-- writers set the value explicitly — but the next writer to rely on the default
+-- would store NULL on upgraded volumes only, and the credential-age report
+-- filters WHERE updated_at IS NOT NULL, so those keys would quietly vanish from
+-- it. A bug that only appears on volumes older than a given release is the
+-- hardest kind to reproduce from a report (CashPilot-f62).
+--
+-- NULL is also the honest value: it means "nobody recorded when this was set",
+-- which is what both consumers already assume.
 CREATE TABLE IF NOT EXISTS config (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT
 );
 
+-- spec_encrypted holds the FULL resolved container spec as it was actually
+-- deployed (image, env, volumes, ports, command, resources), Fernet-encrypted
+-- because env carries credentials. Without it a redeploy has to rebuild the
+-- spec from the catalog and silently produces a different container whenever
+-- the running one diverged - which is how node identities get orphaned.
+-- env_vars_encrypted predates this and was never written; spec_encrypted
+-- supersedes it.
 CREATE TABLE IF NOT EXISTS deployments (
     slug               TEXT PRIMARY KEY,
     container_id       TEXT NOT NULL,
     env_vars_encrypted TEXT NOT NULL DEFAULT '',
+    spec_encrypted     TEXT NOT NULL DEFAULT '',
     deployed_at        TEXT NOT NULL DEFAULT (datetime('now')),
     status             TEXT NOT NULL DEFAULT 'running'
 );
@@ -120,7 +387,18 @@ CREATE TABLE IF NOT EXISTS users (
     username   TEXT    NOT NULL UNIQUE,
     password   TEXT    NOT NULL,
     role       TEXT    NOT NULL DEFAULT 'viewer',
-    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    -- Declared here as well as in the migration below, so a FRESH install does
+    -- not run an ALTER TABLE it never needed. Found by the startup log added in
+    -- CashPilot-sfbh: a brand-new database reported "Migrations applied this
+    -- boot: users.password_changed_at", which is exactly the noise that makes an
+    -- operator stop reading migration output.
+    --
+    -- Safe both ways: CREATE TABLE IF NOT EXISTS is a no-op on an existing
+    -- database, so it still gets the column from the migration. (Unlike adding
+    -- an INDEX here, which runs on existing tables and fails on a column they do
+    -- not have yet -- that mistake broke the upgrade path twice.)
+    password_changed_at REAL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS workers (
@@ -133,6 +411,9 @@ CREATE TABLE IF NOT EXISTS workers (
     apps            TEXT    NOT NULL DEFAULT '[]',
     system_info     TEXT    NOT NULL DEFAULT '{}',
     last_heartbeat  TEXT,
+    api_key_enc     TEXT,
+    key_confirmed   INTEGER NOT NULL DEFAULT 0,
+    key_issued_at   TEXT,
     registered_at   TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -145,6 +426,43 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     created_at          TEXT    NOT NULL DEFAULT (datetime('now')),
     updated_at          TEXT    NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- Alerts worth a human's attention (collector failures today; container crashes and
+-- earnings flatlines later). Persisted rather than kept in memory so they survive a
+-- restart: passive income is unattended, and an alert that only exists in a running
+-- process is an alert nobody ever sees.
+CREATE TABLE IF NOT EXISTS payouts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform     TEXT    NOT NULL,
+    amount       REAL    NOT NULL,
+    currency     TEXT    NOT NULL DEFAULT 'USD',
+    -- USD per 1 unit of `currency` WHEN THE PAYOUT LANDED, mirroring the
+    -- earnings table. A MYST payout valued at today's rate would silently
+    -- restate history every time the token moves.
+    fx_rate_usd  REAL,
+    -- 0 until a human says this really was a payout. A balance also falls for
+    -- provider corrections and reset sessions, and recording a guess as income
+    -- corrupts lifetime-earned in a way the user cannot see.
+    confirmed    INTEGER NOT NULL DEFAULT 0,
+    method       TEXT    NOT NULL DEFAULT '',
+    detected_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    confirmed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_payouts_platform ON payouts(platform, confirmed);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT    NOT NULL,
+    subject    TEXT    NOT NULL,
+    message    TEXT    NOT NULL DEFAULT '',
+    -- What KIND of failure the message describes: 'auth' | 'transient' |
+    -- 'shape', or NULL when the collector could not tell. NULL means unknown,
+    -- never transient -- the UI renders unknown as a plain failure, not as
+    -- "will self-heal" (CashPilot-5bdm).
+    category   TEXT,
+    created_at TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS health_events (
@@ -161,41 +479,311 @@ CREATE TABLE IF NOT EXISTS service_specs (
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_earnings_platform_date
-    ON earnings (platform, date);
+-- Durable per-user session-revocation epochs. A signed session cookie whose iat
+-- predates a user's revoked_before is rejected. DELIBERATELY has no FOREIGN KEY to
+-- users: when a user is deleted the revocation MUST outlive the row, so the deleted
+-- account's still-valid 30-day cookies keep being rejected across UI restarts
+-- (otherwise the in-memory epoch resets on restart and a deleted/demoted user's old
+-- cookie regains their old role). Warmed into auth's in-memory epoch cache at startup.
+CREATE TABLE IF NOT EXISTS session_revocations (
+    user_id        INTEGER PRIMARY KEY,
+    revoked_before REAL    NOT NULL
+);
+
+-- The (platform, SOURCE, date) unique index is created in the MIGRATION, not
+-- here, and this must stay that way. _SCHEMA is replayed on EVERY startup, and
+-- on an upgraded volume `CREATE TABLE IF NOT EXISTS earnings` is a no-op -- so
+-- an index declared here names `source` before the ALTER has added it and
+-- init_db dies with "no such column: source", taking the whole app down on
+-- upgrade. I made that mistake twice; the fx-migration test catches it both
+-- times.
+--
+-- Source is part of the key because two machines may legitimately report the
+-- same platform on the same day -- the normal case once a client pushes its
+-- history -- while one machine reporting a platform twice for one day is still
+-- a duplicate to be upserted away.
+
+CREATE INDEX IF NOT EXISTS idx_earnings_created
+    ON earnings (created_at);
+
+CREATE INDEX IF NOT EXISTS idx_earnings_date
+    ON earnings (date);
 
 CREATE INDEX IF NOT EXISTS idx_workers_status
     ON workers (status);
 
 CREATE INDEX IF NOT EXISTS idx_health_events_slug
     ON health_events (slug, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_health_events_created
+    ON health_events (created_at);
+
+CREATE INDEX IF NOT EXISTS idx_alerts_created
+    ON alerts (created_at);
 """
 
 
-async def _get_db() -> aiosqlite.Connection:
+# ---------------------------------------------------------------------------
+# Shared connection management
+# ---------------------------------------------------------------------------
+#
+# Each event loop gets a single long-lived aiosqlite connection. In production
+# there is one uvicorn loop, so all 36 DB helpers reuse one connection instead
+# of opening (and WAL-initialising) a fresh one on every call. Tests use
+# ``asyncio.run(...)`` which creates a brand-new loop per call, so each test
+# gets its own isolated connection.
+#
+# The 36 helpers keep their ``db = await _get_db(); try: ... finally:
+# await db.close()`` shape unchanged. ``_get_db()`` hands back a
+# ``_BorrowedConnection`` proxy whose ``.close()`` is a no-op, so the borrowed
+# handle's ``finally`` never actually tears down the shared connection.
+
+_shared_conns: dict[int, aiosqlite.Connection] = {}
+
+
+class _BorrowedConnection:
+    """A borrowed view onto a shared aiosqlite connection.
+
+    Delegates every attribute (execute, commit, fetch*, row_factory, ...) to
+    the real connection, but turns ``close()`` into an async no-op and makes
+    ``async with`` a pass-through. This lets call sites keep their
+    ``finally: await db.close()`` pattern byte-for-byte while the underlying
+    connection stays open and shared for the lifetime of the event loop.
+    """
+
+    __slots__ = ("_conn",)
+
+    def __init__(self, conn: aiosqlite.Connection) -> None:
+        object.__setattr__(self, "_conn", conn)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(object.__getattribute__(self, "_conn"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_conn"), name, value)
+
+    async def close(self) -> None:
+        """No-op: the shared connection outlives any individual borrow."""
+        return None
+
+    async def __aenter__(self) -> _BorrowedConnection:
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+
+def _open_connection() -> aiosqlite.Connection:
+    """Create an unawaited aiosqlite connection with row factory + PRAGMAs.
+
+    The returned object is the ``aiosqlite.connect(...)`` awaitable/context
+    manager; the caller awaits it to obtain the live connection. The row
+    factory and PRAGMAs are applied once per connection in ``_get_db()``.
+    """
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    db = await aiosqlite.connect(str(DB_PATH))
-    db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL")
-    await db.execute("PRAGMA foreign_keys=ON")
-    return db
+    return aiosqlite.connect(str(DB_PATH))
+
+
+async def _get_db() -> _BorrowedConnection:
+    """Return a borrowed handle on this event loop's shared connection.
+
+    Opens (and caches) a connection the first time it is needed on a given
+    loop, or whenever the cached connection has been closed. The returned
+    ``_BorrowedConnection`` is safe to ``close()`` — it is a no-op.
+    """
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    conn = _shared_conns.get(key)
+
+    needs_open = conn is None
+    if conn is not None:
+        try:
+            needs_open = not conn._running
+        except AttributeError:
+            needs_open = False
+
+    if needs_open:
+        conn = await _open_connection()
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA foreign_keys=ON")
+        await conn.execute("PRAGMA busy_timeout=5000")
+        # In WAL mode NORMAL is durable across app crashes (only a power loss can lose
+        # the last transactions) and skips an fsync on every commit — a large win on the
+        # write-heavy health-check path that commits per service each cycle.
+        await conn.execute("PRAGMA synchronous=NORMAL")
+        _shared_conns[key] = conn
+
+    return _BorrowedConnection(conn)
+
+
+async def connect_shared() -> None:
+    """Eagerly open the shared connection for the current event loop."""
+    await _get_db()
+
+
+async def close_shared() -> None:
+    """Close and forget the current event loop's shared connection."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    conn = _shared_conns.pop(id(loop), None)
+    if conn is not None:
+        await conn.close()
+
+
+async def _dedupe_earnings_before_indexing(db: Any) -> None:
+    """Clear the way for the unique earnings index on an old volume.
+
+    ``_SCHEMA`` is replayed on EVERY startup, and it contains
+    ``CREATE UNIQUE INDEX IF NOT EXISTS idx_earnings_platform_date``. On an
+    installation whose ``/data`` predates that index and that accumulated two
+    rows for the same platform and date, creating it raises IntegrityError —
+    inside ``executescript``, which nothing catches, during ``lifespan`` — and
+    the application does not start AT ALL. Verified: a two-duplicate-row
+    database fails ``init_db`` with "UNIQUE constraint failed".
+
+    That is the one piece of schema evolution here without a defensive
+    migration; every other column change is guarded by a ``PRAGMA table_info``
+    check. Recovering by hand means opening SQLite on a container that will not
+    boot, which is a bad thing to ask of someone whose dashboard just died.
+
+    Deliberately conservative: this touches nothing unless the index is genuinely
+    absent AND duplicates genuinely exist, and it keeps the HIGHEST id per
+    (platform, date) — the most recently written row, which is what an upsert
+    would have left behind had the index been there all along.
+    """
+    cursor = await db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_earnings_platform_source_date'"
+    )
+    if await cursor.fetchone():
+        return  # Index already present, so duplicates cannot exist.
+
+    cursor = await db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'earnings'")
+    if not await cursor.fetchone():
+        return  # Fresh install; the table is about to be created cleanly.
+
+    # This runs BEFORE the `source` column is added, so the key must match
+    # whichever schema is actually on disk. Referencing `source` unconditionally
+    # crashes init_db on exactly the volume this helper exists to rescue.
+    cursor = await db.execute("PRAGMA table_info(earnings)")
+    has_source = any(row["name"] == "source" for row in await cursor.fetchall())
+    key = "platform || '|' || COALESCE(source, 'server') || '|' || date" if has_source else "platform || '|' || date"
+    group_by = "platform, source, date" if has_source else "platform, date"
+
+    cursor = await db.execute(f"SELECT COUNT(*) - COUNT(DISTINCT {key}) AS extra FROM earnings")
+    row = await cursor.fetchone()
+    extra = int(row["extra"] or 0)
+    if extra <= 0:
+        return
+
+    _logger.warning(
+        "Found %d duplicate earnings row(s) predating the unique index. Keeping the most recent "
+        "reading for each platform and date and removing the rest, so the index can be created "
+        "and the application can start.",
+        extra,
+    )
+    await db.execute(f"DELETE FROM earnings WHERE id NOT IN (SELECT MAX(id) FROM earnings GROUP BY {group_by})")
+    await db.commit()
+
+
+async def _encrypt_legacy_plaintext_credentials(db: Any) -> int:
+    """Re-encrypt secret config values written before at-rest encryption existed.
+
+    Reads are backward compatible — decrypt_value returns an unprefixed value
+    as-is — which is what makes an upgrade work at all, and also what left the
+    plaintext sitting there forever. Two users on identical code end up with
+    different at-rest protection for the same secret, and nothing tells the
+    upgraded one: a copied backup, a Duplicacy snapshot or a shared /data hands
+    over the live provider password. It stays plaintext until the user happens
+    to re-enter it.
+
+    This also covers keys that only BECAME secret later. The suffix list was
+    widened after an audit found the boundary was a naming convention with
+    nothing enforcing it, and values written before that widening are plaintext
+    under a key that is now recognised as a credential.
+
+    Never runs under an ephemeral key. Encrypting with a key that vanishes on
+    restart would turn a readable credential into a permanently unrecoverable
+    one — strictly worse than the plaintext this is meant to fix.
+    """
+    if _fernet_key_is_ephemeral:
+        _logger.warning(
+            "Not re-encrypting stored credentials: the credential-encryption key is "
+            "ephemeral, so anything encrypted now would be unreadable after a restart. "
+            "Set CASHPILOT_ENCRYPTION_KEY or fix the data directory, then restart."
+        )
+        return 0
+
+    cursor = await db.execute("SELECT key, value FROM config")
+    rows = await cursor.fetchall()
+    stale = [
+        (r["key"], r["value"])
+        for r in rows
+        if r["value"] and _is_secret_key(r["key"]) and not str(r["value"]).startswith(_ENC_PREFIX)
+    ]
+    if not stale:
+        return 0
+
+    for key, value in stale:
+        await db.execute("UPDATE config SET value = ? WHERE key = ?", (encrypt_value(str(value)), key))
+    await db.commit()
+    # The key NAMES are safe to log and are what an operator needs to confirm the
+    # pass did what they expect. The values are exactly what must never appear.
+    _logger.info(
+        "Encrypted %d stored credential(s) that predated at-rest encryption: %s",
+        len(stale),
+        ", ".join(sorted(k for k, _ in stale)),
+    )
+    return len(stale)
+
+
+#: What this build's schema looks like. Bumped by hand when a migration is added.
+#:
+#: REPORTED, NEVER USED AS A GATE. Every migration below is guarded by its own
+#: ``PRAGMA table_info`` check, and that stays the source of truth. If this number
+#: decided whether migrations ran, a database whose user_version said 10 but was
+#: missing a column -- an interrupted upgrade, a restored backup, a hand-edited
+#: file -- could never be repaired, because the gate would say there was nothing
+#: to do. The guards are idempotent and cheap; the version is for the operator.
+SCHEMA_VERSION = 11
 
 
 async def init_db() -> None:
     """Create tables if they don't exist."""
     db = await _get_db()
+    # What actually changed on THIS boot, for the log line at the end. An
+    # operator watching `docker logs` during an upgrade could previously not
+    # tell a clean start from one that had just rewritten the earnings table.
+    applied: list[str] = []
     try:
+        await _dedupe_earnings_before_indexing(db)
         await db.executescript(_SCHEMA)
         # Migrate workers table: add client_id (UNIQUE) and apps columns
         cursor = await db.execute("PRAGMA table_info(workers)")
         cols = {row["name"] for row in await cursor.fetchall()}
         if "client_id" not in cols:
+            applied.append("workers.client_id")
             # Rebuild table: UNIQUE moves from name → client_id, name becomes display-only.
             # Existing rows get client_id = name for backward compat.
             has_apps = "apps" in cols
             apps_select = "apps" if has_apps else "'[]'"
             _logger.info("Migrating workers table: adding client_id column")
             await db.executescript(f"""
+                -- executescript COMMITS PER STATEMENT, so an interruption
+                -- between CREATE and RENAME leaves workers_new behind
+                -- permanently. The guard above ("client_id" not in cols) is
+                -- still true on the next boot, so the rebuild re-runs, the
+                -- CREATE fails with "table already exists", init_db raises, and
+                -- the app never starts again. Reproduced: a leftover
+                -- workers_new plus a pre-client_id workers table bricks startup
+                -- on every subsequent restart.
+                --
+                -- Dropping any leftover first makes the rebuild re-entrant. The
+                -- leftover is always disposable: it is only ever a partial copy
+                -- of workers, which is still intact until the DROP below.
+                DROP TABLE IF EXISTS workers_new;
                 CREATE TABLE workers_new (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     client_id       TEXT    NOT NULL UNIQUE,
@@ -217,8 +805,140 @@ async def init_db() -> None:
                 CREATE INDEX IF NOT EXISTS idx_workers_status ON workers (status);
             """)
         elif "apps" not in cols:
+            applied.append("workers.apps")
             await db.execute("ALTER TABLE workers ADD COLUMN apps TEXT NOT NULL DEFAULT '[]'")
+
+        # Migrate workers table: add api_key_enc for per-worker fleet keys.
+        # (cols is the pre-rebuild snapshot; on a fresh DB the column comes from
+        # _SCHEMA so it is already present here and the ALTER is skipped.)
+        if "api_key_enc" not in cols:
+            applied.append("workers.api_key_enc")
+            await db.execute("ALTER TABLE workers ADD COLUMN api_key_enc TEXT")
+        if "key_confirmed" not in cols:
+            applied.append("workers.key_confirmed")
+            await db.execute("ALTER TABLE workers ADD COLUMN key_confirmed INTEGER NOT NULL DEFAULT 0")
+        if "key_issued_at" not in cols:
+            applied.append("workers.key_issued_at")
+            # When the per-worker key was minted, so the window in which the
+            # SHARED key still works for that worker can be bounded.
+            await db.execute("ALTER TABLE workers ADD COLUMN key_issued_at TEXT")
+
+            # Backfilled to NOW, not to NULL and not to the distant past.
+            # Every already-enrolled-but-unconfirmed worker would otherwise be
+            # instantly past its window the moment this upgrade lands, and a
+            # patch release would take a working fleet offline with no warning.
+            # Absent is not expired: these get a full fresh window, and only a
+            # worker that still cannot confirm within it is cut off.
+            await db.execute(
+                "UPDATE workers SET key_issued_at = datetime('now') "
+                "WHERE api_key_enc IS NOT NULL AND api_key_enc != '' AND key_confirmed = 0"
+            )
+
+        # Migrate earnings table: add fx_rate_usd so a non-USD balance's value at the
+        # time it was recorded stays reconstructable (rates are only cached live).
+        cursor = await db.execute("PRAGMA table_info(earnings)")
+        earnings_cols = {row["name"] for row in await cursor.fetchall()}
+        if "fx_rate_usd" not in earnings_cols:
+            applied.append("earnings.fx_rate_usd")
+            await db.execute("ALTER TABLE earnings ADD COLUMN fx_rate_usd REAL")
+        # Add `source`: WHO took the reading. Existing rows were all taken by
+        # this server's own collectors, so 'server' is the truthful backfill
+        # rather than a placeholder -- there was no other sampler before this.
+        if "source" not in earnings_cols:
+            applied.append("earnings.source")
+            await db.execute("ALTER TABLE earnings ADD COLUMN source TEXT NOT NULL DEFAULT 'server'")
+        # Unconditional, and only AFTER the column is guaranteed to exist. This
+        # is the ONLY place the index is created, so a fresh install and an
+        # upgraded volume take the same path -- declaring it in _SCHEMA instead
+        # broke every upgrade, because `CREATE TABLE IF NOT EXISTS` is a no-op
+        # there and the index then named a column the ALTER had not yet added.
+        #
+        # Makes (platform, source, date) the idempotency key, so re-pairing or a
+        # retried import overwrites a day rather than appending a second reading
+        # for it -- which would difference against itself and read as zero.
+        # The LEGACY index must go FIRST. On an upgraded volume
+        # idx_earnings_platform_date survives, and it still forbids two sources
+        # for one (platform, date) -- so the new index would be created and the
+        # old one would quietly keep rejecting exactly the writes this change
+        # exists to allow. Creating the replacement is not enough; the old
+        # constraint has to be removed. (CodeRabbit, PR #255.)
+        await db.execute("DROP INDEX IF EXISTS idx_earnings_platform_date")
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_earnings_platform_source_date ON earnings (platform, source, date)"
+        )
+
+        # Migrate deployments table: add spec_encrypted so an existing install starts
+        # remembering what it deployed. Rows written before this stay empty and fall
+        # back to the catalog, exactly as they do today.
+        # Migrate alerts table: add the failure-kind category (CashPilot-5bdm).
+        cursor = await db.execute("PRAGMA table_info(alerts)")
+        alerts_cols = {row["name"] for row in await cursor.fetchall()}
+        if "category" not in alerts_cols:
+            applied.append("alerts.category")
+            # NULL backfill is the truthful one: nothing recorded before this
+            # column existed ever knew its failure kind (CashPilot-5bdm).
+            await db.execute("ALTER TABLE alerts ADD COLUMN category TEXT")
+
+        cursor = await db.execute("PRAGMA table_info(deployments)")
+        deployment_cols = {row["name"] for row in await cursor.fetchall()}
+        if "spec_encrypted" not in deployment_cols:
+            applied.append("deployments.spec_encrypted")
+            await db.execute("ALTER TABLE deployments ADD COLUMN spec_encrypted TEXT NOT NULL DEFAULT ''")
+        # Migrate config table: add updated_at so credential age is knowable.
+        # Existing rows are left NULL — see the note on the back-fill below.
+        # (This comment used to say they receive the migration time, which is
+        # exactly the behaviour that was removed; leaving it would have invited
+        # someone to restore the back-fill.)
+        cursor = await db.execute("PRAGMA table_info(config)")
+        config_cols = {row["name"] for row in await cursor.fetchall()}
+        if "updated_at" not in config_cols:
+            applied.append("config.updated_at")
+            await db.execute("ALTER TABLE config ADD COLUMN updated_at TEXT")
+            # Deliberately NOT back-filled with datetime('now').
+            #
+            # Doing so stamped every credential on an upgraded volume with the
+            # moment of the upgrade, so the credential-health page reported all
+            # of them "fresh" — including a Bytelixir session cookie that
+            # expires after two hours and had in fact expired days earlier. An
+            # unknown age was rendered as the most favourable known age.
+            #
+            # NULL is the honest value, and both consumers already handle it:
+            # get_config_updated_at filters WHERE updated_at IS NOT NULL, and
+            # the health endpoint skips unstamped keys.
+
+        # Migrate users table: add password_changed_at for session invalidation
+        cursor = await db.execute("PRAGMA table_info(users)")
+        user_cols = {row["name"] for row in await cursor.fetchall()}
+        if "password_changed_at" not in user_cols:
+            applied.append("users.password_changed_at")
+            await db.execute("ALTER TABLE users ADD COLUMN password_changed_at REAL DEFAULT 0")
+
+        # The version the database CLAIMED before this boot. 0 on anything
+        # written before this was introduced, including a fully up-to-date one --
+        # so the first upgrade reports "was 0" and that is honest rather than
+        # alarming.
+        cursor = await db.execute("PRAGMA user_version")
+        row = await cursor.fetchone()
+        previous = int(row[0]) if row else 0
+        if previous != SCHEMA_VERSION:
+            # A literal: PRAGMA does not accept a bound parameter here. Safe
+            # because the value is this module's own int constant.
+            await db.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
+
+        if applied:
+            _logger.info(
+                "Schema now at version %d (was %d). Migrations applied this boot: %s",
+                SCHEMA_VERSION,
+                previous,
+                ", ".join(applied),
+            )
+        else:
+            _logger.info("Schema at version %d; no migration needed this boot.", SCHEMA_VERSION)
+
         await db.commit()
+
+        # After the schema is settled, so the config table certainly exists.
+        await _encrypt_legacy_plaintext_credentials(db)
     finally:
         await db.close()
 
@@ -231,31 +951,126 @@ async def upsert_earnings(
     balance: float,
     currency: str = "USD",
     date: str | None = None,
+    fx_rate_usd: float | None = None,
+    source: str = "server",
 ) -> None:
-    """Insert or update an earnings record for a platform + date."""
+    """Insert or update an earnings record for a platform + source + date.
+
+    ``fx_rate_usd`` is the currency -> USD rate at collection time. It is stored
+    alongside the balance because exchange rates are only cached live: without it,
+    the USD value of a historical non-USD reading cannot be reconstructed later.
+
+    ``source`` is WHO took the reading: ``"server"`` for this server's own
+    collectors, or a paired client's worker id. It is part of the key, so two
+    machines may report the same platform on the same day -- the normal case once
+    a client pushes its history -- while one machine reporting a platform twice
+    for a day still upserts. Without this parameter the schema would accept a
+    source but nothing could ever write one, so a client's series could not exist.
+    """
     date = date or datetime.now(UTC).strftime("%Y-%m-%d")
     db = await _get_db()
     try:
+        # Insert a new reading, or update the existing platform+date row only
+        # when the balance changed (we always want the latest reading). The
+        # WHERE guard preserves created_at when the balance is unchanged.
         await db.execute(
             """
-            INSERT INTO earnings (platform, balance, currency, date)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT DO NOTHING
+            INSERT INTO earnings (platform, balance, currency, date, fx_rate_usd, source)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, source, date) DO UPDATE SET
+                balance = excluded.balance,
+                currency = excluded.currency,
+                -- COALESCE, not a plain assignment: if the rate lookup failed this
+                -- cycle (provider outage after a restart cleared the cache) the new
+                -- value is NULL, and overwriting a known-good rate with it would
+                -- destroy the very data this column exists to preserve.
+                fx_rate_usd = COALESCE(excluded.fx_rate_usd, earnings.fx_rate_usd),
+                created_at = datetime('now')
+            -- The balance guard preserves created_at when nothing changed, but it also
+            -- meant a row already stored with a NULL rate (written pre-upgrade, or when
+            -- the rate was briefly unavailable) could never be back-filled: for a
+            -- service whose balance moves once a day, every later run in that day was
+            -- skipped entirely. Allow the update through in that one case.
+            WHERE earnings.balance != excluded.balance
+               OR earnings.fx_rate_usd IS NULL
             """,
-            (platform, balance, currency, date),
-        )
-        # Update if there is already a record for this platform+date with a
-        # different balance (we always want the latest reading).
-        await db.execute(
-            """
-            UPDATE earnings SET balance = ?, currency = ?, created_at = datetime('now')
-            WHERE platform = ? AND date = ? AND balance != ?
-            """,
-            (balance, currency, platform, date, balance),
+            (platform, balance, currency, date, fx_rate_usd, source),
         )
         await db.commit()
     finally:
         await db.close()
+
+
+async def upsert_earnings_many(readings: Sequence[Mapping[str, Any]]) -> int:
+    """Upsert many readings in ONE transaction. Returns how many were written.
+
+    Same statement and same conflict rules as :func:`upsert_earnings` — this is
+    purely about how often the work is committed.
+
+    WHY IT EXISTS
+    -------------
+    A client importing its pre-pairing history sends up to a thousand readings
+    per request, and calling ``upsert_earnings`` in a loop commits once per row.
+    Every commit is an fsync, and every one of them takes SQLite's write lock —
+    so a single import serialised a thousand disk syncs against the server's own
+    collector, and request latency tracked disk sync cost rather than row count.
+
+    (The connection is NOT the problem, despite appearances: ``_get_db`` hands
+    out a borrowed handle on a shared per-loop connection whose ``close()`` is a
+    documented no-op, so the loop was never opening and closing a thousand
+    connections. It was committing a thousand times.)
+
+    ONE TRANSACTION ALSO MEANS ALL-OR-NOTHING, which is the behaviour to want
+    here: a failure part-way through leaves the caller's history exactly as it
+    was rather than half-applied, and the import is idempotent so retrying costs
+    a round trip.
+    """
+    rows = [
+        (
+            r["platform"],
+            float(r["balance"]),
+            (r.get("currency") or "USD"),
+            r.get("date") or datetime.now(UTC).strftime("%Y-%m-%d"),
+            r.get("fx_rate_usd"),
+            (r.get("source") or "server"),
+        )
+        for r in readings
+    ]
+    if not rows:
+        # No statement, no commit. An empty import is a normal case, and taking
+        # the write lock to do nothing would still block the collector.
+        return 0
+
+    db = await _get_db()
+    try:
+        try:
+            await db.executemany(
+                """
+                INSERT INTO earnings (platform, balance, currency, date, fx_rate_usd, source)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, source, date) DO UPDATE SET
+                    balance = excluded.balance,
+                    currency = excluded.currency,
+                    fx_rate_usd = COALESCE(excluded.fx_rate_usd, earnings.fx_rate_usd),
+                    created_at = datetime('now')
+                WHERE earnings.balance != excluded.balance
+                   OR earnings.fx_rate_usd IS NULL
+                """,
+                rows,
+            )
+            await db.commit()
+        except Exception:
+            # ROLL BACK, do not merely propagate. The connection is SHARED and
+            # outlives the request, so an abandoned transaction keeps SQLite's
+            # write lock and every later write on this loop -- including this
+            # server's own collector -- blocks until it times out. Measured: the
+            # next write took twelve seconds before this was added.
+            with contextlib.suppress(Exception):
+                await db.rollback()
+            raise
+    finally:
+        await db.close()
+    return len(rows)
 
 
 async def get_earnings_summary() -> list[dict[str, Any]]:
@@ -264,10 +1079,23 @@ async def get_earnings_summary() -> list[dict[str, Any]]:
     try:
         cursor = await db.execute(
             """
-            SELECT platform, balance, currency, date
+            -- fx_rate_usd is selected because the dashboard total needs a
+            -- fallback when no LIVE rate is cached. Without it a crypto
+            -- balance whose rate lookup is merely stale gets dropped from the
+            -- headline figure entirely, even though the rate it was recorded
+            -- at is sitting right here in the row.
+            SELECT platform, balance, currency, date, fx_rate_usd
             FROM earnings
-            WHERE (platform, date) IN (
-                SELECT platform, MAX(date) FROM earnings GROUP BY platform
+            -- Deliberately ONE row per platform, not one per source. A
+            -- provider reports a single balance for the whole account, so the
+            -- newest reading from ANY source IS the current balance; taking the
+            -- latest per source and summing them would multiply it by the
+            -- number of machines watching.
+            WHERE id IN (
+                SELECT id FROM earnings e
+                WHERE e.date = (SELECT MAX(date) FROM earnings WHERE platform = e.platform)
+                GROUP BY e.platform
+                HAVING id = MAX(e.id)
             )
             ORDER BY platform
             """
@@ -298,13 +1126,98 @@ async def get_earnings_history(
                 (f"-{days} days",),
             )
         else:
+            # period="all": defensively cap the result so a very long-lived DB can't
+            # return an unbounded row set into a single response/chart. Most-recent
+            # first; 50k rows spans years of daily per-service earnings.
             cursor = await db.execute(
-                "SELECT platform, balance, currency, date FROM earnings ORDER BY date DESC, platform"
+                "SELECT platform, balance, currency, date FROM earnings ORDER BY date DESC, platform LIMIT 50000"
             )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
     finally:
         await db.close()
+
+
+def _usd_rate(currency: str, raw: Any) -> float | None:
+    """The USD price of one unit, or None when the reading cannot be priced.
+
+    USD is parity BY DEFINITION — trusting a stored rate on a USD row would let
+    a bad rate rewrite money the collector reported exactly. For anything else
+    only a finite positive number is a price:
+
+    * ``0`` reports the platform as having earned nothing, which is
+      indistinguishable from a genuinely flat balance;
+    * a negative defeats the payout clamp, which applies to the delta while the
+      sign is applied after it, so the total comes out NEGATIVE;
+    * ``inf``/``nan`` poison the total outright.
+
+    Anything rejected here is treated as unpriced — excluded and reported —
+    rather than believed.
+    """
+    if currency == "USD":
+        return 1.0
+    if raw is None:
+        return None
+    value = float(raw)
+    return value if math.isfinite(value) and value > 0 else None
+
+
+async def _usd_earned_per_date(db: Any) -> tuple[dict[str, float], int]:
+    """USD earned per calendar date, summed across platforms.
+
+    ONE implementation behind both the dashboard cards and the trend chart.
+    They previously carried separate copies of the arithmetic and both filtered
+    ``currency = 'USD'``, so an installation earning MYST, GRASS or ANYONE saw
+    "$0.00 today", "$0.00 this month" and a flat-zero chart while its balances
+    climbed — verified against a MystNodes-only fixture, which reported 0.00
+    where the correct figure was 0.20.
+
+    Same rules as :func:`get_earned_by_platform`, and deliberately so:
+
+    * the delta is taken in the NATIVE currency and only then priced, because a
+      balance is a running total and converting before subtracting puts the
+      movement of the exchange rate inside the earnings figure;
+    * a platform with no predecessor reading contributes nothing, rather than
+      counting its whole opening balance as one day's earnings;
+    * a reading that cannot be priced drops the baseline instead of anchoring
+      the next delta, so an unpriced stretch is not silently counted whole.
+    """
+    cursor = await db.execute(
+        """
+        SELECT platform, date, balance, currency, fx_rate_usd, source
+        FROM earnings
+        ORDER BY platform, source, date
+        """
+    )
+    per_date: dict[str, float] = {}
+    # Keyed by (platform, SOURCE) for the same reason as get_earned_by_platform:
+    # two machines sampling one provider account interleave into a series whose
+    # deltas are meaningless, and every drop clamps to zero, so the total comes
+    # out understated while looking plausible.
+    previous: dict[tuple[str, str], tuple[str, float]] = {}
+    unpriced = 0
+    for row in await cursor.fetchall():
+        platform = row["platform"]
+        # Absent source means a row written before the column existed; those
+        # were all this server's own, so they join the 'server' series rather
+        # than forming a phantom one.
+        series = (platform, (row["source"] or "server"))
+        currency = (row["currency"] or "USD").upper()
+        rate = _usd_rate(currency, row["fx_rate_usd"])
+        if rate is None:
+            previous.pop(series, None)
+            unpriced += 1
+            continue
+        balance = float(row["balance"] or 0.0)
+        before = previous.get(series)
+        if before is not None and before[0] == currency:
+            # Clamped per platform BEFORE summing: a payout drops one
+            # platform's balance, and an unclamped drop would cancel real
+            # earnings on another platform in the same day's total.
+            gained = max(0.0, balance - before[1]) * rate
+            per_date[row["date"]] = per_date.get(row["date"], 0.0) + gained
+        previous[series] = (currency, balance)
+    return per_date, unpriced
 
 
 async def get_earnings_dashboard_summary() -> dict[str, Any]:
@@ -331,75 +1244,25 @@ async def get_earnings_dashboard_summary() -> dict[str, Any]:
         row = await cursor.fetchone()
         total = row["total"]
 
-        # Today's earnings: delta from yesterday per platform
-        cursor = await db.execute(
-            """
-            SELECT COALESCE(SUM(t.balance - COALESCE(y.balance, 0)), 0) as earned
-            FROM (
-                SELECT platform, balance FROM earnings
-                WHERE date = ? AND currency = 'USD'
-            ) t
-            LEFT JOIN (
-                SELECT platform, balance FROM earnings
-                WHERE date = ? AND currency = 'USD'
-            ) y ON t.platform = y.platform
-            """,
-            (today, yesterday),
-        )
-        row = await cursor.fetchone()
-        today_earned = max(0.0, row["earned"])
+        # Today, this month and yesterday all come from one priced series.
+        # They used to be three separate SQL aggregates that each filtered
+        # currency = 'USD', so every non-USD platform was missing from all
+        # three at once and the cards read $0.00 while balances climbed.
+        per_date, unpriced = await _usd_earned_per_date(db)
+        if unpriced:
+            _logger.warning(
+                "%d earnings reading(s) have no usable USD rate and are left out of the "
+                "dashboard totals, which are therefore understated.",
+                unpriced,
+            )
 
-        # This month's earnings: latest balance minus first-of-month balance
-        cursor = await db.execute(
-            """
-            SELECT COALESCE(SUM(
-                latest.balance - COALESCE(month_start.balance, 0)
-            ), 0) as earned
-            FROM (
-                SELECT e.platform, e.balance
-                FROM earnings e
-                INNER JOIN (
-                    SELECT platform, MAX(date) as max_date
-                    FROM earnings WHERE currency = 'USD'
-                    GROUP BY platform
-                ) m ON e.platform = m.platform AND e.date = m.max_date
-                WHERE e.currency = 'USD'
-            ) latest
-            LEFT JOIN (
-                SELECT e.platform, e.balance
-                FROM earnings e
-                INNER JOIN (
-                    SELECT platform, MIN(date) as min_date
-                    FROM earnings
-                    WHERE date >= ? AND currency = 'USD'
-                    GROUP BY platform
-                ) m ON e.platform = m.platform AND e.date = m.min_date
-                WHERE e.currency = 'USD'
-            ) month_start ON latest.platform = month_start.platform
-            """,
-            (first_of_month,),
-        )
-        row = await cursor.fetchone()
-        month_earned = max(0.0, row["earned"])
+        today_earned = per_date.get(today, 0.0)
+        # The month is the sum of clamped daily deltas rather than one delta
+        # from the first of the month, so a mid-month payout counts as zero on
+        # its own day instead of erasing the whole month's earnings.
+        month_earned = sum(earned for day, earned in per_date.items() if day >= first_of_month)
 
-        # Yesterday's delta for percentage change
-        day_before = (datetime.now(UTC) - timedelta(days=2)).strftime("%Y-%m-%d")
-        cursor = await db.execute(
-            """
-            SELECT COALESCE(SUM(y.balance - COALESCE(dy.balance, 0)), 0) as earned
-            FROM (
-                SELECT platform, balance FROM earnings
-                WHERE date = ? AND currency = 'USD'
-            ) y
-            LEFT JOIN (
-                SELECT platform, balance FROM earnings
-                WHERE date = ? AND currency = 'USD'
-            ) dy ON y.platform = dy.platform
-            """,
-            (yesterday, day_before),
-        )
-        row = await cursor.fetchone()
-        yesterday_earned = max(0.0, row["earned"])
+        yesterday_earned = per_date.get(yesterday, 0.0)
 
         today_change = 0.0
         if yesterday_earned > 0:
@@ -410,7 +1273,11 @@ async def get_earnings_dashboard_summary() -> dict[str, Any]:
             "today": round(today_earned, 2),
             "month": round(month_earned, 2),
             "today_change": round(today_change, 1),
-            "month_change": 0.0,
+            # None, not 0.0. This was a literal that nothing computed, and the
+            # dashboard rendered it as "+0.0%" in the positive style forever —
+            # a month-over-month figure that had never been measured, presented
+            # with the same confidence as one that had.
+            "month_change": None,
         }
     finally:
         await db.close()
@@ -457,42 +1324,30 @@ async def get_daily_earnings(days: int = 7) -> list[dict[str, Any]]:
     """Return daily aggregated earnings for charting (delta per day)."""
     db = await _get_db()
     try:
-        # Get daily total balance (sum across platforms) for the range
-        # Include one extra day before the range so we can compute the first delta
-        cursor = await db.execute(
-            """
-            SELECT date, SUM(balance) as total_balance
-            FROM earnings
-            WHERE date >= date('now', ?) AND currency = 'USD'
-            GROUP BY date
-            ORDER BY date
-            """,
-            (f"-{days + 1} days",),
-        )
-        rows = await cursor.fetchall()
-        data = [dict(r) for r in rows]
+        # Shares the priced series with the dashboard cards, so the chart and
+        # the "Today" card can no longer disagree. The previous version built
+        # its own per-date balance map filtered to currency = 'USD', which drew
+        # a flat-zero line for a fleet earning MYST, GRASS or ANYONE.
+        #
+        # It also treated a platform's FIRST-EVER reading as a delta against
+        # zero, so a newly added service drew a spike the size of its whole
+        # opening balance. The shared helper requires a predecessor.
+        per_date, unpriced = await _usd_earned_per_date(db)
+        if unpriced:
+            _logger.warning(
+                "%d earnings reading(s) have no usable USD rate and are left out of the "
+                "daily chart, which is therefore understated.",
+                unpriced,
+            )
 
-        # Build a map of date -> total_balance
-        balance_by_date: dict[str, float] = {}
-        for row in data:
-            balance_by_date[row["date"]] = row["total_balance"]
-
-        # Generate result for exactly `days` days
         now = datetime.now(UTC)
         result = []
         for i in range(days - 1, -1, -1):
             d = now - timedelta(days=i)
-            date_str = d.strftime("%Y-%m-%d")
-            prev_str = (d - timedelta(days=1)).strftime("%Y-%m-%d")
-
-            current = balance_by_date.get(date_str, 0.0)
-            previous = balance_by_date.get(prev_str, 0.0)
-            delta = max(0.0, current - previous) if current > 0 else 0.0
-
             result.append(
                 {
                     "date": d.strftime("%b %d"),
-                    "amount": round(delta, 2),
+                    "amount": round(per_date.get(d.strftime("%Y-%m-%d"), 0.0), 2),
                 }
             )
 
@@ -525,13 +1380,37 @@ async def get_config(key: str | None = None) -> dict[str, str] | str | None:
         await db.close()
 
 
+async def get_config_masked() -> dict[str, Any]:
+    """Return non-secret config values plus a {secret_key: is_set} map.
+
+    Secret values are NEVER decrypted or returned — only their presence is
+    reported under the ``_secrets`` key. This is the read path for the UI so
+    stored credentials never cross the wire in plaintext.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute("SELECT key, value FROM config")
+        rows = await cursor.fetchall()
+        values: dict[str, Any] = {}
+        secrets_set: dict[str, bool] = {}
+        for r in rows:
+            if _is_secret_key(r["key"]):
+                secrets_set[r["key"]] = bool(r["value"])
+            else:
+                values[r["key"]] = r["value"]
+        values["_secrets"] = secrets_set
+        return values
+    finally:
+        await db.close()
+
+
 async def set_config(key: str, value: str) -> None:
     """Upsert a config key-value pair. Secrets are encrypted at rest."""
     stored = encrypt_value(value) if _is_secret_key(key) else value
     db = await _get_db()
     try:
         await db.execute(
-            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?, ?, datetime('now'))",
             (key, stored),
         )
         await db.commit()
@@ -545,10 +1424,24 @@ async def set_config_bulk(data: dict[str, str]) -> None:
     db = await _get_db()
     try:
         await db.executemany(
-            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+            "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?, ?, datetime('now'))",
             pairs,
         )
         await db.commit()
+    finally:
+        await db.close()
+
+
+async def get_config_updated_at() -> dict[str, str]:
+    """Return {config_key: ISO timestamp of last write}.
+
+    Values are never returned here - only when each key was last set - so this
+    is safe to drive a UI that shows credential age without touching secrets.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute("SELECT key, updated_at FROM config WHERE updated_at IS NOT NULL")
+        return {row["key"]: row["updated_at"] for row in await cursor.fetchall()}
     finally:
         await db.close()
 
@@ -574,20 +1467,76 @@ async def save_deployment(
     container_id: str,
     env_vars_encrypted: str = "",
     status: str = "running",
+    spec: dict[str, Any] | None = None,
 ) -> None:
+    """Record a deployment, including the spec that was actually used.
+
+    ``spec`` is serialised and encrypted at rest because it embeds the service's
+    environment, which carries credentials. Passing None preserves any spec
+    already recorded for this slug rather than blanking it, so a caller that
+    only knows the container id (an external service, a status update) cannot
+    erase the deployment's memory of itself.
+    """
+    spec_encrypted = ""
+    if spec is not None:
+        try:
+            spec_encrypted = encrypt_value(json.dumps(spec, sort_keys=True))
+        except (TypeError, ValueError):
+            # A deploy must not fail because the bookkeeping did. Degrade to
+            # today's behaviour - no record, so the next redeploy rebuilds from
+            # the catalog - but say so loudly, because that redeploy is then the
+            # one that can silently change the container.
+            _logger.error(
+                "Could not serialise the deployed spec for %s; it will NOT be recorded, "
+                "so a later redeploy will fall back to the catalog",
+                slug,
+                exc_info=True,
+            )
+    else:
+        existing = await get_deployment(slug)
+        if existing:
+            spec_encrypted = existing.get("spec_encrypted") or ""
+
     db = await _get_db()
     try:
         await db.execute(
             """
             INSERT OR REPLACE INTO deployments
-                (slug, container_id, env_vars_encrypted, deployed_at, status)
-            VALUES (?, ?, ?, datetime('now'), ?)
+                (slug, container_id, env_vars_encrypted, spec_encrypted, deployed_at, status)
+            VALUES (?, ?, ?, ?, datetime('now'), ?)
             """,
-            (slug, container_id, env_vars_encrypted, status),
+            (slug, container_id, env_vars_encrypted, spec_encrypted, status),
         )
         await db.commit()
     finally:
         await db.close()
+
+
+async def get_deployment_spec(slug: str) -> dict[str, Any] | None:
+    """Return the spec this service was actually deployed with, or None.
+
+    None means "no record" - a deployment made before this existed, or one whose
+    stored spec can no longer be decrypted. Callers must fall back to the
+    catalog in that case rather than deploying a half-remembered spec, which
+    would be worse than deploying a fresh one.
+    """
+    row = await get_deployment(slug)
+    if not row:
+        return None
+    blob = row.get("spec_encrypted") or ""
+    if not blob:
+        return None
+    raw = decrypt_value(blob)
+    if not raw:
+        # decrypt_value returns "" on a key mismatch and has already logged it.
+        _logger.warning("Recorded spec for %s could not be decrypted; falling back to the catalog", slug)
+        return None
+    try:
+        spec = json.loads(raw)
+    except ValueError:
+        _logger.warning("Recorded spec for %s is not valid JSON; falling back to the catalog", slug)
+        return None
+    return spec if isinstance(spec, dict) else None
 
 
 async def get_deployments() -> list[dict[str, Any]]:
@@ -626,9 +1575,7 @@ async def get_service_spec(slug: str) -> str | None:
     """Return the YAML override for a service, or None if no override exists."""
     db = await _get_db()
     try:
-        cursor = await db.execute(
-            "SELECT spec_yaml FROM service_specs WHERE slug = ?", (slug,)
-        )
+        cursor = await db.execute("SELECT spec_yaml FROM service_specs WHERE slug = ?", (slug,))
         row = await cursor.fetchone()
         return row["spec_yaml"] if row else None
     finally:
@@ -699,6 +1646,28 @@ async def create_user(username: str, hashed_password: str, role: str = "viewer")
         await db.close()
 
 
+async def create_first_owner(username: str, hashed_password: str) -> int | None:
+    """Atomically create the first owner account.
+
+    Returns the new id, or ``None`` if any account already exists (lost the
+    first-run race). The ``INSERT ... WHERE NOT EXISTS`` makes the "one owner per
+    setup token" guarantee safe against two concurrent first-run registrations,
+    which a check-then-act (``has_any_users()`` then ``create_user()``) could not.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "INSERT INTO users (username, password, role) SELECT ?, ?, 'owner' WHERE NOT EXISTS (SELECT 1 FROM users)",
+            (username, hashed_password),
+        )
+        await db.commit()
+        if cursor.rowcount != 1:
+            return None
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
 async def get_user_by_username(username: str) -> dict[str, Any] | None:
     db = await _get_db()
     try:
@@ -729,6 +1698,17 @@ async def list_users() -> list[dict[str, Any]]:
         await db.close()
 
 
+async def list_users_with_pwd_epoch() -> list[dict[str, Any]]:
+    """Return [{id, password_changed_at}, ...] for warming the auth pwd-epoch cache."""
+    db = await _get_db()
+    try:
+        cursor = await db.execute("SELECT id, password_changed_at FROM users")
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        await db.close()
+
+
 async def update_user_role(user_id: int, role: str) -> None:
     db = await _get_db()
     try:
@@ -742,6 +1722,68 @@ async def delete_user(user_id: int) -> None:
     db = await _get_db()
     try:
         await db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+# Kept in sync with auth.SESSION_MAX_AGE (30 days); duplicated as a plain constant
+# so this module doesn't import auth (which would create a cycle).
+_SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30
+
+
+async def revoke_user_sessions(user_id: int, revoked_before: float) -> None:
+    """Durably invalidate a user's outstanding session cookies.
+
+    Records that any session token for ``user_id`` issued before ``revoked_before``
+    must be rejected. This table has no FK to ``users``, so the revocation outlives
+    a deleted row and is restored into auth's in-memory epoch cache at startup —
+    that is what stops a deleted/demoted account's still-valid 30-day cookie from
+    regaining access after a UI restart. The write is monotonic (an older timestamp
+    can never lower an existing revocation), and rows whose window has fully elapsed
+    are pruned since the tokens they guarded have themselves expired.
+    """
+    db = await _get_db()
+    try:
+        await db.execute(
+            """
+            INSERT INTO session_revocations (user_id, revoked_before)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET revoked_before = excluded.revoked_before
+            WHERE excluded.revoked_before > session_revocations.revoked_before
+            """,
+            (user_id, revoked_before),
+        )
+        await db.execute(
+            "DELETE FROM session_revocations WHERE revoked_before < ?",
+            (revoked_before - _SESSION_MAX_AGE_SECONDS,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def list_session_revocations() -> list[dict[str, Any]]:
+    """Return [{user_id, revoked_before}, ...] for warming the auth epoch cache."""
+    db = await _get_db()
+    try:
+        cursor = await db.execute("SELECT user_id, revoked_before FROM session_revocations")
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        await db.close()
+
+
+async def update_user_password(user_id: int, hashed_password: str) -> None:
+    """Update a user's password and record the change timestamp."""
+    import time
+
+    db = await _get_db()
+    try:
+        await db.execute(
+            "UPDATE users SET password = ?, password_changed_at = ? WHERE id = ?",
+            (hashed_password, time.time(), user_id),
+        )
         await db.commit()
     finally:
         await db.close()
@@ -819,7 +1861,30 @@ async def upsert_worker(
             INSERT INTO workers (client_id, name, url, containers, apps, system_info, status, last_heartbeat)
             VALUES (?, ?, ?, ?, ?, ?, 'online', datetime('now'))
             ON CONFLICT(client_id) DO UPDATE SET
-                name = excluded.name,
+                -- Never replace a name we already have with a Docker container ID.
+                --
+                -- Inside a container, socket.gethostname() returns the first 12
+                -- hex characters of the container ID, and Docker regenerates that
+                -- on every recreate -- which is what an image bump does. So a
+                -- worker with no CASHPILOT_WORKER_NAME set reported a brand-new
+                -- meaningless name after every upgrade, and the fleet page's
+                -- labels churned while the machines had not changed at all.
+                -- Observed live: three workers renamed themselves during a
+                -- routine 1.10.1 -> 1.11.34 roll.
+                --
+                -- The worker's IDENTITY is already protected from this
+                -- (worker_api._name_is_ephemeral guards client_id); this is the
+                -- display name, which was not.
+                --
+                -- GLOB matches the whole string, so 12 character classes means
+                -- exactly 12 hex characters -- the container-ID shape and
+                -- nothing else. A real hostname, or anything the user set, is
+                -- kept and wins.
+                name = CASE
+                    WHEN excluded.name GLOB '[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]' AND COALESCE(workers.name, '') != ''
+                        THEN workers.name
+                    ELSE excluded.name
+                END,
                 url = excluded.url,
                 containers = excluded.containers,
                 apps = excluded.apps,
@@ -847,12 +1912,18 @@ async def get_worker(worker_id: int) -> dict[str, Any] | None:
         await db.close()
 
 
-async def get_worker_by_name(name: str) -> dict[str, Any] | None:
+async def get_worker_status_and_name(client_id: str) -> tuple[str, str] | None:
+    """The (status, display name) a worker had BEFORE its next upsert.
+
+    The heartbeat route needs the pre-upsert state to detect an
+    offline -> online recovery — upsert_worker unconditionally writes
+    'online', so after it runs the transition is no longer observable.
+    """
     db = await _get_db()
     try:
-        cursor = await db.execute("SELECT * FROM workers WHERE name = ?", (name,))
+        cursor = await db.execute("SELECT status, name FROM workers WHERE client_id = ?", (client_id,))
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        return (row["status"], row["name"]) if row else None
     finally:
         await db.close()
 
@@ -876,11 +1947,148 @@ async def set_worker_status(worker_id: int, status: str) -> None:
         await db.close()
 
 
+async def mark_worker_offline_if_unchanged(worker_id: int, expected_heartbeat: str) -> bool:
+    """Mark a worker offline only if no heartbeat landed since the sweep read it.
+
+    The stale-worker sweep reads the row, decides, then writes — and a recovery
+    heartbeat can land in that gap. An unconditional write would flip a worker
+    that JUST came back to offline and alert on it, exactly at its moment of
+    recovery. Conditioning on the heartbeat value the sweep based its decision
+    on makes the decide-and-write atomic: if anything moved, the update matches
+    nothing and the sweep simply reconsiders in two minutes.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE workers SET status = 'offline' WHERE id = ? AND last_heartbeat = ? AND status = 'online'",
+            (worker_id, expected_heartbeat),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+    finally:
+        await db.close()
+
+
 async def delete_worker(worker_id: int) -> None:
     db = await _get_db()
     try:
         await db.execute("DELETE FROM workers WHERE id = ?", (worker_id,))
         await db.commit()
+    finally:
+        await db.close()
+
+
+# --- Per-worker fleet keys ---
+#
+# The UI must both VERIFY inbound heartbeats from a worker and, for the full
+# cutover, AUTHENTICATE outbound calls TO that worker — so it needs the key
+# itself, not just a one-way hash. Keys are therefore stored encrypted at rest
+# (Fernet, the same at-rest protection as service credentials) and decrypted on
+# demand for comparison and for outbound Authorization headers.
+
+
+async def set_worker_key(client_id: str, key: str) -> None:
+    """Store a worker's per-worker key (encrypted), unconfirmed until the worker
+    proves it holds the key by using it on a later heartbeat."""
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE workers SET api_key_enc = ?, key_confirmed = 0, key_issued_at = datetime('now') WHERE client_id = ?",
+            (encrypt_value(key), client_id),
+        )
+        await db.commit()
+        if not cursor.rowcount:
+            # The worker row must exist first (upsert runs before this); a missing
+            # row would silently drop the key and lock the worker out.
+            _logger.warning("set_worker_key: no worker row for client_id=%s", client_id)
+    finally:
+        await db.close()
+
+
+async def confirm_worker_key(client_id: str) -> None:
+    """Mark a worker's key confirmed — it has authenticated with its own key, so the
+    shared bootstrap key is refused from now on (the cutover finalizes)."""
+    db = await _get_db()
+    try:
+        await db.execute(
+            "UPDATE workers SET key_confirmed = 1 WHERE client_id = ?",
+            (client_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def get_worker_key(client_id: str) -> str | None:
+    """Return a worker's per-worker key (decrypted), or None if not yet enrolled."""
+    key, _ = await get_worker_key_state(client_id)
+    return key
+
+
+async def get_worker_key_state(client_id: str) -> tuple[str | None, bool]:
+    """Return (key, confirmed) for a worker: the decrypted per-worker key (or None
+    if unenrolled, or if the stored key can no longer be decrypted) and whether the
+    worker has confirmed it by using it."""
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT api_key_enc, key_confirmed FROM workers WHERE client_id = ?",
+            (client_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None, False
+        enc = row["api_key_enc"]
+        if not enc:
+            return None, bool(row["key_confirmed"])
+        key = decrypt_value(enc)
+        if not key:
+            # decrypt_value() returns "" (after logging its own warning) when the
+            # CREDENTIAL-ENCRYPTION key can't decrypt this value -- the Fernet key
+            # at CASHPILOT_ENCRYPTION_KEY / /data/.fernet_key was rotated, or /data
+            # was restored without it. NOT CASHPILOT_SECRET_KEY, which only signs
+            # sessions: this message used to name that one, sending the operator
+            # after the wrong variable while their whole fleet sat offline.
+            #
+            # A real per-worker key is always a secrets.token_urlsafe(32) string
+            # and can never legitimately be empty, so "" here unambiguously means
+            # "undecryptable", not "empty key". Report it as NOT enrolled (None)
+            # rather than as a real key that can never match.
+            _logger.error(
+                "Worker '%s' per-worker key cannot be decrypted. The credential-encryption key "
+                "(CASHPILOT_ENCRYPTION_KEY / %s) is not the one it was encrypted with -- this is "
+                "NOT CASHPILOT_SECRET_KEY, which only signs sessions. Restore the original key to "
+                "recover every stored credential. Until then this worker is treated as unenrolled; "
+                "it keeps sending the key it persisted and will 401 for roughly %d heartbeats "
+                "before discarding it and re-enrolling on its own. To fix it now, delete "
+                "/data/.worker_key on that host and restart its container.",
+                client_id,
+                _FERNET_KEY_FILE,
+                _WORKER_KEY_DISCARD_AFTER,
+            )
+            return None, False
+        return key, bool(row["key_confirmed"])
+    finally:
+        await db.close()
+
+
+async def get_worker_key_issued_at(client_id: str) -> str | None:
+    """When this worker's per-worker key was minted, or None if not recorded.
+
+    Separate from ``get_worker_key_state`` rather than widening its tuple: that
+    function is called on every heartbeat and its 2-tuple contract is relied on
+    in several places, while this is only needed on the one branch that decides
+    whether the shared key may still be honoured.
+
+    None means UNKNOWN — a row written before this column existed and missed by
+    the migration's backfill. Callers must not read it as "long ago"; unknown is
+    not expired.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute("SELECT key_issued_at FROM workers WHERE client_id = ?", (client_id,))
+        row = await cursor.fetchone()
+        return row["key_issued_at"] if row else None
     finally:
         await db.close()
 
@@ -896,6 +2104,300 @@ async def record_health_event(slug: str, event: str, detail: str = "") -> None:
             "INSERT INTO health_events (slug, event, detail) VALUES (?, ?, ?)",
             (slug, event, detail),
         )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def record_health_events(events: list[tuple[str, str, str]]) -> None:
+    """Record many health events in ONE transaction/commit.
+
+    The health-check cycle writes one event per deployed service; committing each
+    separately fsync'd the WAL up to ~49 times per cycle. One executemany + one commit
+    collapses that to a single write — the dominant fix for that path's I/O.
+    """
+    if not events:
+        return
+    db = await _get_db()
+    try:
+        await db.executemany(
+            "INSERT INTO health_events (slug, event, detail) VALUES (?, ?, ?)",
+            events,
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+# How long a subject stays quiet after alerting. A collector broken for a week must
+# not notify every hour: the first failure is news, the 168th is noise.
+ALERT_COOLDOWN_HOURS = 24
+
+
+# A service can be "running" and earning nothing at all - the container is up,
+# the collector authenticates, and the balance simply never moves. That gap
+# between running and earning is invisible in every other view, because
+# everything it touches looks healthy.
+FLATLINE_MIN_DAYS = 7
+
+
+async def get_earned_by_platform(days: int = 30) -> dict[str, float]:
+    """USD earned per platform over the trailing window.
+
+    Deliberately NOT the latest balance. A balance is a running total; charging
+    a window's electricity against it would subtract 30 days of cost from a
+    lifetime of earnings and produce a number that means nothing.
+
+    Deltas are clamped per platform before summing, the same rule the dashboard
+    uses (CashPilot-glc): a payout drops a balance, and an unclamped drop would
+    read as negative earnings and understate what the service actually paid.
+
+    The delta is taken in the NATIVE currency and only then priced. Converting
+    each cumulative balance to USD first and subtracting afterwards would let a
+    rate move alone move the earnings figure: 100 MYST at $0.50 followed by 110
+    MYST at $0.40 subtracts to a loss and clamps to zero, hiding 10 MYST that
+    really was earned, while an unchanged balance at a risen rate invents
+    earnings out of nothing.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            """
+            SELECT platform, date, balance, currency, fx_rate_usd, source
+            FROM earnings
+            WHERE date >= date('now', ?)
+            ORDER BY platform, source, date
+            """,
+            (f"-{max(1, int(days))} days",),
+        )
+        rows = await cursor.fetchall()
+
+        earned: dict[str, float] = {}
+        # Keyed by (platform, SOURCE). Keyed by platform alone, two samplers of
+        # one provider account interleave into a single series whose deltas are
+        # meaningless: each drop clamps to zero, so the total is understated.
+        previous: dict[tuple[str, str], tuple[str, float]] = {}
+        unpriced = 0
+        for row in rows:
+            platform = row["platform"]
+            # Absent source means a row written before the column existed, and
+            # those were all this server's own. Never invent a distinct source
+            # for them: that would split one real series in two.
+            series = (platform, (row["source"] or "server"))
+            currency = (row["currency"] or "USD").upper()
+            balance = float(row["balance"] or 0.0)
+            # USD is parity by definition. Trusting a stored rate on a USD row
+            # would let a bad rate rewrite money the collector reported exactly.
+            rate = _usd_rate(currency, row["fx_rate_usd"])
+            earned.setdefault(platform, 0.0)
+
+            if rate is None:
+                # No rate means this reading cannot be priced, so it can neither
+                # contribute earnings nor anchor the next delta. Dropping the
+                # baseline is what stops a later reading from being differenced
+                # across the gap and counting the unpriced period twice.
+                previous.pop(series, None)
+                unpriced += 1
+                continue
+
+            before = previous.get(series)
+            if before is not None and before[0] == currency:
+                # Summed into the PLATFORM, so each source contributes its own
+                # earnings and the combination happens after differencing.
+                earned[platform] += max(0.0, balance - before[1]) * float(rate)
+            previous[series] = (currency, balance)
+
+        if unpriced:
+            _logger.warning(
+                "%d earnings reading(s) in the last %d days have no USD rate and were left out "
+                "of the per-platform totals, which are therefore understated.",
+                unpriced,
+                days,
+            )
+        return earned
+    finally:
+        await db.close()
+
+
+async def get_flatlined_services(min_days: int = FLATLINE_MIN_DAYS) -> list[dict[str, Any]]:
+    """Services whose recorded balance has not moved for at least ``min_days``.
+
+    Deliberately conservative, because a report that cries wolf is a report
+    nobody reads:
+
+    * A service with fewer than ``min_days`` of history is NOT reported. A new
+      deployment has not had time to earn anything yet.
+    * A balance of exactly zero throughout is NOT reported either. That is a
+      service that has never paid rather than one that stopped, and it is
+      usually a setup problem the user already knows about.
+    * The window is measured over distinct recorded days, so a collection outage
+      (which records nothing) cannot masquerade as a flat balance.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            """
+            SELECT platform,
+                   COUNT(DISTINCT date) AS days_recorded,
+                   MIN(balance)         AS min_balance,
+                   MAX(balance)         AS max_balance,
+                   MAX(date)            AS last_date
+            FROM earnings
+            WHERE date >= date('now', ?)
+            GROUP BY platform
+            -- Only platforms that recorded a reading TODAY. A collector that is
+            -- failing stops writing rows, but its earlier readings are still
+            -- there and are, of course, unchanged - so without this a broken
+            -- collector reads as a flatline, and so does a service that was
+            -- removed but kept its history. Those are different faults with
+            -- different fixes, and reporting them as "running but not earning"
+            -- is exactly the crying wolf this feature must avoid.
+            HAVING MAX(date) >= date('now')
+            """,
+            (f"-{min_days} days",),
+        )
+        rows = await cursor.fetchall()
+
+        flat: list[dict[str, Any]] = []
+        for row in rows:
+            if row["days_recorded"] < min_days:
+                continue  # not enough history to call it a flatline
+            if row["max_balance"] != row["min_balance"]:
+                continue  # it moved
+            if row["max_balance"] == 0:
+                continue  # never earned rather than stopped earning
+            flat.append(
+                {
+                    "platform": row["platform"],
+                    "days_flat": row["days_recorded"],
+                    "balance": row["max_balance"],
+                    "last_recorded": row["last_date"],
+                }
+            )
+        return flat
+    finally:
+        await db.close()
+
+
+async def record_alert(
+    kind: str,
+    subject: str,
+    message: str,
+    *,
+    category: str | None = None,
+    cooldown_hours: int = ALERT_COOLDOWN_HOURS,
+) -> int | None:
+    """Persist an alert, returning the new row's id only when the caller should notify.
+
+    The id is the delivery task's ownership token: a push that fails and wants
+    to un-dedupe must delete THAT row and no other, because a recovery and a
+    fresh failure can insert a newer row while the push was in flight —
+    clearing by (kind, subject) would take the newer row's dedupe with it.
+    Deduped calls return None, so every existing truthiness check keeps its
+    meaning.
+
+    Suppression is by TIME WINDOW per kind+subject, not by message equality. Message
+    equality alone is not enough: several collectors alternate between two error
+    strings for the same underlying fault (grass flips between an expired-token error
+    and a Cloudflare rate-limit depending on which request tripped first), so a
+    "changed message means new" rule would notify every single hour and grow the
+    table without bound — exactly what this is meant to prevent.
+
+    Nothing is stored while a subject is in cooldown, which keeps the table bounded.
+    Call ``clear_alerts`` when a subject recovers so the next failure alerts again
+    immediately instead of waiting out the window.
+    """
+    # A closed enum, enforced at the boundary: `error` is carefully redacted
+    # on the line next to this call, and a future collector setting
+    # error_kind=str(exc) must not smuggle unredacted exception text (which
+    # for several providers IS the credential) into a durable, any-role table.
+    if category not in (None, "auth", "transient", "shape"):
+        category = None
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id FROM alerts WHERE kind = ? AND subject = ? AND created_at > datetime('now', ?) LIMIT 1",
+            (kind, subject, f"-{int(cooldown_hours)} hours"),
+        )
+        if (row := await cursor.fetchone()) is not None:
+            # Refresh what the stored row SAYS while keeping the push
+            # suppressed. Without this the first category of a failure window
+            # is pinned for 24h: grass alternates between an expired-token
+            # error (auth) and a Cloudflare rate-limit (transient) with no
+            # success in between, so a restart could restore "transient" for a
+            # dead credential — rendered muted, with no fix button, as a blip
+            # that will never actually heal.
+            await db.execute(
+                "UPDATE alerts SET category = ?, message = ? WHERE id = ?",
+                (category, message, row["id"]),
+            )
+            await db.commit()
+            return None
+        cursor = await db.execute(
+            "INSERT INTO alerts (kind, subject, message, category) VALUES (?, ?, ?, ?)",
+            (kind, subject, message, category),
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def delete_alert(alert_id: int) -> bool:
+    """Delete exactly one alert row by id; True when a row was deleted.
+
+    The ownership-token counterpart to record_alert's returned id: a failed
+    delivery un-dedupes only the row it created, never a newer one.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+        await db.commit()
+        return cursor.rowcount == 1
+    finally:
+        await db.close()
+
+
+async def list_alerts(limit: int = 50) -> list[dict[str, Any]]:
+    """Return the most recent alerts, newest first."""
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT kind, subject, message, category, created_at FROM alerts ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+    finally:
+        await db.close()
+
+
+async def get_alert_subjects(kind: str) -> set[str]:
+    """Subjects currently holding a stored alert of this kind."""
+    db = await _get_db()
+    try:
+        cursor = await db.execute("SELECT DISTINCT subject FROM alerts WHERE kind = ?", (kind,))
+        return {row["subject"] for row in await cursor.fetchall()}
+    finally:
+        await db.close()
+
+
+async def clear_alerts(kind: str | None = None, subject: str | None = None) -> None:
+    """Drop stored alerts (all, one kind, or one subject within a kind).
+
+    Called when a subject recovers, so that if it breaks again later the failure
+    counts as new and notifies again instead of being deduped into silence.
+    """
+    clauses, params = [], []
+    if kind is not None:
+        clauses.append("kind = ?")
+        params.append(kind)
+    if subject is not None:
+        clauses.append("subject = ?")
+        params.append(subject)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    db = await _get_db()
+    try:
+        await db.execute(f"DELETE FROM alerts{where}", tuple(params))  # noqa: S608 - clauses are literals
         await db.commit()
     finally:
         await db.close()
@@ -967,13 +2469,27 @@ async def get_health_scores(days: int = 7) -> list[dict[str, Any]]:
 # --- Data Retention ---
 
 RETENTION_DAYS = 400
+# High-frequency uptime samples (check_ok / check_down, one per service every 5
+# minutes) are the dominant source of health_events growth, yet get_health_scores
+# only ever reads a bounded window. /api/health/scores caps that window at 90 days,
+# so we keep samples just past that (95d) — enough that no allowed query can
+# out-range its own samples, while still cutting the bulk sample rows ~76% versus
+# the 400-day lifecycle-event history (start/stop/restart/crash), which we keep in
+# full because those rows are rare and worth the long tail.
+HEALTH_CHECK_RETENTION_DAYS = 95
+_HEALTH_CHECK_EVENTS = ("check_ok", "check_down")
 
 
 async def purge_old_data() -> int:
-    """Delete earnings and health_events older than RETENTION_DAYS. Returns rows deleted."""
+    """Delete data past retention. Returns rows deleted.
+
+    Earnings and lifecycle health events are kept RETENTION_DAYS; the far more
+    numerous uptime-sample events are trimmed to HEALTH_CHECK_RETENTION_DAYS.
+    """
     db = await _get_db()
     try:
         cutoff = f"-{RETENTION_DAYS} days"
+        check_cutoff = f"-{HEALTH_CHECK_RETENTION_DAYS} days"
         c1 = await db.execute(
             "DELETE FROM earnings WHERE created_at < datetime('now', ?)",
             (cutoff,),
@@ -982,7 +2498,197 @@ async def purge_old_data() -> int:
             "DELETE FROM health_events WHERE created_at < datetime('now', ?)",
             (cutoff,),
         )
+        c3 = await db.execute(
+            "DELETE FROM health_events WHERE event IN ('check_ok', 'check_down') AND created_at < datetime('now', ?)",
+            (check_cutoff,),
+        )
+        # Alerts are deduped on write so the table stays small, but a service that
+        # was removed long ago should not leave its last failure sitting there forever.
+        c4 = await db.execute(
+            "DELETE FROM alerts WHERE created_at < datetime('now', ?)",
+            (cutoff,),
+        )
         await db.commit()
-        return (c1.rowcount or 0) + (c2.rowcount or 0)
+        return (c1.rowcount or 0) + (c2.rowcount or 0) + (c3.rowcount or 0) + (c4.rowcount or 0)
+    finally:
+        await db.close()
+
+
+async def vacuum_database() -> None:
+    """Reclaim free pages left by retention deletes.
+
+    SQLite never shrinks the file on DELETE alone, so without a periodic VACUUM the
+    database keeps its high-water-mark size forever even as old rows are purged.
+    Run off-peak (weekly) — VACUUM rewrites the whole file and briefly locks it. We
+    commit first because VACUUM cannot run inside an open transaction, and checkpoint
+    the WAL afterwards so the freed space is actually returned to the filesystem.
+    """
+    db = await _get_db()
+    try:
+        await db.commit()
+        await db.execute("VACUUM")
+        await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Payouts (CashPilot-1og)
+# ---------------------------------------------------------------------------
+
+
+async def record_probable_payout(
+    platform: str,
+    amount: float,
+    currency: str = "USD",
+    fx_rate_usd: float | None = None,
+) -> int | None:
+    """Record a balance drop that LOOKS like a payout, unconfirmed.
+
+    Returns the row id, or None when an unconfirmed one is already pending for
+    this platform. Without that guard every collection cycle would file another
+    copy of the same drop, and the user would face a growing pile of duplicate
+    prompts for one event.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT id FROM payouts WHERE platform = ? AND confirmed = 0 LIMIT 1",
+            (platform,),
+        )
+        if await cursor.fetchone():
+            return None
+        cursor = await db.execute(
+            "INSERT INTO payouts (platform, amount, currency, fx_rate_usd) VALUES (?, ?, ?, ?)",
+            (platform, float(amount), currency, fx_rate_usd),
+        )
+        await db.commit()
+        return cursor.lastrowid
+    finally:
+        await db.close()
+
+
+async def confirm_payout(payout_id: int, method: str = "") -> bool:
+    """Mark a probable payout as real. Only a human should reach this."""
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "UPDATE payouts SET confirmed = 1, method = ?, confirmed_at = datetime('now') "
+            "WHERE id = ? AND confirmed = 0",
+            (method, payout_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def reject_payout(payout_id: int) -> bool:
+    """Delete a probable payout the user says was not one.
+
+    Deleted rather than flagged: a rejected guess is not data about earnings,
+    and keeping it invites some later query from counting it.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute("DELETE FROM payouts WHERE id = ? AND confirmed = 0", (payout_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+    finally:
+        await db.close()
+
+
+async def get_payouts(platform: str | None = None, confirmed_only: bool = False) -> list[dict[str, Any]]:
+    """Payout rows, newest first."""
+    query = "SELECT * FROM payouts"
+    clauses: list[str] = []
+    params: list[Any] = []
+    if platform:
+        clauses.append("platform = ?")
+        params.append(platform)
+    if confirmed_only:
+        clauses.append("confirmed = 1")
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY detected_at DESC"
+
+    db = await _get_db()
+    try:
+        cursor = await db.execute(query, params)
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        await db.close()
+
+
+async def get_confirmed_payout_totals() -> dict[str, float]:
+    """Confirmed payout total per platform, in USD.
+
+    Uses the fx rate recorded when the payout landed, so a token payout keeps
+    the value it actually had rather than being restated by today's price.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            # COALESCE(fx_rate_usd, 1.0) would price an unrated token payout at
+            # PARITY WITH USD — a 500 MYST payout becomes $500 instead of ~$15.
+            # A payout whose rate was never captured is not worth "the same
+            # number of dollars"; it is worth an unknown amount, so it is
+            # excluded and counted separately rather than silently invented.
+            "SELECT platform, "
+            "  SUM(CASE WHEN currency = 'USD' THEN amount "
+            "           WHEN fx_rate_usd IS NOT NULL THEN amount * fx_rate_usd "
+            "           ELSE 0 END) AS total, "
+            "  SUM(CASE WHEN currency != 'USD' AND fx_rate_usd IS NULL THEN 1 ELSE 0 END) AS unpriced "
+            "FROM payouts WHERE confirmed = 1 GROUP BY platform"
+        )
+        totals: dict[str, float] = {}
+        for row in await cursor.fetchall():
+            totals[row["platform"]] = float(row["total"] or 0.0)
+            if row["unpriced"]:
+                # Say it rather than let the total quietly read low. The
+                # alternative — pricing them at parity — reads high by roughly
+                # the token's price, which is far worse.
+                _logger.warning(
+                    "%s: %d confirmed payout(s) have no recorded exchange rate and are "
+                    "excluded from the total, which is therefore an UNDERSTATEMENT.",
+                    row["platform"],
+                    row["unpriced"],
+                )
+        return totals
+    finally:
+        await db.close()
+
+
+async def get_latest_balance(platform: str) -> float | None:
+    """The most recent recorded balance for a platform, or None if never seen.
+
+    None matters: a first-ever reading has nothing to compare against, and
+    treating an absent history as zero would make every initial collection look
+    like a huge gain — or, for payout detection, make the first reading after a
+    fresh install look like a drop.
+    """
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT balance FROM earnings WHERE platform = ? ORDER BY date DESC, id DESC LIMIT 1",
+            (platform,),
+        )
+        row = await cursor.fetchone()
+        return float(row["balance"]) if row else None
+    finally:
+        await db.close()
+
+
+async def get_balance_history(platform: str, days: int = 30) -> list[dict[str, Any]]:
+    """Oldest-first balance readings for a platform, for rate projection."""
+    db = await _get_db()
+    try:
+        cursor = await db.execute(
+            "SELECT date, balance, currency, fx_rate_usd FROM earnings "
+            "WHERE platform = ? AND date >= date('now', ?) ORDER BY date ASC",
+            (platform, f"-{int(days)} days"),
+        )
+        return [dict(r) for r in await cursor.fetchall()]
     finally:
         await db.close()

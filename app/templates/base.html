@@ -9,37 +9,62 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="/static/css/style.css">
-  <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" onload="this.onload=null;this.rel='stylesheet'">
+  <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" data-async-style>
   <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"></noscript>
-  <script>
+  <script nonce="{{ csp_nonce(request) }}">
     (function(){var t=localStorage.getItem('cp-theme')||'dark';document.documentElement.setAttribute('data-theme',t)})();
   </script>
   {% block head %}{% endblock %}
+  <script nonce="{{ csp_nonce(request) }}">
+    // Async font loading used an inline onload= handler, which a nonce cannot
+    // cover — a nonce applies to a script element, never to an inline event
+    // attribute. Same effect, one listener, no 'unsafe-inline'.
+    function asyncStyleSwap() {
+      document.querySelectorAll('link[data-async-style]').forEach((link) => {
+        if (link.rel === 'stylesheet') return;
+        link.addEventListener('load', () => { link.rel = 'stylesheet'; }, { once: true });
+        if (link.sheet) link.rel = 'stylesheet';
+      });
+    }
+    asyncStyleSwap();
+  </script>
 </head>
 <body data-page="{% block page %}{% endblock %}">
+{# Every sidebar link below compares `active_page`, and .sidebar-link.active is
+   styled -- but nothing ever SET this, so the comparison was always false and
+   no page has ever highlighted its own nav item (CashPilot-yhkl). The page name
+   is already declared by each child through {% raw %}{% block page %}{% endraw %},
+   which is what <body data-page> uses, so derive it here rather than making
+   every route pass a second copy of the same string. #}
+{% set active_page = self.page() %}
 
   <div class="sidebar-overlay"></div>
 
   <!-- Sidebar -->
   <aside class="sidebar">
     <div class="sidebar-brand">
-      <svg width="28" height="28" viewBox="0 0 32 32">
+      <svg width="28" height="28" viewBox="0 0 256 256" role="img" aria-label="CashPilot">
         <defs>
-          <linearGradient id="cpSun" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stop-color="#fde68a"/>
-            <stop offset="35%" stop-color="#fb923c"/>
-            <stop offset="65%" stop-color="#e11d48"/>
-            <stop offset="100%" stop-color="#6d28d9"/>
+          <linearGradient id="cpSun" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="#FFD54F"/>
+            <stop offset="40%" stop-color="#FF9800"/>
+            <stop offset="72%" stop-color="#E91E63"/>
+            <stop offset="100%" stop-color="#AB47BC"/>
           </linearGradient>
-          <mask id="cpMask">
-            <circle cx="16" cy="16" r="12" fill="white"/>
-            <rect x="0" y="16" width="32" height="1" fill="black"/>
-            <rect x="0" y="18.5" width="32" height="1.5" fill="black"/>
-            <rect x="0" y="21.5" width="32" height="2.5" fill="black"/>
-            <rect x="0" y="25.5" width="32" height="4" fill="black"/>
+          <mask id="cpBands">
+            <rect width="256" height="256" fill="#fff"/>
+            <rect x="16" y="150" width="224" height="10" fill="#000"/>
+            <rect x="16" y="172" width="224" height="13" fill="#000"/>
+            <rect x="16" y="197" width="224" height="16" fill="#000"/>
           </mask>
         </defs>
-        <circle cx="16" cy="16" r="12" fill="url(#cpSun)" mask="url(#cpMask)"/>
+        <g transform="translate(128,128) scale(1.3333333) translate(-128,-132)">
+          <circle cx="128" cy="132" r="96" fill="url(#cpSun)" mask="url(#cpBands)"/>
+          <g transform="translate(128,104) rotate(28)">
+            <path d="M0,-46 L4,-10 L50,3 L5,8 L6.5,20 L0,13 L-6.5,20 L-5,8 L-50,3 L-4,-10 Z"
+                  fill="#000010" opacity="0.65"/>
+          </g>
+        </g>
       </svg>
       CashPilot
     </div>
@@ -63,6 +88,14 @@
         Service Catalog
       </a>
       {% if user and user.r == 'owner' %}
+      <!-- Owner-only, matching /payouts and /api/payout-registry. This view maps
+           one person to all of their wallets at once. -->
+      <a href="/payouts" class="sidebar-link {% if active_page == 'payouts' %}active{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12V7H5a2 2 0 010-4h14v4"/><path d="M3 5v14a2 2 0 002 2h16v-5"/><path d="M18 12a2 2 0 000 4h4v-4z"/>
+        </svg>
+        Payouts
+      </a>
       <a href="/settings" class="sidebar-link {% if active_page == 'settings' %}active{% endif %}">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 010-2.83 2 2 0 012.83 0l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 0 2 2 0 010 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/>
@@ -86,7 +119,7 @@
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M4.25 2.5c-1.336 0-2.75 1.164-2.75 3 0 2.15 1.58 4.144 3.365 5.682A20.6 20.6 0 008 13.393a20.6 20.6 0 003.135-2.211C12.92 9.644 14.5 7.65 14.5 5.5c0-1.836-1.414-3-2.75-3-1.373 0-2.609.986-3.029 2.456a.749.749 0 01-1.442 0C6.859 3.486 5.623 2.5 4.25 2.5z"/></svg>
         </a>
       </div>
-      <span class="sidebar-footer-version">CashPilot v0.2.49</span>
+      <span class="sidebar-footer-version">CashPilot {{ app_version() }}</span>
     </div>
   </aside>
 
@@ -134,6 +167,11 @@
               <span class="theme-label">Light mode</span>
             </button>
             <div class="avatar-dropdown-divider"></div>
+            <button class="avatar-dropdown-item" id="change-password-btn" data-action="openChangePasswordModal">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
+              Change password
+            </button>
+            <div class="avatar-dropdown-divider"></div>
             <a href="/logout" class="avatar-dropdown-item avatar-dropdown-logout">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
               Sign out
@@ -143,6 +181,16 @@
         {% endif %}
       </div>
     </header>
+
+    <!-- A newer release is available (CashPilot-w0ss). Hidden by default and
+         populated by CP.checkForUpdate(); it stays hidden when the check is off,
+         has not run, failed, or this build is not a release. Unknown is unknown,
+         never "up to date". -->
+    <div class="update-banner" id="update-banner" hidden>
+      <span id="update-banner-text"></span>
+      <a id="update-banner-link" href="#" target="_blank" rel="noopener noreferrer">Release notes</a>
+      <button type="button" id="update-banner-dismiss" aria-label="Dismiss">&times;</button>
+    </div>
 
     <!-- Page content -->
     <main class="page-content">
@@ -155,7 +203,7 @@
     <div class="modal" style="max-width: 800px;">
       <div class="modal-header">
         <h3 class="modal-title" id="logs-modal-title">Logs</h3>
-        <button class="modal-close" onclick="CP.closeModal('logs-modal'); CP.stopLogPolling();" aria-label="Close">
+        <button class="modal-close" data-action="closeModal" data-a1="logs-modal" data-then="stopLogPolling" aria-label="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
@@ -170,7 +218,7 @@
     <div class="modal" style="max-width: 700px;">
       <div class="modal-header">
         <h3 class="modal-title" id="service-detail-title">Service</h3>
-        <button class="modal-close" onclick="CP.closeModal('service-detail-modal')" aria-label="Close">
+        <button class="modal-close" data-action="closeModal" data-a1="service-detail-modal" aria-label="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
@@ -180,10 +228,45 @@
   </div>
 
   {% if user %}
-  <script>window._userRole = '{{ user.r }}';</script>
+  <!-- Change Password Modal (global) -->
+  <div class="modal-overlay" id="password-modal">
+    <div class="modal" style="max-width: 420px;">
+      <div class="modal-header">
+        <h3 class="modal-title">Change Password</h3>
+        <button class="modal-close" data-action="closeModal" data-a1="password-modal" aria-label="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label class="form-label" for="chpw-current">Current password</label>
+          <input class="form-input" type="password" id="chpw-current" autocomplete="current-password" placeholder="Enter current password">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="chpw-new">New password</label>
+          <input class="form-input" type="password" id="chpw-new" autocomplete="new-password" placeholder="At least 10 characters">
+          <div class="form-hint">Use at least 10 characters.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="chpw-confirm">Confirm new password</label>
+          <input class="form-input" type="password" id="chpw-confirm" autocomplete="new-password" placeholder="Re-enter new password">
+        </div>
+        <div id="chpw-error" style="display:none; color:var(--error); font-size:0.82rem; margin-bottom:12px;"></div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+          <button class="btn btn-ghost btn-sm" data-action="closeModal" data-a1="password-modal">Cancel</button>
+          <button class="btn btn-primary btn-sm" id="pwd-submit" data-action="submitPasswordChange">Change Password</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if user %}
+  <script nonce="{{ csp_nonce(request) }}">window._userRole = '{{ user.r }}';</script>
   {% endif %}
   <script async src="https://cdn.jsdelivr.net/npm/chart.js@4.4.8/dist/chart.umd.min.js" integrity="sha384-T/4KgSWuZEPozpPz7rnnp/5lDSnpY1VPJCojf1S81uTHS1E38qgLfMgVsAeRCWc4" crossorigin="anonymous"></script>
   <script src="/static/js/app.js"></script>
   {% block scripts %}{% endblock %}
+  <script src="/static/js/delegate.js"></script>
 </body>
 </html>

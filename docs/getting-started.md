@@ -25,7 +25,23 @@ This starts two containers:
 
 ### 2. Open the dashboard
 
-Navigate to [http://localhost:8080](http://localhost:8080) in your browser. The onboarding wizard will guide you through initial setup.
+Navigate to [http://localhost:8080](http://localhost:8080) in your browser. Since no account exists yet, you'll be redirected to onboarding and then to the registration form.
+
+!!! warning "First-run setup token required"
+    On first start, CashPilot generates a one-time setup token and prints it to the **cashpilot-ui** container logs:
+
+    ```bash
+    docker compose logs cashpilot-ui
+    ```
+
+    Look for a line like:
+
+    ```
+    FIRST-RUN SETUP: no account exists yet. Open /register and enter this
+    one-time setup token to create the owner account: <token>
+    ```
+
+    Copy that token into the **Setup Token** field on the registration form to create the first (owner) account. It's only ever shown in the logs — never in a URL — and is discarded permanently once the owner account exists.
 
 ### 3. Browse the service catalog
 
@@ -66,10 +82,13 @@ graph LR
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TZ` | `UTC` | Timezone for scheduling and display |
-| `CASHPILOT_SECRET_KEY` | *(auto-generated)* | Encryption key for stored credentials. Set this to persist encryption across container recreations |
+| `CASHPILOT_SECRET_KEY` | *(auto-generated)* | Signing key for login sessions. Persisted at `/data/.secret_key`. **Does not encrypt credentials** |
+| `CASHPILOT_ENCRYPTION_KEY` | *(auto-generated)* | Fernet key encrypting stored credentials at rest. Persisted at `/data/.fernet_key`. Adopted only when that file is absent, so set it only to restore a backup |
 | `CASHPILOT_API_KEY` | -- | Shared secret between UI and workers for API authentication |
-| `CASHPILOT_COLLECTION_INTERVAL` | `3600` | Seconds between earnings collection cycles |
-| `CASHPILOT_PORT` | `8080` | Web UI port inside the container |
+| `CASHPILOT_COLLECT_INTERVAL` | `60` | Minutes between earnings collection cycles |
+| `CASHPILOT_BIND_ADDR` | `127.0.0.1` | Host interface the UI port is published on. **Loopback by default** — the dashboard can command the Docker-socket worker, so it is not exposed to your network out of the box. Set a specific IP (e.g. a Tailscale/VPN address) or `0.0.0.0` to expose it, or (preferred) run an authenticating reverse proxy in front |
+
+The UI's web port inside the container is fixed at `8080` (set via the container's `CMD`); `CASHPILOT_BIND_ADDR` controls only which host interface it is published on.
 
 ### Worker Environment Variables
 
@@ -79,50 +98,75 @@ graph LR
 | `CASHPILOT_UI_URL` | -- | URL of the UI container, e.g. `http://cashpilot-ui:8080` |
 | `CASHPILOT_API_KEY` | -- | Must match the UI's API key |
 | `CASHPILOT_WORKER_NAME` | *(hostname)* | Display name for this worker in the fleet dashboard |
+| `CASHPILOT_WORKER_URL` | *(auto-detected)* | URL the UI uses to reach this worker, e.g. `http://192.168.10.50:8081`. Set explicitly for cross-host fleets — auto-detection can report an unreachable container-internal IP |
+| `CASHPILOT_WORKER_BIND_ADDR` | `127.0.0.1` | Host interface the worker's Docker-socket API port is published on. **Loopback by default.** The worker API can deploy/stop any container (= root on the host), so for a remote worker bind a private/VPN interface (e.g. a Tailscale IP), **never** a public IP |
+| `CASHPILOT_PORT` | `8081` | Port the worker **advertises** to the UI. It does *not* change the listen port, which is fixed by the image's `CMD` — see the [configuration reference](configuration.md) |
 
 ### Docker Compose Example
 
 ```yaml
-services:
-  cashpilot-ui:
-    image: drumsergio/cashpilot:latest
-    container_name: cashpilot-ui
-    ports:
-      - "8080:8080"
-    volumes:
-      - cashpilot_data:/data
-    environment:
-      - TZ=Europe/Madrid
-      - CASHPILOT_API_KEY=your-secret-api-key
-      - CASHPILOT_SECRET_KEY=your-encryption-key
-    restart: unless-stopped
-
-  cashpilot-worker:
-    image: drumsergio/cashpilot-worker:latest
-    container_name: cashpilot-worker
-    ports:
-      - "8081:8081"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - cashpilot_worker_data:/data
-    environment:
-      - TZ=Europe/Madrid
-      - CASHPILOT_UI_URL=http://cashpilot-ui:8080
-      - CASHPILOT_API_KEY=your-secret-api-key
-    restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
-
-volumes:
-  cashpilot_data:
-  cashpilot_worker_data:
+--8<-- "docker-compose.yml"
 ```
+
+!!! note "This is the real file"
+
+    The block above is included verbatim from `docker-compose.yml` in the
+    repository, so it cannot drift from what actually ships. Earlier, a
+    hand-copied version of it published the worker's Docker-socket API on every
+    interface and pinned `:latest` — both of which the
+    [security defaults](security-defaults.md) page tells you not to do.
 
 !!! warning "Docker Socket Access"
     The worker container requires access to `/var/run/docker.sock` to manage service containers. This grants the worker significant privileges on the host. Run CashPilot on a dedicated machine or VLAN for best security.
 
 !!! tip "Secret Key Persistence"
-    If you don't set `CASHPILOT_SECRET_KEY`, one is auto-generated on first run and stored in the data volume. If you recreate the volume, stored credentials become unreadable. Set an explicit key in your compose file to avoid this.
+    Credentials are encrypted with `CASHPILOT_ENCRYPTION_KEY`, **not** `CASHPILOT_SECRET_KEY` — the latter only signs login sessions. The encryption key is auto-generated on first run and stored at `/data/.fernet_key`. **Back that file up.** If the volume is recreated without it, a fresh key is generated and every stored credential becomes permanently unreadable. Setting `CASHPILOT_ENCRYPTION_KEY` is for restoring that backup; the key file always wins, so setting it on a healthy instance changes nothing.
+
+!!! tip "Passwords and secrets in the UI"
+    Change your own password any time from the avatar menu -> **Change password** (available to all roles); this signs out your other sessions. In **Settings**, stored secrets are write-only: enter a value to change it, or leave the field blank to keep the existing one. Saved credentials are never sent back to the browser.
+
+## Updating CashPilot
+
+The published images use floating tags, so updating is just a pull + recreate:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+`docker compose pull` fetches the newest published image and `up -d` recreates
+only the containers whose image changed. The shipped compose files set
+`pull_policy: always`, so even a bare `docker compose up -d` will pull the
+latest image first.
+
+!!! note "You do **not** need to rebuild"
+    CashPilot ships prebuilt multi-arch images on Docker Hub
+    ([`drumsergio/cashpilot`](https://hub.docker.com/r/drumsergio/cashpilot),
+    [`drumsergio/cashpilot-worker`](https://hub.docker.com/r/drumsergio/cashpilot-worker)).
+    `docker compose build` / `--build` is only relevant if you deliberately
+    build from source with `docker-compose.build.yml`. For normal installs,
+    `pull` + `up -d` is the complete and correct update procedure.
+
+### Pinning a specific version
+
+`:latest` always tracks the newest release. To stay on a fixed version,
+replace the tag (e.g. `drumsergio/cashpilot:0.6.13`) and remove
+`pull_policy: always`. Browse available tags on
+[Docker Hub](https://hub.docker.com/r/drumsergio/cashpilot/tags). The minor
+tag (e.g. `:0.6`) tracks the latest patch within that minor series.
+
+### Automating updates (optional)
+
+If you want hands-off updates, point a scheduler at the same two commands —
+for example a daily cron entry:
+
+```cron
+0 4 * * *  cd /path/to/cashpilot && docker compose pull && docker compose up -d
+```
+
+Or run an auto-updater such as [Watchtower](https://containrrr.dev/watchtower/)
+or [Diun](https://crazymax.dev/diun/) against the CashPilot containers. These
+are entirely optional — CashPilot does not bundle an updater.
 
 ## Supported Services
 

@@ -47,10 +47,39 @@ def _no_auth():
     return patch("app.main.auth.get_current_user", return_value=None)
 
 
+@pytest.fixture(autouse=True)
+def _no_recorded_deployment_spec():
+    """Default these tests to "this service has never been deployed".
+
+    The deploy route now reads the previously recorded spec so a redeploy
+    reproduces the container that is actually running. Returning None keeps the
+    pre-existing behaviour these tests assert on - build the spec from the
+    catalog - without each of them having to mock the database.
+    """
+    with patch("app.main.database.get_deployment_spec", new_callable=AsyncMock, return_value=None):
+        yield
+
+
 @pytest.fixture
 def client():
     with TestClient(app, raise_server_exceptions=False) as c:
         yield c
+
+
+@pytest.fixture
+def deploy_capture():
+    """Capture the spec forwarded to ``_proxy_worker_deploy``.
+
+    Returns ``(captured, side_effect)``: patch ``app.main._proxy_worker_deploy``
+    with ``side_effect``, then read the forwarded spec from ``captured["spec"]``.
+    """
+    captured: dict = {}
+
+    async def _capture_deploy(worker_id, slug, spec):
+        captured["spec"] = spec
+        return {"container_id": "abc123"}
+
+    return captured, _capture_deploy
 
 
 def _online_worker(wid=1, url="http://192.168.1.10:8081"):
@@ -106,6 +135,83 @@ class TestApiDeploy:
             data = resp.json()
             assert data["status"] == "deployed"
 
+    def test_divergent_redeploy_returns_the_kept_list_over_http(self, client):
+        """CashPilot-23yb: the deploy response must survive FastAPI's response model.
+
+        `kept_from_previous_deployment` is a list, and the route used to be
+        annotated `-> dict[str, str]` — so the very deployments that had
+        something to tell the user 500'd AFTER deploying and persisting, and a
+        retry could deploy again. Exercised through HTTP because a direct call
+        to the function bypasses response validation entirely.
+        """
+        svc = {
+            "slug": "honeygain",
+            "name": "Honeygain",
+            "docker": {
+                "image": "honeygain/honeygain:latest",
+                "env": [{"key": "EMAIL", "default": "user@test.com"}],
+                "ports": ["8080:80/tcp"],
+                "volumes": ["/data:/app/data"],
+            },
+        }
+        # The recorded container ran with a command the catalog no longer has:
+        # _merge_recorded_spec keeps it and reports the divergence.
+        recorded = {"image": "honeygain/honeygain:latest", "command": "--legacy-flag"}
+        worker = _online_worker()
+
+        async def _fake_deploy(worker_id, slug, spec):
+            return {"container_id": "abc123"}
+
+        with (
+            _auth_owner(),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=[worker]),
+            patch("app.main.catalog.get_service", return_value=svc),
+            patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
+            patch(
+                "app.main.database.get_deployment_spec",
+                new_callable=AsyncMock,
+                return_value=recorded,
+            ),
+            patch("app.main._proxy_worker_deploy", side_effect=_fake_deploy),
+            patch("app.main.database.save_deployment", new_callable=AsyncMock),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
+            patch("app.main._run_collection", new_callable=AsyncMock),
+        ):
+            resp = client.post("/api/deploy/honeygain", json={"env": {}})
+            assert resp.status_code == 200, resp.text
+            data = resp.json()
+            assert data["status"] == "deployed"
+            kept = data["kept_from_previous_deployment"]
+            assert isinstance(kept, list) and kept
+            assert any("command" in line for line in kept)
+
+    def test_plain_deploy_response_has_no_kept_key(self, client):
+        # Negative control: without a recorded spec there is no divergence and
+        # the key must be absent — the toast only fires when there is news.
+        svc = {
+            "slug": "honeygain",
+            "name": "Honeygain",
+            "docker": {"image": "honeygain/honeygain:latest", "env": []},
+        }
+        worker = _online_worker()
+
+        async def _fake_deploy(worker_id, slug, spec):
+            return {"container_id": "abc123"}
+
+        with (
+            _auth_owner(),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=[worker]),
+            patch("app.main.catalog.get_service", return_value=svc),
+            patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
+            patch("app.main._proxy_worker_deploy", side_effect=_fake_deploy),
+            patch("app.main.database.save_deployment", new_callable=AsyncMock),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
+            patch("app.main._run_collection", new_callable=AsyncMock),
+        ):
+            resp = client.post("/api/deploy/honeygain", json={"env": {}})
+            assert resp.status_code == 200, resp.text
+            assert "kept_from_previous_deployment" not in resp.json()
+
     def test_deploy_service_not_found(self, client):
         with (
             _auth_owner(),
@@ -136,10 +242,259 @@ class TestApiDeploy:
             assert resp.status_code == 410
             assert "no longer available" in resp.json()["detail"]
 
+    def test_deploy_broken_service_refused(self, client):
+        # The catalog listing already hides broken services; the deploy gate used to
+        # let them through, so a direct link or stale page could still deploy one.
+        svc = {"slug": "speedshare", "name": "SpeedShare", "status": "broken", "docker": {"image": "x"}}
+        with (
+            _auth_owner(),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=[_online_worker()]),
+            patch("app.main.catalog.get_service", return_value=svc),
+        ):
+            resp = client.post("/api/deploy/speedshare", json={})
+            assert resp.status_code == 409  # broken may come back; not "gone"
+            assert "broken" in resp.json()["detail"]
+
+    def test_deploy_dropped_service_refused(self, client):
+        svc = {"slug": "gone", "name": "Gone", "status": "dropped", "docker": {"image": "x"}}
+        with (
+            _auth_owner(),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=[_online_worker()]),
+            patch("app.main.catalog.get_service", return_value=svc),
+        ):
+            resp = client.post("/api/deploy/gone", json={})
+            assert resp.status_code == 410
+            assert "dropped" in resp.json()["detail"]
+
     def test_deploy_no_auth(self, client):
         with _no_auth():
             resp = client.post("/api/deploy/honeygain", json={})
             assert resp.status_code == 401
+
+    def test_deploy_repocket_emits_rp_env_keys(self, client, deploy_capture):
+        """#82 guard at the deploy layer: the real repocket catalog entry must
+        produce RP_EMAIL/RP_API_KEY in the container spec sent to the worker.
+
+        Uses the real catalog (no get_service mock), so a future regression that
+        renames the YAML keys OR a refactor of api_deploy that mangles env names
+        is caught independently of the catalog-level test.
+        """
+        captured, capture = deploy_capture
+
+        # Reload the real catalog from disk so this test is independent of any
+        # earlier test that swapped SERVICES_DIR and left the cache polluted.
+        from app import catalog
+
+        catalog.load_services()
+
+        with (
+            _auth_owner(),
+            patch("app.main._resolve_worker_id", new_callable=AsyncMock, return_value=1),
+            patch("app.main._proxy_worker_deploy", side_effect=capture),
+            patch("app.main.database.save_deployment", new_callable=AsyncMock),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
+        ):
+            resp = client.post(
+                "/api/deploy/repocket",
+                json={"env": {"RP_EMAIL": "me@example.com", "RP_API_KEY": "key123"}},
+            )
+            assert resp.status_code == 200, resp.text
+            spec_env = captured["spec"]["env"]
+            assert set(spec_env) == {"RP_EMAIL", "RP_API_KEY"}, (
+                f"repocket container spec must carry exactly RP_EMAIL + RP_API_KEY, got {set(spec_env)}"
+            )
+            assert spec_env["RP_API_KEY"] == "key123"
+            assert spec_env["RP_EMAIL"] == "me@example.com"
+
+    def test_deploy_forwards_resources_from_yaml(self, client, deploy_capture):
+        """A resources block in the service YAML must reach the worker spec."""
+        captured, capture = deploy_capture
+
+        svc = {
+            "slug": "storj",
+            "name": "Storj",
+            "docker": {
+                "image": "storjlabs/storagenode",
+                "env": [],
+                "ports": [],
+                "volumes": [],
+                "resources": {"mem_limit": "2g", "oom_score_adj": -100},
+            },
+        }
+        with (
+            _auth_owner(),
+            patch("app.main._resolve_worker_id", new_callable=AsyncMock, return_value=1),
+            patch("app.main.catalog.get_service", return_value=svc),
+            patch("app.main._proxy_worker_deploy", side_effect=capture),
+            patch("app.main.database.save_deployment", new_callable=AsyncMock),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
+        ):
+            resp = client.post("/api/deploy/storj", json={})
+            assert resp.status_code == 200, resp.text
+            assert captured["spec"]["resources"] == {"mem_limit": "2g", "oom_score_adj": -100}
+
+    def test_deploy_omits_resources_when_absent(self, client, deploy_capture):
+        """A service YAML without a resources block must not add one to the spec."""
+        captured, capture = deploy_capture
+
+        svc = {
+            "slug": "nores",
+            "name": "NoRes",
+            "docker": {"image": "x", "env": [], "ports": [], "volumes": []},
+        }
+        with (
+            _auth_owner(),
+            patch("app.main._resolve_worker_id", new_callable=AsyncMock, return_value=1),
+            patch("app.main.catalog.get_service", return_value=svc),
+            patch("app.main._proxy_worker_deploy", side_effect=capture),
+            patch("app.main.database.save_deployment", new_callable=AsyncMock),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
+        ):
+            resp = client.post("/api/deploy/nores", json={})
+            assert resp.status_code == 200, resp.text
+            assert "resources" not in captured["spec"]
+
+    def test_deploy_storj_real_catalog_carries_resources(self, client, deploy_capture):
+        """Guard: the real storj YAML resources must reach the container spec.
+
+        Uses the real catalog (no get_service mock) so a rename of the YAML
+        `resources` keys is caught independently of the schema-level test.
+        """
+        captured, capture = deploy_capture
+
+        from app import catalog
+
+        catalog.load_services()
+
+        with (
+            _auth_owner(),
+            patch("app.main._resolve_worker_id", new_callable=AsyncMock, return_value=1),
+            patch("app.main._proxy_worker_deploy", side_effect=capture),
+            patch("app.main.database.save_deployment", new_callable=AsyncMock),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
+        ):
+            resp = client.post(
+                "/api/deploy/storj",
+                json={
+                    "env": {
+                        "WALLET": "0xabc",
+                        "EMAIL": "a@b.com",
+                        "ADDRESS": "1.2.3.4:28967",
+                        "STORAGE": "2TB",
+                        "IDENTITY_DIR": "/mnt/id",
+                        "STORAGE_DIR": "/mnt/data",
+                    }
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            assert captured["spec"]["resources"] == {
+                "mem_limit": "2g",
+                "oom_score_adj": -100,
+                # 4096, not 2048: older runc maps shares below ~2600 UNDER the
+                # unset cgroup-v2 default weight — see _schema.yml.
+                "cpu_shares": 4096,
+            }
+
+    def test_deploy_proxybase_real_catalog_passes_credentials_as_arguments(self, client, deploy_capture):
+        """Guard for issue #343: the peer client reads ONLY positional arguments.
+
+        Its own error text offers "environment variables ID and NAME", but no
+        published image honors them (verified live against the pinned digest
+        and tag v2.0.3): an env-only container loops on "Missing ID and NAME"
+        while showing as running. The catalog command must therefore reach the
+        worker spec with both values substituted — if a catalog rewrite drops
+        the command line again (the 2026-07-17 fix shipped without it), this
+        goes red.
+        """
+        captured, capture = deploy_capture
+
+        from app import catalog
+
+        catalog.load_services()
+
+        with (
+            _auth_owner(),
+            patch("app.main._resolve_worker_id", new_callable=AsyncMock, return_value=1),
+            patch("app.main._proxy_worker_deploy", side_effect=capture),
+            patch("app.main.database.save_deployment", new_callable=AsyncMock),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
+        ):
+            resp = client.post(
+                "/api/deploy/proxybase",
+                json={"env": {"ID": "tok123", "NAME": "mydev"}},
+            )
+            assert resp.status_code == 200, resp.text
+            assert captured["spec"]["command"] == "tok123 mydev"
+
+    def test_deploy_bitping_real_catalog_requires_credentials(self, client, deploy_capture):
+        """Guard for issue #341: bitping must not deploy credential-less.
+
+        The 2026-03-28 catalog rewrite dropped BITPING_EMAIL/BITPING_PASSWORD
+        while the guide and the image kept supporting them, so every deploy
+        for months shipped a node that sat at "No active session" earning
+        nothing. With the env block restored, an empty deploy is rejected up
+        front; if the block is ever dropped again, the empty deploy succeeds
+        and this goes red.
+        """
+        captured, capture = deploy_capture
+
+        from app import catalog
+
+        catalog.load_services()
+
+        with (
+            _auth_owner(),
+            patch("app.main._resolve_worker_id", new_callable=AsyncMock, return_value=1),
+            patch("app.main._proxy_worker_deploy", side_effect=capture),
+            patch("app.main.database.save_deployment", new_callable=AsyncMock),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
+        ):
+            resp = client.post("/api/deploy/bitping", json={"env": {}})
+            assert resp.status_code == 400
+            assert "Email" in resp.json()["detail"]
+            assert "Password" in resp.json()["detail"]
+
+            resp = client.post(
+                "/api/deploy/bitping",
+                json={"env": {"BITPING_EMAIL": "a@b.c", "BITPING_PASSWORD": "pw"}},
+            )
+            assert resp.status_code == 200, resp.text
+            assert captured["spec"]["env"]["BITPING_EMAIL"] == "a@b.c"
+            assert captured["spec"]["env"]["BITPING_PASSWORD"] == "pw"
+
+    def test_deploy_urnetwork_real_catalog_authenticates_via_auth_provide(self, client, deploy_capture):
+        """Guard for issue #344: the provider binary reads NO environment variables.
+
+        The retired UR_AUTH_TOKEN spec deployed containers that simply ran
+        unauthenticated. The working contract (the binary's own --help, verified
+        live) is the auth-provide subcommand with the account credentials as
+        arguments — so the substituted command must reach the worker spec, and a
+        credential-less deploy must be rejected up front.
+        """
+        captured, capture = deploy_capture
+
+        from app import catalog
+
+        catalog.load_services()
+
+        with (
+            _auth_owner(),
+            patch("app.main._resolve_worker_id", new_callable=AsyncMock, return_value=1),
+            patch("app.main._proxy_worker_deploy", side_effect=capture),
+            patch("app.main.database.save_deployment", new_callable=AsyncMock),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
+        ):
+            resp = client.post("/api/deploy/urnetwork", json={"env": {}})
+            assert resp.status_code == 400
+            assert "Email" in resp.json()["detail"]
+            assert "Password" in resp.json()["detail"]
+
+            resp = client.post(
+                "/api/deploy/urnetwork",
+                json={"env": {"UR_USER_AUTH": "a@b.c", "UR_PASSWORD": "pw"}},
+            )
+            assert resp.status_code == 200, resp.text
+            assert captured["spec"]["command"] == "auth-provide --user_auth=a@b.c --password=pw"
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +564,7 @@ class TestServiceManagement:
             patch("app.main.database.remove_deployment", new_callable=AsyncMock),
             patch("app.main.httpx.AsyncClient", return_value=mock_client),
             patch("app.main.FLEET_API_KEY", "test-key"),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
         ):
             resp = client.delete("/api/services/honeygain")
             assert resp.status_code == 200
@@ -240,6 +596,7 @@ class TestServiceManagement:
             patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
             patch("app.main.httpx.AsyncClient", return_value=mock_client),
             patch("app.main.FLEET_API_KEY", "test-key"),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
         ):
             resp = client.post("/api/stop/honeygain")
             assert resp.status_code == 200
@@ -252,6 +609,7 @@ class TestServiceManagement:
             patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
             patch("app.main.httpx.AsyncClient", return_value=mock_client),
             patch("app.main.FLEET_API_KEY", "test-key"),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
         ):
             resp = client.post("/api/restart/honeygain")
             assert resp.status_code == 200
@@ -265,9 +623,25 @@ class TestServiceManagement:
             patch("app.main.database.remove_deployment", new_callable=AsyncMock),
             patch("app.main.httpx.AsyncClient", return_value=mock_client),
             patch("app.main.FLEET_API_KEY", "test-key"),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
         ):
             resp = client.delete("/api/remove/honeygain")
             assert resp.status_code == 200
+
+    def test_remove_with_delete_volumes(self, client):
+        worker, mock_client = self._setup_proxy()
+        with (
+            _auth_writer(),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=[worker]),
+            patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
+            patch("app.main.database.remove_deployment", new_callable=AsyncMock),
+            patch("app.main.httpx.AsyncClient", return_value=mock_client),
+            patch("app.main.FLEET_API_KEY", "test-key"),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
+        ):
+            resp = client.delete("/api/services/honeygain?delete_volumes=true")
+            assert resp.status_code == 200
+            assert mock_client.delete.call_args.kwargs["params"] == {"delete_volumes": "true"}
 
 
 # ---------------------------------------------------------------------------
@@ -359,10 +733,14 @@ class TestWorkerCommand:
         return worker, mock_client
 
     def test_command_deploy(self, client):
+        # Deploy via the command route is OWNER-gated (matching /api/deploy/{slug}),
+        # so it must not be reachable with a mere writer role — use owner here.
         worker, mock_client = self._setup()
         with (
-            _auth_writer(),
+            _auth_owner(),
             patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
+            patch("app.main.database.save_deployment", new_callable=AsyncMock) as save_dep,
+            patch("app.main.database.record_health_event", new_callable=AsyncMock) as health_evt,
             patch("app.main.httpx.AsyncClient", return_value=mock_client),
             patch("app.main.FLEET_API_KEY", "test-key"),
         ):
@@ -375,12 +753,34 @@ class TestWorkerCommand:
                 },
             )
             assert resp.status_code == 200
+            # The bug fix: a deploy via the command route must record the deployment
+            # (so it starts earning) and a "start" health event — not silently skip both.
+            save_dep.assert_awaited_once()
+            health_evt.assert_awaited()
+
+    def test_command_deploy_writer_denied(self, client):
+        """A writer must NOT be able to deploy via /api/workers/{id}/command — deploy is
+        owner-only, so this route must not become an owner-gate bypass (writer stays
+        allowed for stop/restart/remove, tested separately)."""
+        worker, mock_client = self._setup()
+        with (
+            _auth_writer(),
+            patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
+            patch("app.main.httpx.AsyncClient", return_value=mock_client),
+            patch("app.main.FLEET_API_KEY", "test-key"),
+        ):
+            resp = client.post(
+                "/api/workers/1/command",
+                json={"command": "deploy", "slug": "honeygain", "spec": {"image": "test"}},
+            )
+            assert resp.status_code == 403
 
     def test_command_stop(self, client):
         worker, mock_client = self._setup()
         with (
             _auth_writer(),
             patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock) as health_evt,
             patch("app.main.httpx.AsyncClient", return_value=mock_client),
             patch("app.main.FLEET_API_KEY", "test-key"),
         ):
@@ -392,12 +792,15 @@ class TestWorkerCommand:
                 },
             )
             assert resp.status_code == 200
+            health_evt.assert_awaited_once()
 
     def test_command_remove(self, client):
         worker, mock_client = self._setup()
         with (
             _auth_writer(),
             patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
+            patch("app.main.database.remove_deployment", new_callable=AsyncMock) as rm_dep,
+            patch("app.main.database.record_health_event", new_callable=AsyncMock) as health_evt,
             patch("app.main.httpx.AsyncClient", return_value=mock_client),
             patch("app.main.FLEET_API_KEY", "test-key"),
         ):
@@ -409,6 +812,85 @@ class TestWorkerCommand:
                 },
             )
             assert resp.status_code == 200
+            # A remove via the command route must clean up the deployments row.
+            rm_dep.assert_awaited_once()
+            health_evt.assert_awaited()
+
+    def test_command_restart(self, client):
+        worker, mock_client = self._setup()
+        with (
+            _auth_writer(),
+            patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock) as health_evt,
+            patch("app.main.httpx.AsyncClient", return_value=mock_client),
+            patch("app.main.FLEET_API_KEY", "test-key"),
+        ):
+            resp = client.post(
+                "/api/workers/1/command",
+                json={"command": "restart", "slug": "honeygain"},
+            )
+            assert resp.status_code == 200
+            health_evt.assert_awaited_once()
+
+    def test_command_start(self, client):
+        worker, mock_client = self._setup()
+        with (
+            _auth_writer(),
+            patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock) as health_evt,
+            patch("app.main.httpx.AsyncClient", return_value=mock_client),
+            patch("app.main.FLEET_API_KEY", "test-key"),
+        ):
+            resp = client.post(
+                "/api/workers/1/command",
+                json={"command": "start", "slug": "honeygain"},
+            )
+            assert resp.status_code == 200
+            health_evt.assert_awaited_once()
+
+    def test_command_deploy_refuses_broken_service(self, client):
+        """The raw worker-command route is a THIRD deploy path.
+
+        It proxies straight to the worker and then runs the full bookkeeping, so
+        without the same status gate a broken service would look deployed while
+        earning nothing — the exact drift the shared constant exists to prevent.
+        """
+        worker, mock_client = self._setup()
+        svc = {"slug": "speedshare", "name": "SpeedShare", "status": "broken", "docker": {"image": "x"}}
+        with (
+            _auth_owner(),
+            patch("app.main.catalog.get_service", return_value=svc),
+            patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
+            patch("app.main.httpx.AsyncClient", return_value=mock_client),
+            patch("app.main.FLEET_API_KEY", "test-key"),
+        ):
+            resp = client.post(
+                "/api/workers/1/command",
+                json={"command": "deploy", "slug": "speedshare", "spec": {"image": "x"}},
+            )
+            assert resp.status_code == 409
+        # Refused before the worker was ever contacted.
+        mock_client.post.assert_not_called()
+
+    def test_command_stop_still_allowed_for_broken_service(self, client):
+        # You must still be able to STOP a running service that has since been
+        # marked broken — only deploy is gated.
+        worker, mock_client = self._setup()
+        svc = {"slug": "speedshare", "name": "SpeedShare", "status": "broken", "docker": {"image": "x"}}
+        with (
+            _auth_writer(),
+            patch("app.main.catalog.get_service", return_value=svc),
+            patch("app.main.database.get_worker", new_callable=AsyncMock, return_value=worker),
+            patch("app.main.database.record_health_event", new_callable=AsyncMock),
+            patch("app.main.httpx.AsyncClient", return_value=mock_client),
+            patch("app.main.FLEET_API_KEY", "test-key"),
+        ):
+            resp = client.post("/api/workers/1/command", json={"command": "stop", "slug": "speedshare"})
+            assert resp.status_code == 200
+        # A 200 alone would also pass if the route silently did nothing, so assert
+        # the stop actually reached the worker at the right path.
+        assert mock_client.post.call_count == 1
+        assert mock_client.post.call_args.args[0].endswith("/api/containers/speedshare/stop")
 
     def test_command_unknown(self, client):
         worker, mock_client = self._setup()

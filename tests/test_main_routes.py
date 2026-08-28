@@ -7,8 +7,9 @@ config, users, fleet workers, and compose export.
 import asyncio
 import json
 import os
+import socket
 from contextlib import asynccontextmanager
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("CASHPILOT_API_KEY", "test-fleet-key")
 
@@ -173,12 +174,68 @@ class TestGetAllWorkerContainers:
         assert result[0]["_is_android"] is True
 
     def test_offline_workers_skipped(self):
+        """CashPilot-1xg: this fed a worker with NO containers.
+
+        Removing the `status != "online"` skip therefore still produced [] and
+        the test passed — it asserted nothing about the skip it is named for.
+        The offline worker now HAS a container, so deleting the skip leaks it
+        into the result and the test fails.
+        """
         from app.main import _get_all_worker_containers
 
-        workers = [{"id": 1, "name": "w1", "status": "offline", "system_info": "{}", "containers": "[]", "apps": "[]"}]
+        workers = [
+            {
+                "id": 1,
+                "name": "w1",
+                "status": "offline",
+                "system_info": '{"docker_available": true}',
+                "containers": '[{"slug": "honeygain", "status": "running"}]',
+                "apps": "[]",
+            }
+        ]
         with patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=workers):
             result = asyncio.run(_get_all_worker_containers())
-        assert result == []
+        assert result == [], "an offline worker's containers leaked into the live view"
+
+    def test_online_workers_are_included(self):
+        """The control: without it the test above passes if NOTHING is returned."""
+        from app.main import _get_all_worker_containers
+
+        workers = [
+            {
+                "id": 1,
+                "name": "w1",
+                "status": "online",
+                "system_info": '{"docker_available": true}',
+                "containers": '[{"slug": "honeygain", "status": "running"}]',
+                "apps": "[]",
+            }
+        ]
+        with patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=workers):
+            result = asyncio.run(_get_all_worker_containers())
+        assert [c["slug"] for c in result] == ["honeygain"]
+
+    def test_a_container_with_no_status_reads_as_unknown(self):
+        """CashPilot-1xg, second half: no test supplied a container without a status.
+
+        `c.get("status", "unknown")` is the rule that stops an unreadable
+        container from rendering as running, and nothing exercised the default.
+        """
+        from app.main import _get_all_worker_containers
+
+        workers = [
+            {
+                "id": 1,
+                "name": "w1",
+                "status": "online",
+                "system_info": '{"docker_available": true}',
+                "containers": '[{"slug": "honeygain"}]',
+                "apps": "[]",
+            }
+        ]
+        with patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=workers):
+            result = asyncio.run(_get_all_worker_containers())
+        assert result[0]["status"] == "unknown", "a container with no status must not read as running"
 
 
 # ---------------------------------------------------------------------------
@@ -187,14 +244,14 @@ class TestGetAllWorkerContainers:
 
 
 class TestLoginRoute:
-    def test_login_page_redirects_to_register_if_no_users(self, client):
+    def test_login_page_redirects_to_onboarding_if_no_users(self, client):
         with (
             _no_auth(),
             patch("app.main.database.has_any_users", new_callable=AsyncMock, return_value=False),
         ):
             resp = client.get("/login", follow_redirects=False)
             assert resp.status_code == 303
-            assert "/register" in resp.headers["location"]
+            assert "/onboarding" in resp.headers["location"]
 
     def test_login_page_redirects_to_home_if_logged_in(self, client):
         with (
@@ -219,7 +276,7 @@ class TestLoginRoute:
             patch("app.main.database.get_user_by_username", new_callable=AsyncMock, return_value=user),
             patch("app.main.auth.verify_password", return_value=True),
             patch("app.main.auth.create_session_token", return_value="tok"),
-            patch("app.main.auth.set_session_cookie", side_effect=lambda r, t: r),
+            patch("app.main.auth.set_session_cookie", side_effect=lambda r, t, req=None: r),
         ):
             resp = client.post("/login", data={"username": "admin", "password": "pass"}, follow_redirects=False)
             assert resp.status_code == 303
@@ -262,9 +319,10 @@ class TestRegisterRoute:
             patch("app.main.database.has_any_users", new_callable=AsyncMock, return_value=False),
             patch("app.main.database.get_user_by_username", new_callable=AsyncMock, return_value=None),
             patch("app.main.auth.hash_password", return_value="hashed"),
-            patch("app.main.database.create_user", new_callable=AsyncMock, return_value=1),
+            patch("app.main.database.create_first_owner", new_callable=AsyncMock, return_value=1),
+            patch("app.main.database.delete_config_keys", new_callable=AsyncMock),
             patch("app.main.auth.create_session_token", return_value="tok"),
-            patch("app.main.auth.set_session_cookie", side_effect=lambda r, t: r),
+            patch("app.main.auth.set_session_cookie", side_effect=lambda r, t, req=None: r),
         ):
             resp = client.post(
                 "/register",
@@ -276,6 +334,55 @@ class TestRegisterRoute:
                 follow_redirects=False,
             )
             assert resp.status_code == 303
+
+    def test_register_first_user_requires_setup_token(self, client):
+        # When a first-run setup token is active, registering without it is refused
+        # (the proxy-independent gate against a public visitor seizing the owner).
+        from app import setup_token
+
+        setup_token.set_active("the-token")
+        with (
+            _no_auth(),
+            patch("app.main.database.has_any_users", new_callable=AsyncMock, return_value=False),
+        ):
+            resp = client.post(
+                "/register",
+                data={
+                    "username": "admin",
+                    "password": "password123",
+                    "password_confirm": "password123",
+                },
+                follow_redirects=False,
+            )
+            assert resp.status_code == 403
+
+    def test_register_first_user_with_setup_token_clears_it(self, client):
+        from app import setup_token
+
+        setup_token.set_active("the-token")
+        with (
+            _no_auth(),
+            patch("app.main.database.has_any_users", new_callable=AsyncMock, return_value=False),
+            patch("app.main.database.get_user_by_username", new_callable=AsyncMock, return_value=None),
+            patch("app.main.auth.hash_password", return_value="hashed"),
+            patch("app.main.database.create_first_owner", new_callable=AsyncMock, return_value=1),
+            patch("app.main.database.delete_config_keys", new_callable=AsyncMock) as del_keys,
+            patch("app.main.auth.create_session_token", return_value="tok"),
+            patch("app.main.auth.set_session_cookie", side_effect=lambda r, t, req=None: r),
+        ):
+            resp = client.post(
+                "/register",
+                data={
+                    "username": "admin",
+                    "password": "password123",
+                    "password_confirm": "password123",
+                    "setup_token": "the-token",
+                },
+                follow_redirects=False,
+            )
+            assert resp.status_code == 303
+            del_keys.assert_awaited_once_with(["_setup_token"])
+            assert setup_token.active() is None
 
     def test_register_password_mismatch(self, client):
         with (
@@ -374,7 +481,7 @@ class TestPageRoutes:
         ):
             resp = client.get("/", follow_redirects=False)
             assert resp.status_code == 303
-            assert "/register" in resp.headers["location"]
+            assert "/onboarding" in resp.headers["location"]
 
     def test_dashboard_not_logged_in_has_users(self, client):
         with (
@@ -435,15 +542,22 @@ class TestPageRoutes:
             resp = client.get("/fleet", follow_redirects=False)
             assert resp.status_code == 303
 
-    def test_onboarding_page(self, client):
-        with _auth_owner():
+    def test_onboarding_page_no_users(self, client):
+        with (
+            _no_auth(),
+            patch("app.main.database.has_any_users", new_callable=AsyncMock, return_value=False),
+        ):
             resp = client.get("/onboarding")
             assert resp.status_code == 200
 
-    def test_onboarding_no_auth(self, client):
-        with _no_auth():
+    def test_onboarding_redirects_when_users_exist(self, client):
+        with (
+            _no_auth(),
+            patch("app.main.database.has_any_users", new_callable=AsyncMock, return_value=True),
+        ):
             resp = client.get("/onboarding", follow_redirects=False)
             assert resp.status_code == 303
+            assert "/login" in resp.headers["location"]
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +599,25 @@ class TestApiServices:
             resp = client.get("/api/services/hg")
             assert resp.status_code == 200
             assert resp.json()["slug"] == "hg"
+
+    def test_api_get_service_has_collector_flag(self, client):
+        # honeygain has a collector; a service without one reports False.
+        hg = {"slug": "honeygain", "name": "Honeygain", "docker": {"image": "test"}}
+        with (
+            _auth_owner(),
+            patch("app.main.catalog.get_service", return_value=hg),
+            patch("app.main.database.get_deployments", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=[]),
+        ):
+            assert client.get("/api/services/honeygain").json()["has_collector"] is True
+        nocol = {"slug": "nodle", "name": "Nodle", "docker": {"image": "test"}}
+        with (
+            _auth_owner(),
+            patch("app.main.catalog.get_service", return_value=nocol),
+            patch("app.main.database.get_deployments", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=[]),
+        ):
+            assert client.get("/api/services/nodle").json()["has_collector"] is False
 
     def test_api_get_service_not_found(self, client):
         with (
@@ -558,6 +691,153 @@ class TestApiServices:
             data = resp.json()
             assert len(data) == 1
             assert data[0]["container_status"] == "external"
+
+    def test_deployed_collector_needs_setup_when_creds_missing(self, client):
+        # Repocket deployed + earning, but its collector email/password are unset
+        # → needs_setup True, disconnected False.
+        workers = [
+            {
+                "id": 1,
+                "name": "w1",
+                "status": "online",
+                "system_info": json.dumps({"docker_available": True}),
+                "containers": json.dumps([{"slug": "repocket", "name": "rp", "status": "running"}]),
+                "apps": "[]",
+            }
+        ]
+        with (
+            _auth_owner(),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=workers),
+            patch("app.main.database.get_earnings_summary", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_health_scores", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_deployments", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_config", new_callable=AsyncMock, return_value={}),
+            patch("app.main.catalog.get_service", return_value={"name": "Repocket", "category": "bandwidth"}),
+        ):
+            resp = client.get("/api/services/deployed")
+            assert resp.status_code == 200
+            row = next(r for r in resp.json() if r["slug"] == "repocket")
+            assert row["collector_needs_setup"] is True
+            assert row["collector_disconnected"] is False
+
+    def test_deployed_collector_not_needs_setup_when_creds_present(self, client):
+        workers = [
+            {
+                "id": 1,
+                "name": "w1",
+                "status": "online",
+                "system_info": json.dumps({"docker_available": True}),
+                "containers": json.dumps([{"slug": "repocket", "name": "rp", "status": "running"}]),
+                "apps": "[]",
+            }
+        ]
+        cfg = {"repocket_email": "me@example.com", "repocket_password": "secret"}
+        with (
+            _auth_owner(),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=workers),
+            patch("app.main.database.get_earnings_summary", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_health_scores", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_deployments", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_config", new_callable=AsyncMock, return_value=cfg),
+            patch("app.main.catalog.get_service", return_value={"name": "Repocket", "category": "bandwidth"}),
+        ):
+            resp = client.get("/api/services/deployed")
+            row = next(r for r in resp.json() if r["slug"] == "repocket")
+            assert row["collector_needs_setup"] is False
+
+    def test_deployed_row_flags_unstable_on_repeated_crashes(self, client):
+        """A service with >=3 crashes in the health window is flagged unstable so the
+        dashboard can surface a crash-looping earner at a glance."""
+        workers = [
+            {
+                "id": 1,
+                "name": "w1",
+                "status": "online",
+                "system_info": json.dumps({"docker_available": True}),
+                "containers": json.dumps([{"slug": "repocket", "name": "rp", "status": "running"}]),
+                "apps": "[]",
+            }
+        ]
+        scores = [{"slug": "repocket", "score": 30, "uptime_pct": 40, "restarts": 5, "crashes": 4}]
+        with (
+            _auth_owner(),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=workers),
+            patch("app.main.database.get_earnings_summary", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_health_scores", new_callable=AsyncMock, return_value=scores),
+            patch("app.main.database.get_deployments", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_config", new_callable=AsyncMock, return_value={}),
+            patch("app.main.catalog.get_service", return_value={"name": "Repocket", "category": "bandwidth"}),
+        ):
+            resp = client.get("/api/services/deployed")
+            assert resp.status_code == 200
+            row = next(r for r in resp.json() if r["slug"] == "repocket")
+            assert row["unstable"] is True
+            assert row["crashes_7d"] == 4
+
+    def test_deployed_row_not_unstable_below_threshold(self, client):
+        """Fewer than 3 crashes is not flagged unstable (crashes_7d is still surfaced)."""
+        workers = [
+            {
+                "id": 1,
+                "name": "w1",
+                "status": "online",
+                "system_info": json.dumps({"docker_available": True}),
+                "containers": json.dumps([{"slug": "repocket", "name": "rp", "status": "running"}]),
+                "apps": "[]",
+            }
+        ]
+        scores = [{"slug": "repocket", "score": 85, "uptime_pct": 98, "restarts": 1, "crashes": 2}]
+        with (
+            _auth_owner(),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=workers),
+            patch("app.main.database.get_earnings_summary", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_health_scores", new_callable=AsyncMock, return_value=scores),
+            patch("app.main.database.get_deployments", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_config", new_callable=AsyncMock, return_value={}),
+            patch("app.main.catalog.get_service", return_value={"name": "Repocket", "category": "bandwidth"}),
+        ):
+            resp = client.get("/api/services/deployed")
+            row = next(r for r in resp.json() if r["slug"] == "repocket")
+            assert row["unstable"] is False
+            assert row["crashes_7d"] == 2
+
+    def test_deployed_disconnected_takes_precedence_over_needs_setup(self, client):
+        # When the collector has actually errored, show the error state, not "needs setup".
+        workers = [
+            {
+                "id": 1,
+                "name": "w1",
+                "status": "online",
+                "system_info": json.dumps({"docker_available": True}),
+                "containers": json.dumps([{"slug": "repocket", "name": "rp", "status": "running"}]),
+                "apps": "[]",
+            }
+        ]
+        with (
+            _auth_owner(),
+            patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=workers),
+            patch("app.main.database.get_earnings_summary", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_health_scores", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_deployments", new_callable=AsyncMock, return_value=[]),
+            patch("app.main.database.get_config", new_callable=AsyncMock, return_value={}),
+            patch("app.main._collector_alerts", [{"platform": "repocket", "error": "auth failed"}]),
+            patch("app.main.catalog.get_service", return_value={"name": "Repocket", "category": "bandwidth"}),
+        ):
+            resp = client.get("/api/services/deployed")
+            row = next(r for r in resp.json() if r["slug"] == "repocket")
+            assert row["collector_disconnected"] is True
+            assert row["collector_needs_setup"] is False
+
+    def test_collector_needs_setup_helper(self):
+        # Service with no collector → never needs setup.
+        from app.main import _collector_needs_setup
+
+        assert _collector_needs_setup("not-a-service", {}) is False
+        # Optional-only collector (storj: ?api_url) → not "needs setup" when blank.
+        assert _collector_needs_setup("storj", {}) is False
+        # Required creds absent → needs setup; present → not.
+        assert _collector_needs_setup("repocket", {}) is True
+        assert _collector_needs_setup("repocket", {"repocket_email": "a", "repocket_password": "b"}) is False
 
 
 # ---------------------------------------------------------------------------
@@ -728,26 +1008,44 @@ class TestApiCompose:
 
 class TestApiConfig:
     def test_api_get_config(self, client):
+        masked = {"honeygain_email": "a@b.com", "_secrets": {"honeygain_password": True}}
         with (
             _auth_owner(),
-            patch("app.main.database.get_config", new_callable=AsyncMock, return_value={"k": "v"}),
+            patch("app.main.database.get_config_masked", new_callable=AsyncMock, return_value=masked),
         ):
             resp = client.get("/api/config")
             assert resp.status_code == 200
-            assert resp.json() == {"k": "v"}
+            assert resp.json() == masked
 
-    def test_api_get_config_non_dict(self, client):
+    def test_api_get_config_masks_secrets(self, client):
+        """Secret keys must be absent at top level and only present (as bool) in _secrets."""
+        masked = {
+            "honeygain_email": "a@b.com",
+            "_secrets": {"honeygain_password": True, "grass_access_token": False},
+        }
         with (
             _auth_owner(),
-            patch("app.main.database.get_config", new_callable=AsyncMock, return_value=None),
+            patch("app.main.database.get_config_masked", new_callable=AsyncMock, return_value=masked),
         ):
             resp = client.get("/api/config")
-            assert resp.json() == {}
+            assert resp.status_code == 200
+            data = resp.json()
+            # Non-secret value present at top level
+            assert data["honeygain_email"] == "a@b.com"
+            # Secret values absent from top level
+            assert "honeygain_password" not in data
+            assert "grass_access_token" not in data
+            # Presence reported as bool under _secrets
+            assert data["_secrets"]["honeygain_password"] is True
+            assert data["_secrets"]["grass_access_token"] is False
 
     def test_api_set_config(self, client):
         with (
             _auth_owner(),
             patch("app.main.database.set_config_bulk", new_callable=AsyncMock),
+            # Completeness is judged against the MERGED config, so the endpoint
+            # reads it back after writing.
+            patch("app.main.database.get_config", new_callable=AsyncMock, return_value={}),
             patch("app.main.catalog.get_service", return_value=None),
         ):
             resp = client.post("/api/config", json={"data": {"key": "value"}})
@@ -759,6 +1057,11 @@ class TestApiConfig:
         with (
             _auth_owner(),
             patch("app.main.database.set_config_bulk", new_callable=AsyncMock),
+            patch(
+                "app.main.database.get_config",
+                new_callable=AsyncMock,
+                return_value={"grass_access_token": "tok"},
+            ),
             patch("app.main.catalog.get_service", return_value=svc),
             patch("app.main.database.get_deployment", new_callable=AsyncMock, return_value=None),
             patch("app.main.database.save_deployment", new_callable=AsyncMock) as mock_save,
@@ -773,6 +1076,7 @@ class TestApiConfig:
             _auth_owner(),
             patch("app.main.database.delete_config_keys", new_callable=AsyncMock),
             patch("app.main.catalog.get_service", return_value=svc),
+            patch("app.main.database.get_deployment", new_callable=AsyncMock, return_value=None),
             patch("app.main.database.remove_deployment", new_callable=AsyncMock),
         ):
             resp = client.delete("/api/config/grass")
@@ -806,6 +1110,7 @@ class TestApiUsers:
             _auth_owner(),
             patch("app.main.database.get_user_by_id", new_callable=AsyncMock, return_value=user),
             patch("app.main.database.update_user_role", new_callable=AsyncMock),
+            patch("app.main.database.revoke_user_sessions", new_callable=AsyncMock),
         ):
             resp = client.patch("/api/users/2", json={"role": "writer"})
             assert resp.status_code == 200
@@ -849,6 +1154,7 @@ class TestApiUsers:
             _auth_owner(),
             patch("app.main.database.get_user_by_id", new_callable=AsyncMock, return_value=user),
             patch("app.main.database.delete_user", new_callable=AsyncMock),
+            patch("app.main.database.revoke_user_sessions", new_callable=AsyncMock),
         ):
             resp = client.delete("/api/users/2")
             assert resp.status_code == 200
@@ -865,6 +1171,181 @@ class TestApiUsers:
         ):
             resp = client.delete("/api/users/99")
             assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# API: Change own password (H4)
+# ---------------------------------------------------------------------------
+
+
+class TestChangeOwnPassword:
+    def test_change_own_password_ok(self, client):
+        record = {
+            "id": 1,
+            "username": "admin",
+            "password": "x-mock-hash",
+            "role": "owner",
+            "password_changed_at": 123.0,
+        }
+        with (
+            _auth_owner(),
+            patch("app.main.database.get_user_by_id", new_callable=AsyncMock, return_value=record),
+            patch("app.main.auth.verify_password", return_value=True),
+            patch("app.main.auth.hash_password", return_value="hashed-new"),
+            patch("app.main.database.update_user_password", new_callable=AsyncMock) as mock_upd,
+            patch("app.main.auth.set_user_pwd_epoch") as mock_epoch,
+            patch("app.main.auth.create_session_token", return_value="tok"),
+            patch("app.main.auth.set_session_cookie", side_effect=lambda r, t, req=None: r),
+        ):
+            resp = client.post(
+                "/api/users/me/password",
+                json={"current_password": "oldpassword1", "new_password": "newpassword123"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "password_changed"
+            mock_upd.assert_called_once_with(1, "hashed-new")
+            mock_epoch.assert_called_once_with(1, 123.0)
+
+    def test_change_own_password_remints_cookie(self, client):
+        # The caller must NOT be logged out by their own password change: the
+        # route re-mints the session cookie with a fresh token (iat > new epoch).
+        record = {
+            "id": 1,
+            "username": "admin",
+            "password": "x-mock-hash",
+            "role": "owner",
+            "password_changed_at": 123.0,
+        }
+        with (
+            _auth_owner(),
+            patch("app.main.database.get_user_by_id", new_callable=AsyncMock, return_value=record),
+            patch("app.main.auth.verify_password", return_value=True),
+            patch("app.main.auth.hash_password", return_value="hashed-new"),
+            patch("app.main.database.update_user_password", new_callable=AsyncMock),
+            patch("app.main.auth.set_user_pwd_epoch"),
+            patch("app.main.auth.create_session_token", return_value="fresh-tok") as mock_tok,
+            patch("app.main.auth.set_session_cookie", side_effect=lambda r, t, req=None: r) as mock_cookie,
+        ):
+            resp = client.post(
+                "/api/users/me/password",
+                json={"current_password": "oldpassword1", "new_password": "newpassword123"},
+            )
+            assert resp.status_code == 200
+            mock_tok.assert_called_once_with(1, "admin", "owner")
+            # set_session_cookie must be called with the freshly-minted token.
+            assert mock_cookie.call_args[0][1] == "fresh-tok"
+
+    def test_change_own_password_user_vanished(self, client):
+        # Authenticated session but the user row is gone → 404, no crash.
+        with (
+            _auth_owner(),
+            patch("app.main.database.get_user_by_id", new_callable=AsyncMock, return_value=None),
+        ):
+            resp = client.post(
+                "/api/users/me/password",
+                json={"current_password": "oldpassword1", "new_password": "newpassword123"},
+            )
+            assert resp.status_code == 404
+
+    def test_change_own_password_wrong_current(self, client):
+        record = {"id": 1, "username": "admin", "password": "x-mock-hash", "role": "owner"}
+        with (
+            _auth_owner(),
+            patch("app.main.database.get_user_by_id", new_callable=AsyncMock, return_value=record),
+            patch("app.main.auth.verify_password", return_value=False),
+        ):
+            resp = client.post(
+                "/api/users/me/password",
+                json={"current_password": "wrong", "new_password": "newpassword123"},
+            )
+            assert resp.status_code == 403
+
+    def test_change_own_password_too_short(self, client):
+        record = {"id": 1, "username": "admin", "password": "x-mock-hash", "role": "owner"}
+        with (
+            _auth_owner(),
+            patch("app.main.database.get_user_by_id", new_callable=AsyncMock, return_value=record),
+            patch("app.main.auth.verify_password", return_value=True),
+        ):
+            resp = client.post(
+                "/api/users/me/password",
+                json={"current_password": "oldpassword1", "new_password": "short"},
+            )
+            assert resp.status_code == 400
+
+    def test_change_own_password_same_as_old(self, client):
+        record = {"id": 1, "username": "admin", "password": "x-mock-hash", "role": "owner"}
+        with (
+            _auth_owner(),
+            patch("app.main.database.get_user_by_id", new_callable=AsyncMock, return_value=record),
+            patch("app.main.auth.verify_password", return_value=True),
+        ):
+            resp = client.post(
+                "/api/users/me/password",
+                json={"current_password": "samepassword1", "new_password": "samepassword1"},
+            )
+            assert resp.status_code == 400
+
+    def test_change_own_password_uid0_rejected(self, client):
+        """API-key sessions (uid=0) cannot change a password."""
+        with patch("app.main.auth.get_current_user", return_value={"uid": 0, "u": "api", "r": "owner"}):
+            resp = client.post(
+                "/api/users/me/password",
+                json={"current_password": "x", "new_password": "newpassword123"},
+            )
+            assert resp.status_code == 400
+
+    def test_change_own_password_unauthenticated(self, client):
+        with _no_auth():
+            resp = client.post(
+                "/api/users/me/password",
+                json={"current_password": "x", "new_password": "newpassword123"},
+            )
+            assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# API: Admin reset password (H4)
+# ---------------------------------------------------------------------------
+
+
+class TestAdminResetPassword:
+    def test_admin_reset_password_owner_ok(self, client):
+        target = {"id": 2, "username": "bob", "password": "hashed", "role": "viewer", "password_changed_at": 456.0}
+        with (
+            _auth_owner(),
+            patch("app.main.database.get_user_by_id", new_callable=AsyncMock, return_value=target),
+            patch("app.main.auth.hash_password", return_value="hashed-new"),
+            patch("app.main.database.update_user_password", new_callable=AsyncMock) as mock_upd,
+            patch("app.main.auth.set_user_pwd_epoch") as mock_epoch,
+        ):
+            resp = client.post("/api/users/2/password", json={"new_password": "newpassword123"})
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "password_set"
+            mock_upd.assert_called_once_with(2, "hashed-new")
+            mock_epoch.assert_called_once_with(2, 456.0)
+
+    def test_admin_reset_password_non_owner_403(self, client):
+        with _auth_writer():
+            resp = client.post("/api/users/2/password", json={"new_password": "newpassword123"})
+            assert resp.status_code == 403
+
+    def test_admin_reset_password_user_not_found_404(self, client):
+        with (
+            _auth_owner(),
+            patch("app.main.database.get_user_by_id", new_callable=AsyncMock, return_value=None),
+        ):
+            resp = client.post("/api/users/99/password", json={"new_password": "newpassword123"})
+            assert resp.status_code == 404
+
+    def test_admin_reset_password_too_short(self, client):
+        target = {"id": 2, "username": "bob", "password": "hashed", "role": "viewer"}
+        with (
+            _auth_owner(),
+            patch("app.main.database.get_user_by_id", new_callable=AsyncMock, return_value=target),
+        ):
+            resp = client.post("/api/users/2/password", json={"new_password": "short"})
+            assert resp.status_code == 400
 
 
 # ---------------------------------------------------------------------------
@@ -927,6 +1408,41 @@ class TestApiEnvInfo:
             resp = client.get("/api/env-info")
             assert resp.status_code == 403
 
+    def test_api_env_info_no_secret_value(self, client):
+        """Secret rows must drop 'value' and expose 'is_set' instead."""
+        with (
+            _auth_owner(),
+            patch.dict(os.environ, {"CASHPILOT_API_KEY": "test-placeholder-value"}, clear=False),
+        ):
+            resp = client.get("/api/env-info")
+            assert resp.status_code == 200
+            rows = {e["key"]: e for e in resp.json()}
+            fleet = rows["CASHPILOT_API_KEY"]
+            assert fleet["secret"] is True
+            assert "value" not in fleet
+            assert fleet["is_set"] is True
+            # Non-secret rows keep their real value
+            prefix = rows["CASHPILOT_HOSTNAME_PREFIX"]
+            assert "value" in prefix
+            assert "is_set" not in prefix
+
+    def test_env_info_secret_key_never_leaks(self, client):
+        """CASHPILOT_SECRET_KEY must never return a value; is_set + read_only true."""
+        sentinel = "test-placeholder-value"
+        with (
+            _auth_owner(),
+            patch.dict(os.environ, {"CASHPILOT_SECRET_KEY": sentinel}, clear=False),
+        ):
+            resp = client.get("/api/env-info")
+            assert resp.status_code == 200
+            rows = {e["key"]: e for e in resp.json()}
+            sk = rows["CASHPILOT_SECRET_KEY"]
+            assert "value" not in sk
+            assert sk["is_set"] is True
+            assert sk["read_only"] is True
+            # The plaintext must not appear anywhere in the response body
+            assert sentinel not in resp.text
+
 
 # ---------------------------------------------------------------------------
 # API: Fleet / Workers
@@ -934,9 +1450,12 @@ class TestApiEnvInfo:
 
 
 class TestApiFleet:
-    def test_api_worker_heartbeat(self, client):
+    def test_api_worker_heartbeat_enrollment_issues_key(self, client):
+        # A brand-new worker authenticates with the shared key and is issued its own.
         with (
             patch("app.main.FLEET_API_KEY", "test-fleet-key"),
+            patch("app.main.database.get_worker_key_state", new_callable=AsyncMock, return_value=(None, False)),
+            patch("app.main.database.set_worker_key", new_callable=AsyncMock) as set_key,
             patch("app.main.database.upsert_worker", new_callable=AsyncMock, return_value=1),
         ):
             resp = client.post(
@@ -945,10 +1464,47 @@ class TestApiFleet:
                 headers={"Authorization": "Bearer test-fleet-key"},
             )
             assert resp.status_code == 200
-            assert resp.json()["worker_id"] == 1
+            body = resp.json()
+            assert body["worker_id"] == 1
+            assert body.get("worker_key")  # a per-worker key was issued
+            set_key.assert_awaited_once()  # it was persisted (encrypted)
 
-    def test_api_worker_heartbeat_bad_key(self, client):
-        with patch("app.main.FLEET_API_KEY", "test-fleet-key"):
+    def test_api_worker_heartbeat_reissues_until_confirmed(self, client):
+        from datetime import UTC, datetime
+
+        # Enrolled but unconfirmed (worker missed the enrollment response): the
+        # shared key is still accepted and the SAME key is re-delivered, so a
+        # dropped response can't permanently lock the worker out.
+        with (
+            patch("app.main.FLEET_API_KEY", "test-fleet-key"),
+            patch(
+                "app.main.database.get_worker_key_state",
+                new_callable=AsyncMock,
+                return_value=("existing-key", False),
+            ),
+            patch("app.main.database.get_worker_key", new_callable=AsyncMock, return_value="existing-key"),
+            # Minted just now, so the reissue window is open. Without this the
+            # guard reads the real database (CashPilot-cvr).
+            patch(
+                "app.main.database.get_worker_key_issued_at",
+                new_callable=AsyncMock,
+                return_value=datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+            patch("app.main.database.upsert_worker", new_callable=AsyncMock, return_value=1),
+        ):
+            resp = client.post(
+                "/api/workers/heartbeat",
+                json={"name": "w", "client_id": "c1"},
+                headers={"Authorization": "Bearer test-fleet-key"},
+            )
+            assert resp.status_code == 200
+            assert resp.json().get("worker_key") == "existing-key"  # re-delivered
+
+    def test_api_worker_heartbeat_unenrolled_bad_key(self, client):
+        with (
+            patch("app.main.FLEET_API_KEY", "test-fleet-key"),
+            patch("app.main.database.get_worker_key_state", new_callable=AsyncMock, return_value=(None, False)),
+        ):
             resp = client.post(
                 "/api/workers/heartbeat",
                 json={"name": "worker-1"},
@@ -964,14 +1520,48 @@ class TestApiFleet:
             )
             assert resp.status_code == 503
 
+    def test_api_worker_heartbeat_confirmed_rejects_shared_key(self, client):
+        # The finalized cutover: a CONFIRMED worker must use its own key; the shared
+        # key is rejected, its own key is accepted, and no new key is re-issued.
+        own_key = "the-worker-key"
+        with (
+            patch("app.main.FLEET_API_KEY", "test-fleet-key"),
+            patch(
+                "app.main.database.get_worker_key_state",
+                new_callable=AsyncMock,
+                return_value=(own_key, True),
+            ),
+            patch("app.main.database.confirm_worker_key", new_callable=AsyncMock),
+            patch("app.main.database.upsert_worker", new_callable=AsyncMock, return_value=1),
+        ):
+            shared = client.post(
+                "/api/workers/heartbeat",
+                json={"name": "w", "client_id": "c1"},
+                headers={"Authorization": "Bearer test-fleet-key"},
+            )
+            assert shared.status_code == 401  # shared key no longer works once confirmed
+
+            own = client.post(
+                "/api/workers/heartbeat",
+                json={"name": "w", "client_id": "c1"},
+                headers={"Authorization": f"Bearer {own_key}"},
+            )
+            assert own.status_code == 200
+            assert "worker_key" not in own.json()
+
     def test_api_list_workers(self, client):
         workers = [{"id": 1, "name": "w1", "status": "online", "containers": "[]", "apps": "[]", "system_info": "{}"}]
         with (
             _auth_owner(),
             patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=workers),
+            # The endpoint reads config for the per-machine power settings the
+            # running-costs card shows (CashPilot-jm6).
+            patch("app.main.database.get_config", new_callable=AsyncMock, return_value={}),
         ):
             resp = client.get("/api/workers")
             assert resp.status_code == 200
+            body = resp.json()
+            assert "watts" in body[0] and "dedicated" in body[0]
 
     def test_api_get_worker(self, client):
         worker = {"id": 1, "name": "w1", "status": "online", "containers": "[]", "apps": "[]", "system_info": "{}"}
@@ -1023,18 +1613,37 @@ class TestApiFleet:
             assert data["total_workers"] == 2
             assert data["online_workers"] == 1
 
-    def test_api_fleet_api_key(self, client):
+    def test_fleet_api_key_status_only(self, client):
+        """GET returns presence only — never the key value."""
         with (
             _auth_owner(),
             patch("app.main.FLEET_API_KEY", "test-key"),
         ):
             resp = client.get("/api/fleet/api-key")
             assert resp.status_code == 200
-            assert resp.json()["api_key"] == "test-key"
+            data = resp.json()
+            assert data["is_set"] is True
+            assert "api_key" not in data
+            assert "source" in data
 
     def test_api_fleet_api_key_non_owner(self, client):
         with _auth_viewer():
             resp = client.get("/api/fleet/api-key")
+            assert resp.status_code == 403
+
+    def test_fleet_api_key_reveal_owner(self, client):
+        """POST reveal returns the actual key for an owner."""
+        with (
+            _auth_owner(),
+            patch("app.main.FLEET_API_KEY", "test-key"),
+        ):
+            resp = client.post("/api/fleet/api-key/reveal")
+            assert resp.status_code == 200
+            assert resp.json()["api_key"] == "test-key"
+
+    def test_fleet_reveal_non_owner_403(self, client):
+        with _auth_viewer():
+            resp = client.post("/api/fleet/api-key/reveal")
             assert resp.status_code == 403
 
 
@@ -1047,12 +1656,15 @@ class TestValidateWorkerUrl:
     def test_valid_url(self):
         from app.main import _validate_worker_url
 
-        assert _validate_worker_url("http://192.168.1.10:8081") == "http://192.168.1.10:8081"
+        # Literal IP -> no pinning needed (httpx won't re-resolve).
+        assert _validate_worker_url("http://192.168.1.10:8081") == ("http://192.168.1.10:8081", None)
 
     def test_trailing_slash_stripped(self):
         from app.main import _validate_worker_url
 
-        assert _validate_worker_url("http://host:8081/") == "http://host:8081"
+        # Patch DNS so the test is deterministic and never hits the real resolver.
+        with patch("app.worker_proxy.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("192.168.1.9", 8081))]):
+            assert _validate_worker_url("http://host:8081/")[0] == "http://host:8081"
 
     def test_invalid_scheme(self):
         from app.main import _validate_worker_url
@@ -1081,8 +1693,178 @@ class TestValidateWorkerUrl:
     def test_tailscale_dns_allowed(self):
         from app.main import _validate_worker_url
 
-        result = _validate_worker_url("http://worker.mango.ts.net:8081")
-        assert "worker.mango.ts.net" in result
+        # Exact-match (not substring) so CodeQL's url-substring-sanitization rule
+        # isn't tripped by a test assertion. Patch DNS to a Tailscale CGNAT IP so the
+        # test is deterministic and never hits the real resolver.
+        with patch("app.worker_proxy.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("100.100.100.100", 8081))]):
+            result = _validate_worker_url("http://worker.mango.ts.net:8081")
+        assert result[0] == "http://worker.mango.ts.net:8081"
+
+    def test_tailscale_cgnat_ip_allowed(self):
+        # 100.64.0.0/10 is neither private nor public in Python's ipaddress;
+        # permissive default must still allow Tailscale literal IPs.
+        from app.main import _validate_worker_url
+
+        assert _validate_worker_url("http://100.100.100.100:8081") == ("http://100.100.100.100:8081", None)
+
+    def test_rfc1918_lan_allowed(self):
+        from app.main import _validate_worker_url
+
+        assert _validate_worker_url("http://192.168.10.50:8081") == ("http://192.168.10.50:8081", None)
+
+    def test_metadata_ipv4_blocked(self):
+        from app.main import _validate_worker_url
+
+        with pytest.raises(Exception, match="metadata"):
+            _validate_worker_url("http://169.254.169.254/latest/meta-data/")
+
+    def test_metadata_ipv6_blocked(self):
+        from app.main import _validate_worker_url
+
+        with pytest.raises(Exception, match="metadata"):
+            _validate_worker_url("http://[fd00:ec2::254]:80/")
+
+    def test_ipv6_loopback_blocked(self):
+        from app.main import _validate_worker_url
+
+        with pytest.raises(Exception, match="loopback"):
+            _validate_worker_url("http://[::1]:8081")
+
+    def test_ipv4_mapped_loopback_blocked(self):
+        from app.main import _validate_worker_url
+
+        with pytest.raises(Exception, match="loopback"):
+            _validate_worker_url("http://[::ffff:127.0.0.1]:8081")
+
+    def test_dns_rebind_to_metadata_blocked(self):
+        # A hostname that resolves to the metadata IP must be rejected even in
+        # permissive mode (DNS-rebinding guard).
+        from app.main import _validate_worker_url
+
+        with (
+            patch(
+                "app.worker_proxy.socket.getaddrinfo",
+                return_value=[(2, 1, 6, "", ("169.254.169.254", 80))],
+            ),
+            pytest.raises(Exception, match="metadata"),
+        ):
+            _validate_worker_url("http://evil.example.com")
+
+    def test_hostname_returns_validated_ip_to_pin(self):
+        # A resolvable hostname returns the checked IP so the caller connects to it
+        # directly, defeating a rebinding flip between validation and the request.
+        from app.main import _validate_worker_url
+
+        with patch("app.worker_proxy.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("192.168.20.7", 8081))]):
+            assert _validate_worker_url("http://wk.example:8081") == ("http://wk.example:8081", "192.168.20.7")
+
+    def test_pin_url_to_ip_rewrites_host_keeps_host_header(self):
+        from app.main import _pin_url_to_ip
+
+        assert _pin_url_to_ip("http://wk.example:8081/x", "192.168.20.7") == (
+            "http://192.168.20.7:8081/x",
+            "wk.example:8081",
+        )
+        # IPv6 pins are bracketed in the URL.
+        url, host = _pin_url_to_ip("http://wk.example:8081", "fd00::5")
+        assert url == "http://[fd00::5]:8081"
+        assert host == "wk.example:8081"
+
+    def test_get_verified_worker_url_pins_ip_and_sets_host_header(self):
+        # End-to-end: the URL handed to httpx uses the validated IP (so httpx never
+        # re-resolves the name) and the original host is preserved in the Host header.
+        import asyncio
+
+        import app.main as main
+
+        worker = {"status": "online", "url": "http://wk.example:8081", "client_id": ""}
+        with (
+            patch("app.worker_proxy.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("192.168.30.9", 8081))]),
+            patch("app.main.database.get_worker_key", new_callable=AsyncMock, return_value=None),
+        ):
+            url, headers = asyncio.run(main._get_verified_worker_url(worker))
+        assert url == "http://192.168.30.9:8081"
+        assert headers["Host"] == "wk.example:8081"
+
+    def test_strict_mode_allows_listed_cidr(self):
+        import app.worker_proxy as main
+
+        orig = (main._WORKER_URL_POLICY, main._WORKER_ALLOWED_CIDRS)
+        try:
+            main._WORKER_URL_POLICY = "strict"
+            main._WORKER_ALLOWED_CIDRS = [main.ipaddress.ip_network("192.168.10.0/24")]
+            assert main._validate_worker_url("http://192.168.10.50:8081") == ("http://192.168.10.50:8081", None)
+        finally:
+            main._WORKER_URL_POLICY, main._WORKER_ALLOWED_CIDRS = orig
+
+    def test_strict_mode_blocks_unlisted_ip(self):
+        import app.worker_proxy as main
+
+        orig = (main._WORKER_URL_POLICY, main._WORKER_ALLOWED_CIDRS)
+        try:
+            main._WORKER_URL_POLICY = "strict"
+            main._WORKER_ALLOWED_CIDRS = [main.ipaddress.ip_network("192.168.10.0/24")]
+            with pytest.raises(Exception, match="strict mode"):
+                main._validate_worker_url("http://10.0.0.5:8081")
+        finally:
+            main._WORKER_URL_POLICY, main._WORKER_ALLOWED_CIDRS = orig
+
+    def test_metadata_escape_hatch_allows(self):
+        # The escape hatch un-blocks the metadata check only. Use the IPv6 IMDS
+        # address (ULA fd00::/8, not link-local) so the loopback/link-local guard
+        # doesn't independently block it — proving the hatch works in isolation.
+        import app.worker_proxy as main
+
+        orig = main._WORKER_ALLOW_METADATA
+        try:
+            main._WORKER_ALLOW_METADATA = True
+            assert main._validate_worker_url("http://[fd00:ec2::254]:80/") == ("http://[fd00:ec2::254]:80", None)
+        finally:
+            main._WORKER_ALLOW_METADATA = orig
+
+    def test_strict_mode_hostname_resolves_into_allowed_cidr(self):
+        # Strict mode, Case B: hostname resolving to an allowed CIDR is accepted.
+        import app.worker_proxy as main
+
+        orig = (main._WORKER_URL_POLICY, main._WORKER_ALLOWED_CIDRS)
+        try:
+            main._WORKER_URL_POLICY = "strict"
+            main._WORKER_ALLOWED_CIDRS = [main.ipaddress.ip_network("192.168.10.0/24")]
+            with patch("app.worker_proxy.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("192.168.10.50", 8081))]):
+                # Hostname resolves into the allowed CIDR -> accepted, and the
+                # validated IP is pinned for the request (anti-rebinding).
+                assert main._validate_worker_url("http://wk.local:8081") == ("http://wk.local:8081", "192.168.10.50")
+        finally:
+            main._WORKER_URL_POLICY, main._WORKER_ALLOWED_CIDRS = orig
+
+    def test_strict_mode_hostname_resolves_outside_allowed_cidr_blocked(self):
+        import app.worker_proxy as main
+
+        orig = (main._WORKER_URL_POLICY, main._WORKER_ALLOWED_CIDRS)
+        try:
+            main._WORKER_URL_POLICY = "strict"
+            main._WORKER_ALLOWED_CIDRS = [main.ipaddress.ip_network("192.168.10.0/24")]
+            with (
+                patch("app.worker_proxy.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("10.0.0.5", 8081))]),
+                pytest.raises(Exception, match="strict mode"),
+            ):
+                main._validate_worker_url("http://wk.local:8081")
+        finally:
+            main._WORKER_URL_POLICY, main._WORKER_ALLOWED_CIDRS = orig
+
+    def test_strict_mode_unresolvable_hostname_blocked(self):
+        import app.worker_proxy as main
+
+        orig = main._WORKER_URL_POLICY
+        try:
+            main._WORKER_URL_POLICY = "strict"
+            with (
+                patch("app.worker_proxy.socket.getaddrinfo", side_effect=socket.gaierror),
+                pytest.raises(Exception, match="does not resolve"),
+            ):
+                main._validate_worker_url("http://nope.invalid:8081")
+        finally:
+            main._WORKER_URL_POLICY = orig
 
 
 # ---------------------------------------------------------------------------
@@ -1124,13 +1906,16 @@ class TestPeriodicTasks:
         from app.main import _check_stale_workers
 
         old_time = (datetime.now(UTC) - timedelta(seconds=300)).isoformat()
-        workers = [{"id": 1, "name": "w1", "status": "online", "last_heartbeat": old_time}]
+        workers = [{"id": 1, "client_id": "w1-cid", "name": "w1", "status": "online", "last_heartbeat": old_time}]
         with (
             patch("app.main.database.list_workers", new_callable=AsyncMock, return_value=workers),
-            patch("app.main.database.set_worker_status", new_callable=AsyncMock) as mock_set,
+            patch(
+                "app.main.database.mark_worker_offline_if_unchanged", new_callable=AsyncMock, return_value=True
+            ) as mock_mark,
+            patch("app.main.database.record_alert", new_callable=AsyncMock, return_value=False),
         ):
             asyncio.run(_check_stale_workers())
-            mock_set.assert_called_once_with(1, "offline")
+            mock_mark.assert_called_once_with(1, old_time)
 
     def test_check_stale_workers_error(self):
         from app.main import _check_stale_workers
@@ -1139,6 +1924,13 @@ class TestPeriodicTasks:
             asyncio.run(_check_stale_workers())  # Should not raise
 
     def test_run_collection(self):
+        """CashPilot-55m / -rhn: this test had NO assertions at all.
+
+        It ran _run_collection and checked nothing, so the entire success path
+        — the payout check, the upsert, and the fx-rate snapshot taken with it
+        — could be deleted and the suite would stay green. The only thing it
+        proved was that the function did not raise.
+        """
         from app.collectors.base import EarningsResult
         from app.main import _run_collection
 
@@ -1148,9 +1940,65 @@ class TestPeriodicTasks:
             patch("app.main.database.get_deployments", new_callable=AsyncMock, return_value=[{"slug": "test"}]),
             patch("app.main.database.get_config", new_callable=AsyncMock, return_value={}),
             patch("app.collectors.make_collectors", return_value=[mock_collector]),
-            patch("app.main.database.upsert_earnings", new_callable=AsyncMock),
+            patch("app.main.database.upsert_earnings", new_callable=AsyncMock) as mock_upsert,
+            patch("app.main._detect_payout", new_callable=AsyncMock) as mock_payout,
         ):
             asyncio.run(_run_collection())
+
+        # The reading is actually stored, with the values the collector returned.
+        mock_upsert.assert_awaited_once()
+        kwargs = mock_upsert.await_args.kwargs
+        assert kwargs["platform"] == "test"
+        assert kwargs["balance"] == 5.0
+        assert kwargs["currency"] == "USD"
+        # USD is parity by definition — a stored rate here would let a bad rate
+        # rewrite money the collector reported exactly.
+        assert kwargs["fx_rate_usd"] == 1.0
+        # And the payout branch is on the success path, so it must be reached.
+        mock_payout.assert_awaited_once()
+
+    def test_run_collection_snapshots_the_rate_for_a_non_usd_reading(self):
+        """CashPilot-rhn: nothing asserted what fx_rate_usd was computed as.
+
+        The snapshot is what makes a historical non-USD reading reconstructable
+        later; forcing it to parity for every currency would have gone
+        unnoticed.
+        """
+        from app.collectors.base import EarningsResult
+        from app.main import _run_collection
+
+        mock_collector = AsyncMock()
+        mock_collector.collect.return_value = EarningsResult(platform="test", balance=10.0, currency="MYST")
+        with (
+            patch("app.main.database.get_deployments", new_callable=AsyncMock, return_value=[{"slug": "test"}]),
+            patch("app.main.database.get_config", new_callable=AsyncMock, return_value={}),
+            patch("app.collectors.make_collectors", return_value=[mock_collector]),
+            patch("app.main.database.upsert_earnings", new_callable=AsyncMock) as mock_upsert,
+            patch("app.main._detect_payout", new_callable=AsyncMock),
+            patch("app.main.exchange_rates.to_usd", lambda amount, currency: 0.25 * amount),
+        ):
+            asyncio.run(_run_collection())
+
+        assert mock_upsert.await_args.kwargs["fx_rate_usd"] == 0.25
+
+    def test_run_collection_records_no_rate_when_the_currency_is_unpriced(self):
+        """None, not 1.0. Parity would silently value an unpriced token as USD."""
+        from app.collectors.base import EarningsResult
+        from app.main import _run_collection
+
+        mock_collector = AsyncMock()
+        mock_collector.collect.return_value = EarningsResult(platform="test", balance=10.0, currency="GRASS")
+        with (
+            patch("app.main.database.get_deployments", new_callable=AsyncMock, return_value=[{"slug": "test"}]),
+            patch("app.main.database.get_config", new_callable=AsyncMock, return_value={}),
+            patch("app.collectors.make_collectors", return_value=[mock_collector]),
+            patch("app.main.database.upsert_earnings", new_callable=AsyncMock) as mock_upsert,
+            patch("app.main._detect_payout", new_callable=AsyncMock),
+            patch("app.main.exchange_rates.to_usd", lambda amount, currency: None),
+        ):
+            asyncio.run(_run_collection())
+
+        assert mock_upsert.await_args.kwargs["fx_rate_usd"] is None
 
     def test_run_collection_with_error(self):
         from app.collectors.base import EarningsResult
@@ -1177,6 +2025,71 @@ class TestSecurityHeaders:
             resp = client.get("/api/mode")
             assert resp.headers.get("X-Content-Type-Options") == "nosniff"
             assert resp.headers.get("X-Frame-Options") == "DENY"
+            csp = resp.headers.get("Content-Security-Policy", "")
+            # Additive CSP hardening (US-004); unsafe-inline stays until the guw refactor.
+            assert "base-uri 'none'" in csp
+            assert "object-src 'none'" in csp
+            assert "form-action 'self'" in csp
+
+    def test_hsts_absent_on_plain_http(self, client):
+        with _auth_owner():
+            resp = client.get("/api/mode")
+            # A plain-HTTP (dev) request must never be pinned to https.
+            assert "Strict-Transport-Security" not in resp.headers
+
+    def test_hsts_present_when_forwarded_https_and_proxy_trusted(self, client):
+        with _auth_owner(), patch("app.main._HSTS_TRUST_PROXY", True):
+            resp = client.get("/api/mode", headers={"X-Forwarded-Proto": "https"})
+            assert resp.headers.get("Strict-Transport-Security", "").startswith("max-age=")
+
+    def test_hsts_ignores_forwarded_proto_when_proxy_untrusted(self, client):
+        with _auth_owner(), patch("app.main._HSTS_TRUST_PROXY", False):
+            resp = client.get("/api/mode", headers={"X-Forwarded-Proto": "https"})
+            # An untrusted (spoofable) header must not trigger HSTS.
+            assert "Strict-Transport-Security" not in resp.headers
+
+
+class TestSessionCookieSecure:
+    """CASHPILOT_SECURE_COOKIE=auto must set Secure when TLS terminates at a trusted proxy."""
+
+    def _resp(self):
+        from starlette.responses import RedirectResponse
+
+        return RedirectResponse("/", status_code=303)
+
+    def _req(self, xf_proto=None):
+        r = MagicMock()
+        r.headers = {"x-forwarded-proto": xf_proto} if xf_proto else {}
+        return r
+
+    def test_secure_from_forwarded_proto_when_trusted(self):
+        import app.auth as a
+
+        with patch.object(a, "_SECURE_COOKIE", "auto"), patch.object(a, "_TRUST_PROXY", True):
+            resp = a.set_session_cookie(self._resp(), "tok", self._req("https"))
+        assert "Secure" in resp.headers.get("set-cookie", "")
+
+    def test_not_secure_when_proxy_untrusted(self):
+        import app.auth as a
+
+        with patch.object(a, "_SECURE_COOKIE", "auto"), patch.object(a, "_TRUST_PROXY", False):
+            resp = a.set_session_cookie(self._resp(), "tok", self._req("https"))
+        assert "Secure" not in resp.headers.get("set-cookie", "")
+
+    def test_explicit_true_overrides(self):
+        import app.auth as a
+
+        with patch.object(a, "_SECURE_COOKIE", "true"):
+            resp = a.set_session_cookie(self._resp(), "tok", self._req())
+        assert "Secure" in resp.headers.get("set-cookie", "")
+
+    def test_backward_compat_no_request_arg(self):
+        # Callers that don't pass request still work (auto falls back to BASE_URL).
+        import app.auth as a
+
+        with patch.object(a, "_SECURE_COOKIE", "auto"), patch.dict("os.environ", {"CASHPILOT_BASE_URL": ""}):
+            resp = a.set_session_cookie(self._resp(), "tok")
+        assert "Secure" not in resp.headers.get("set-cookie", "")
 
 
 # ---------------------------------------------------------------------------
@@ -1219,3 +2132,337 @@ class TestApiPerNodeEarnings:
             resp = client.get("/api/services/honeygain/per-node-earnings")
             assert resp.status_code == 200
             assert resp.json() == []
+
+
+# ---------------------------------------------------------------------------
+# Lifespan / scheduler wiring (audit: error listener + job hardening)
+# ---------------------------------------------------------------------------
+
+
+class TestLifespanScheduler:
+    """Exercise the real lifespan() so the scheduler wiring is actually covered.
+
+    External I/O (init_db, exchange refresh, collection) is mocked, but the real
+    AsyncIOScheduler is started so we can assert every interval job is registered
+    with the hardening kwargs and the EVENT_JOB_ERROR/MISSED listener is attached.
+    """
+
+    def test_lifespan_registers_jobs_and_error_listener(self):
+        import app.main as main_mod
+
+        async def _run():
+            with (
+                patch("app.main.database.init_db", new_callable=AsyncMock),
+                patch("app.main.database.connect_shared", new_callable=AsyncMock),
+                patch("app.main.database.close_shared", new_callable=AsyncMock),
+                patch("app.main.database.list_users_with_pwd_epoch", new_callable=AsyncMock, return_value=[]),
+                patch("app.main.database.list_session_revocations", new_callable=AsyncMock, return_value=[]),
+                patch("app.main.database.has_any_users", new_callable=AsyncMock, return_value=True),
+                patch("app.main.catalog.load_services"),
+                patch("app.main.catalog.register_sighup"),
+                patch("app.main.exchange_rates.refresh", new_callable=AsyncMock),
+                patch("app.main._run_collection", new_callable=AsyncMock),
+                patch("app.main.close_all_collectors", new_callable=AsyncMock, create=True),
+            ):
+                async with main_mod.lifespan(main_mod.app):
+                    sched = main_mod.scheduler
+                    jobs = {j.id: j for j in sched.get_jobs()}
+                    # All interval jobs registered.
+                    assert set(jobs) == {
+                        "collect",
+                        "health_check",
+                        "stale_workers",
+                        "data_retention",
+                        "db_vacuum",
+                        "exchange_rates",
+                        "update_check",
+                        # The Android client's own release track. Separate job
+                        # so a GitHub hiccup fetching one cannot suppress the
+                        # other; it carries the same hardening kwargs, which the
+                        # loop below asserts for every job uniformly.
+                        "update_check_android",
+                    }
+                    # Every job carries the hardening kwargs (audit fix).
+                    for job in jobs.values():
+                        assert job.max_instances == 1, f"{job.id} max_instances"
+                        assert job.coalesce is True, f"{job.id} coalesce"
+                        assert job.misfire_grace_time == 300, f"{job.id} misfire_grace_time"
+                    # The error/missed listener is attached.
+                    assert len(sched._listeners) >= 1
+
+        asyncio.run(_run())
+
+    def test_on_job_event_logs_without_exception_attr(self):
+        """A MISSED event has no .exception attr — the listener must not crash."""
+        import app.main as main_mod
+
+        captured = {}
+
+        async def _run():
+            with (
+                patch("app.main.database.init_db", new_callable=AsyncMock),
+                patch("app.main.database.connect_shared", new_callable=AsyncMock),
+                patch("app.main.database.close_shared", new_callable=AsyncMock),
+                patch("app.main.database.list_users_with_pwd_epoch", new_callable=AsyncMock, return_value=[]),
+                patch("app.main.database.list_session_revocations", new_callable=AsyncMock, return_value=[]),
+                patch("app.main.database.has_any_users", new_callable=AsyncMock, return_value=True),
+                patch("app.main.catalog.load_services"),
+                patch("app.main.catalog.register_sighup"),
+                patch("app.main.exchange_rates.refresh", new_callable=AsyncMock),
+                patch("app.main._run_collection", new_callable=AsyncMock),
+                patch("app.main.close_all_collectors", new_callable=AsyncMock, create=True),
+                patch("app.main.logger.error") as err,
+            ):
+                async with main_mod.lifespan(main_mod.app):
+                    listener = main_mod.scheduler._listeners[0][0]
+                    # Simulate a MISSED event object lacking `.exception`.
+                    event = type("Evt", (), {"job_id": "collect"})()
+                    listener(event)  # must not raise
+                    captured["called"] = err.called
+
+        asyncio.run(_run())
+        assert captured["called"] is True
+
+    def test_lifespan_first_run_generates_setup_token(self):
+        """With no users, startup generates + persists + activates a setup token."""
+        import app.main as main_mod
+        from app import setup_token
+
+        async def _run():
+            with (
+                patch("app.main.database.init_db", new_callable=AsyncMock),
+                patch("app.main.database.connect_shared", new_callable=AsyncMock),
+                patch("app.main.database.close_shared", new_callable=AsyncMock),
+                patch("app.main.database.list_users_with_pwd_epoch", new_callable=AsyncMock, return_value=[]),
+                patch("app.main.database.list_session_revocations", new_callable=AsyncMock, return_value=[]),
+                patch("app.main.database.has_any_users", new_callable=AsyncMock, return_value=False),
+                patch("app.main.database.get_config", new_callable=AsyncMock, return_value=None),
+                patch("app.main.database.set_config", new_callable=AsyncMock) as set_cfg,
+                patch("app.main.catalog.load_services"),
+                patch("app.main.catalog.register_sighup"),
+                patch("app.main.exchange_rates.refresh", new_callable=AsyncMock),
+                patch("app.main._run_collection", new_callable=AsyncMock),
+                patch("app.main.close_all_collectors", new_callable=AsyncMock, create=True),
+                patch("app.main.scheduler"),  # isolate from the real module scheduler
+            ):
+                async with main_mod.lifespan(main_mod.app):
+                    assert setup_token.active() is not None
+                    set_cfg.assert_awaited_once()  # persisted the freshly generated token
+
+        asyncio.run(_run())
+
+
+class TestRunVacuum:
+    def test_run_vacuum_success(self):
+        import app.main as main_mod
+
+        with patch("app.main.database.vacuum_database", new_callable=AsyncMock) as vac:
+            asyncio.run(main_mod._run_vacuum())
+            vac.assert_awaited_once()
+
+    def test_run_vacuum_swallows_error(self):
+        import app.main as main_mod
+
+        with patch(
+            "app.main.database.vacuum_database",
+            new_callable=AsyncMock,
+            side_effect=Exception("boom"),
+        ):
+            # Must not raise — a failed VACUUM is logged, not fatal.
+            asyncio.run(main_mod._run_vacuum())
+
+
+class TestOutboundWorkerAuth:
+    """US-003: UI->worker calls use the worker's own key once enrolled."""
+
+    def _worker(self):
+        return {"status": "online", "url": "http://192.168.1.5:8081", "client_id": "c1"}
+
+    def _auth(self, key_state):
+        """key_state is (key, confirmed) — the shape get_worker_key_state returns."""
+        import app.main as m
+
+        with (
+            patch("app.main.FLEET_API_KEY", "shared-key"),
+            patch("app.main.database.get_worker_key_state", new_callable=AsyncMock, return_value=key_state),
+            patch("app.main._validate_worker_url", return_value=("http://192.168.1.5:8081", None)),
+        ):
+            _, headers = asyncio.run(m._get_verified_worker_url(self._worker()))
+        return headers["Authorization"]
+
+    def test_uses_per_worker_key_when_enrolled_and_confirmed(self):
+        assert self._auth(("worker-1-key", True)) == "Bearer worker-1-key"
+
+    def test_falls_back_to_shared_key_when_unenrolled(self):
+        assert self._auth((None, False)) == "Bearer shared-key"
+
+    def test_an_unconfirmed_key_is_not_used(self):
+        """CashPilot-zcc: the worker may never have received this key.
+
+        get_worker_key discarded the confirmed flag, so the UI signed outbound
+        commands with a key the worker might not hold — reachable whenever the
+        worker failed to persist it and logged "staying on shared key". The
+        worker then read as ONLINE from its heartbeats while every deploy,
+        start, stop, restart and logs call failed 401, with nothing on screen
+        connecting the two.
+        """
+        assert self._auth(("worker-1-key", False)) == "Bearer shared-key"
+
+
+# ---------------------------------------------------------------------------
+# Shared auth deps (app/deps.py) — guard branches
+# ---------------------------------------------------------------------------
+
+
+class TestDepsGuards:
+    def test_require_writer_denies_viewer(self, client):
+        # A writer-gated route (/api/stop) must 403 for a viewer.
+        with _auth_viewer():
+            resp = client.post("/api/stop/honeygain")
+            assert resp.status_code == 403
+
+    def test_require_private_network_blocks_public_ip(self):
+        from fastapi import HTTPException
+
+        from app.deps import _require_private_network
+
+        req = MagicMock()
+        req.client.host = "8.8.8.8"
+        with pytest.raises(HTTPException) as ei:
+            _require_private_network(req)
+        assert ei.value.status_code == 403
+
+    def test_require_private_network_allows_private_ip(self):
+        from app.deps import _require_private_network
+
+        req = MagicMock()
+        req.client.host = "192.168.1.10"
+        assert _require_private_network(req) is None
+
+    def test_require_private_network_no_client_is_noop(self):
+        from app.deps import _require_private_network
+
+        req = MagicMock()
+        req.client = None
+        assert _require_private_network(req) is None
+
+
+class TestWorkerAllowlistParsing:
+    def test_parse_allowlist_mixed_entries(self):
+        import app.worker_proxy as main
+
+        with patch.dict(
+            os.environ,
+            {"CASHPILOT_WORKER_ALLOWED_HOSTS": "192.168.10.0/24, *.ts.net , watchtower.local"},
+        ):
+            cidrs, suffixes, exact = main._parse_worker_allowlist()
+        # Exact-collection asserts (not substring `in`) so CodeQL's
+        # url-substring-sanitization heuristic isn't tripped by the test.
+        assert cidrs == [main.ipaddress.ip_network("192.168.10.0/24")]
+        assert suffixes == ["ts.net"]
+        assert exact == {"watchtower.local"}
+
+
+class TestLoginRateLimitMetric:
+    def test_login_rate_limit_records_metric(self, client):
+        from fastapi import HTTPException
+
+        def _raise_429(_ip):
+            raise HTTPException(status_code=429, detail="Too many login attempts")
+
+        with (
+            patch("app.login_rate_limit.check_login_rate", side_effect=_raise_429),
+            patch("app.main.metrics.record_rate_limit") as mock_metric,
+        ):
+            resp = client.post("/login", data={"username": "x", "password": "y"}, follow_redirects=False)
+            assert resp.status_code == 429
+            mock_metric.assert_called_once()
+
+
+class TestImageDrift:
+    """CashPilot-5wi: flag a deployed container whose image drifted from the catalog."""
+
+    def test_split_image(self):
+        from app.main import _split_image
+
+        assert _split_image("ghcr.io/proxybaseorg/peer-cli@sha256:abc") == (
+            "ghcr.io/proxybaseorg/peer-cli",
+            "",
+            "sha256:abc",
+        )
+        assert _split_image("proxybase/proxybase:latest") == ("proxybase/proxybase", "latest", "")
+        assert _split_image("repo") == ("repo", "", "")
+        # A registry:port is not mistaken for a tag.
+        assert _split_image("localhost:5000/img:1.0")[0] == "localhost:5000/img"
+
+    def test_image_outdated(self):
+        from app.main import _image_outdated
+
+        # Provider migrated the image path (the ProxyBase case) -> outdated.
+        assert _image_outdated("proxybase/proxybase@sha256:old", "ghcr.io/proxybaseorg/peer-cli@sha256:new") is True
+        # Same repo, re-pinned to a new digest -> outdated.
+        assert _image_outdated("repo@sha256:aaa", "repo@sha256:bbb") is True
+        # Same image -> not flagged.
+        assert _image_outdated("repo@sha256:aaa", "repo@sha256:aaa") is False
+        # Missing/empty images -> conservative, not flagged.
+        assert _image_outdated("", "repo@sha256:x") is False
+        assert _image_outdated("repo:1.0", "") is False
+        # Same repo, tag vs digest (unresolvable) -> not flagged.
+        assert _image_outdated("repo:1.0", "repo@sha256:x") is False
+
+
+class TestAddingAUserDoesNotStealTheOwnersSession:
+    """CashPilot-5e6: do_register signed the caller into the account it created.
+
+    An owner adding a viewer was silently demoted into that viewer's session —
+    losing their own access with no sign anything had happened beyond landing
+    on a page with fewer controls. Only the first-run owner should be signed in
+    here, which is the case the code was written for.
+    """
+
+    def _register(self, tmp_path, is_first):
+        import app.auth as auth_module
+        from app import database, setup_token
+        from app.routers import auth as auth_router
+
+        async def run():
+            with (
+                patch.object(database, "DB_DIR", tmp_path),
+                patch.object(database, "DB_PATH", tmp_path / "u.db"),
+            ):
+                await database.init_db()
+                setup_token.set_active("tok")
+                if not is_first:
+                    await database.create_user("owner", auth_module.hash_password("x" * 12), role="owner")
+                request = MagicMock()
+                request.session = {}
+                request.headers = {}
+                request.cookies = {}
+                request.client = MagicMock(host="127.0.0.1")
+                with patch.object(auth_module, "get_current_user", lambda r: {"uid": 1, "u": "owner", "r": "owner"}):
+                    return await auth_router.do_register(
+                        request,
+                        username="newviewer",
+                        password="A-real-passphrase-123",
+                        password_confirm="A-real-passphrase-123",
+                        setup_token="tok",
+                    )
+
+        return asyncio.run(run())
+
+    def test_the_owner_keeps_their_own_session(self, tmp_path):
+        resp = self._register(tmp_path, is_first=False)
+        cookies = resp.raw_headers if hasattr(resp, "raw_headers") else []
+        set_cookie = [v for k, v in cookies if k.lower() == b"set-cookie"]
+        assert not set_cookie, "adding a user replaced the caller's session cookie"
+
+    def test_the_owner_is_not_sent_to_the_dashboard_as_someone_else(self, tmp_path):
+        resp = self._register(tmp_path, is_first=False)
+        assert resp.headers["location"] == "/users"
+
+    def test_the_first_run_owner_is_still_signed_in(self, tmp_path):
+        """The case this code exists for must keep working."""
+        resp = self._register(tmp_path, is_first=True)
+        set_cookie = [v for k, v in resp.raw_headers if k.lower() == b"set-cookie"]
+        assert set_cookie, "the first owner was not signed in"
+        assert resp.headers["location"] == "/setup"

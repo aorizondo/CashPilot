@@ -6,11 +6,13 @@ the PacketStream web interface.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 
 import httpx
 
+from app.collectors import base
 from app.collectors.base import BaseCollector, EarningsResult
 
 logger = logging.getLogger(__name__)
@@ -24,31 +26,54 @@ class PacketStreamCollector(BaseCollector):
     platform = "packetstream"
 
     def __init__(self, auth_token: str) -> None:
+        super().__init__()
         self.auth_token = auth_token
 
     async def collect(self) -> EarningsResult:
         """Fetch current PacketStream balance by scraping dashboard."""
         try:
             cookies = {"auth": self.auth_token}
+            client = self._get_client(cookies=cookies)
 
-            async with httpx.AsyncClient(timeout=30, cookies=cookies) as client:
-                resp = await client.get(f"{API_BASE}/dashboard")
+            async def _fetch() -> httpx.Response:
+                return await client.get(f"{API_BASE}/dashboard")
 
-                if resp.status_code in (401, 403) or "/login" in str(resp.url):
-                    return EarningsResult(
-                        platform=self.platform,
-                        balance=0.0,
-                        error="Authentication failed — check auth JWT cookie",
-                    )
+            resp = await self._retry(_fetch)
 
-                resp.raise_for_status()
-                html = resp.text
+            if resp.status_code in (401, 403) or "/login" in str(resp.url):
+                return EarningsResult(
+                    platform=self.platform,
+                    balance=0.0,
+                    error="Authentication failed — check auth JWT cookie",
+                    error_kind=base.KIND_AUTH,
+                )
 
-                balance = 0.0
-                parsed = False
+            resp.raise_for_status()
+            html = resp.text
 
-                # Pattern 1: server-rendered Balance card (current)
-                # <h3>Balance</h3>...<h2 ...>$0.13</h2>
+            balance = 0.0
+            parsed = False
+
+            # Pattern 1: the Balance metric card (current layout).
+            #   <div class="card metric-card metric-card-balance">
+            #     <h2 class=metric-title>Balance</h2>
+            #     <p class="card-subtitle ...">Available Funds
+            #     <h2 class="default-font fw-600">$2.12</h2>
+            # Anchored on the semantic class, NOT a heading level: the heading has
+            # already moved once (<h3>Balance</h3> -> <h2 class=metric-title>), which
+            # is what silently broke this collector. The markup is also minified with
+            # unquoted attributes, so do not require quotes around class values.
+            match = re.search(
+                r"metric-card-balance.{0,400}?\$\s*([\d,]+(?:\.\d+)?)",
+                html,
+                re.DOTALL,
+            )
+            if match:
+                balance = float(match.group(1).replace(",", ""))
+                parsed = True
+
+            # Pattern 2: the older Balance card layout.
+            if not parsed:
                 match = re.search(
                     r"<h3>Balance</h3>.*?<h2[^>]*>\$?([\d.]+)</h2>",
                     html,
@@ -58,45 +83,45 @@ class PacketStreamCollector(BaseCollector):
                     balance = float(match.group(1))
                     parsed = True
 
-                # Pattern 2: window.userData JSON (legacy)
-                if not parsed:
-                    match = re.search(
-                        r"window\.userData\s*=\s*(\{[^}]+\})",
-                        html,
-                    )
-                    if match:
-                        import json
-
-                        try:
-                            user_data = json.loads(match.group(1))
-                            balance = float(user_data.get("balance", 0))
-                            parsed = True
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-
-                # Pattern 3: bare "balance" key in JSON
-                if not parsed:
-                    match = re.search(r'"balance"\s*:\s*([\d.]+)', html)
-                    if match:
-                        balance = float(match.group(1))
+            # Pattern 3: window.userData JSON (legacy)
+            if not parsed:
+                match = re.search(
+                    r"window\.userData\s*=\s*(\{[^}]+\})",
+                    html,
+                )
+                if match:
+                    try:
+                        user_data = json.loads(match.group(1))
+                        balance = float(user_data.get("balance", 0))
                         parsed = True
+                    except (json.JSONDecodeError, ValueError):
+                        pass
 
-                if not parsed:
-                    return EarningsResult(
-                        platform=self.platform,
-                        balance=0.0,
-                        error="Could not parse balance from dashboard — page structure may have changed",
-                    )
+            # Pattern 4: bare "balance" key in JSON
+            if not parsed:
+                match = re.search(r'"balance"\s*:\s*([\d.]+)', html)
+                if match:
+                    balance = float(match.group(1))
+                    parsed = True
 
+            if not parsed:
                 return EarningsResult(
                     platform=self.platform,
-                    balance=round(balance, 4),
-                    currency="USD",
+                    balance=0.0,
+                    error="Could not parse balance from dashboard — page structure may have changed",
+                    error_kind=base.KIND_SHAPE,
                 )
+
+            return EarningsResult(
+                platform=self.platform,
+                balance=round(balance, 4),
+                currency="USD",
+            )
         except Exception as exc:
-            logger.error("PacketStream collection failed: %s", exc)
+            base.log_failure(logger, "PacketStream", exc)
             return EarningsResult(
                 platform=self.platform,
                 balance=0.0,
                 error=str(exc),
+                error_kind=base.classify_exception(exc),
             )

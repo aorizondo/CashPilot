@@ -15,15 +15,22 @@
     <div class="stat-label">Online</div>
     <div class="stat-value" id="fleet-online-workers">-</div>
   </div>
+  {# "Workers" and "Online" are fleet-wide; these two count ONLY online workers
+     (api_fleet_summary skips offline ones before accumulating). Nothing said so,
+     so a host rebooting made "Services" drop and read as containers lost --
+     contradicting the dashboard note that routes the user to this very page:
+     "Containers keep running and earning while a worker is offline."
+     (CashPilot-wij) #}
   <div class="stat-card">
-    <div class="stat-label">Services</div>
+    <div class="stat-label" title="Counted across workers that are currently online. Containers on an offline worker keep running and earning; they are not included here.">Services <span style="opacity:0.6;">(online)</span></div>
     <div class="stat-value" id="fleet-total-containers">-</div>
   </div>
   <div class="stat-card">
-    <div class="stat-label">Running</div>
+    <div class="stat-label" title="Counted across workers that are currently online. Containers on an offline worker keep running and earning; they are not included here.">Running <span style="opacity:0.6;">(online)</span></div>
     <div class="stat-value" id="fleet-running-containers">-</div>
   </div>
 </div>
+<div id="fleet-unreachable-note" style="display:none; margin:-8px 0 16px; font-size:0.82rem; color:var(--warning);"></div>
 
 <!-- Add Worker -->
 <div class="card" style="margin-bottom: 24px;">
@@ -62,8 +69,8 @@
       <pre id="snippet-output" style="margin: 0; color: var(--text-primary); font-size: 0.82rem; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre; overflow-x: auto;"></pre>
       {% if user.r == 'owner' %}
       <div style="display: flex; gap: 8px; margin-top: 8px;">
-        <button class="btn btn-ghost btn-sm" onclick="toggleApiKey()" id="reveal-btn">Reveal API Key</button>
-        <button class="btn btn-ghost btn-sm" onclick="copySnippet()">Copy</button>
+        <button class="btn btn-ghost btn-sm" data-action="toggleApiKey" id="reveal-btn">Reveal API Key</button>
+        <button class="btn btn-ghost btn-sm" data-action="copySnippet">Copy</button>
       </div>
       {% endif %}
     </div>
@@ -78,6 +85,37 @@
   <h2 class="section-title">Workers</h2>
 </div>
 
+<!-- Is this fleet worth running?
+     The card needs an electricity price to answer that, and until now there was
+     no way to enter one: the keys existed, the backend read them, and nothing
+     in the app ever wrote them. A user who only uses the app saw "unknown"
+     forever with no route out of it (CashPilot-jm6). The inputs below are that
+     route. The verdict area stays hidden until there is something to say. -->
+<div class="card" style="margin-bottom: 24px; display:none;" id="fleet-economics-card">
+  <div class="card-header">
+    <span class="card-title">Running costs</span>
+    <span style="font-size:0.72rem; color:var(--text-muted);" id="fleet-economics-quality"></span>
+  </div>
+
+  <div id="power-settings" style="display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; padding:12px 0; border-bottom:1px solid var(--border-color); margin-bottom:12px;">
+    <div>
+      <label for="power-price" style="display:block; font-size:0.7rem; color:var(--text-muted); margin-bottom:4px;">Electricity price per kWh</label>
+      <input id="power-price" class="form-input" type="number" step="0.001" min="0" style="width:9rem;"
+             placeholder="0.30" aria-describedby="power-help">
+    </div>
+    <div>
+      <label for="power-currency" style="display:block; font-size:0.7rem; color:var(--text-muted); margin-bottom:4px;">Currency</label>
+      <input id="power-currency" class="form-input" type="text" maxlength="4" style="width:5.5rem;" placeholder="EUR">
+    </div>
+    <button class="btn btn-primary btn-sm" id="power-save">Save</button>
+    <span id="power-help" style="font-size:0.7rem; color:var(--text-muted);">
+      Your tariff, as it appears on your bill. Figures below are converted to USD.
+    </span>
+  </div>
+
+  <div id="fleet-economics-body"></div>
+</div>
+
 <div id="fleet-workers">
   <div class="empty-state">
     <div class="empty-state-title">Loading fleet...</div>
@@ -86,11 +124,12 @@
 {% endblock %}
 
 {% block scripts %}
-<script>
+<script nonce="{{ csp_nonce(request) }}">
 (function() {
   let fleetTimer = null;
   let _apiKeyRevealed = false;
   let _apiKey = '';
+  let _apiKeySet = false;
   const _isOwner = {{ 'true' if user.r == 'owner' else 'false' }};
 
   // -------------------------------------------------------------------------
@@ -169,6 +208,42 @@ ${wurl ? `      - CASHPILOT_WORKER_URL=${wurl}\n` : `      # - CASHPILOT_WORKER_
 
   setActiveTab('env');
 
+  // Fetch only the API-key STATUS on load (no secret value). The plaintext key is
+  // fetched lazily via the owner-only reveal endpoint, on explicit user action.
+  async function loadApiKeyStatus() {
+    const statusEl = document.getElementById('api-key-status');
+    try {
+      const data = await CP.api('/api/fleet/api-key');
+      _apiKeySet = !!data.is_set;
+      if (statusEl) {
+        if (_apiKeySet) {
+          statusEl.textContent = 'Configured';
+          statusEl.className = 'badge badge-deployed';
+          statusEl.style.fontSize = '0.72rem';
+        } else {
+          statusEl.textContent = 'Not set';
+          statusEl.className = 'badge badge-category';
+          statusEl.style.fontSize = '0.72rem';
+        }
+      }
+    } catch {
+      if (statusEl) { statusEl.textContent = 'Unknown'; statusEl.style.fontSize = '0.72rem'; }
+    }
+  }
+
+  // Lazily fetch the plaintext key (owner-only POST). Returns the key string.
+  async function fetchApiKey() {
+    if (_apiKey) return _apiKey;
+    try {
+      const data = await CP.api('/api/fleet/api-key/reveal', { method: 'POST' });
+      _apiKey = data.api_key || '(not configured)';
+    } catch (err) {
+      _apiKey = '(error)';
+      CP.toast('Could not reveal API key: ' + (err.message || 'error'), 'error');
+    }
+    return _apiKey;
+  }
+
   async function loadFleet() {
     try {
       const [summary, workers] = await Promise.all([
@@ -181,16 +256,151 @@ ${wurl ? `      - CASHPILOT_WORKER_URL=${wurl}\n` : `      # - CASHPILOT_WORKER_
       document.getElementById('fleet-total-containers').textContent = summary.total_containers || 0;
       document.getElementById('fleet-running-containers').textContent = summary.running_containers || 0;
 
+      // Name what the two online-only cards leave out, rather than letting the
+      // drop read as containers lost.
+      const note = document.getElementById('fleet-unreachable-note');
+      const hidden = summary.unreachable_containers || 0;
+      if (note) {
+        if (hidden > 0) {
+          const w = summary.unreachable_workers || 0;
+          note.textContent = `${hidden} container${hidden === 1 ? '' : 's'} on `
+            + `${w} unreachable worker${w === 1 ? '' : 's'} ${hidden === 1 ? 'is' : 'are'} not counted above. `
+            + `They keep running and earning while their worker is offline — CashPilot just cannot see them right now.`;
+          note.style.display = '';
+        } else {
+          note.style.display = 'none';
+        }
+      }
+
       renderWorkers(workers);
+      loadFleetEconomics();
+      loadPowerSettings();
     } catch (err) {
+      const msg = (err.message || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
       document.getElementById('fleet-workers').innerHTML =
-        `<div class="empty-state"><div class="empty-state-text">Failed to load fleet data: ${err.message}</div></div>`;
+        `<div class="empty-state"><div class="empty-state-text">Failed to load fleet data: ${msg}</div></div>`;
     }
+  }
+
+  // Running costs: per machine, and per service where that can be said honestly.
+  //
+  // Both endpoints already return a finished sentence for every branch —
+  // "not billed by the kilowatt-hour", "costs are known for 1 of 2 machines" —
+  // so this renders those rather than inventing cheerier wording. The verdicts
+  // exist because the answer is often "this machine is not worth leaving on",
+  // and softening that would defeat the point of computing it.
+  async function loadFleetEconomics() {
+    const card = document.getElementById('fleet-economics-card');
+    const body = document.getElementById('fleet-economics-body');
+    const quality = document.getElementById('fleet-economics-quality');
+    if (!card || !body) return;
+
+    let economics, net;
+    try {
+      [economics, net] = await Promise.all([
+        CP.api('/api/fleet/economics'),
+        CP.api('/api/earnings/net?days=30').catch(() => null),
+      ]);
+    } catch (err) {
+      console.warn('Could not load running costs:', err);
+      return;   // Leave hidden; unknown is not "free".
+    }
+
+    const machines = (economics && economics.machines) || [];
+    if (!machines.length) { card.style.display = 'none'; return; }
+    // Shown as soon as there are machines, not once a tariff exists. Hiding it
+    // until configured made the one control that configures it unreachable.
+    card.style.display = '';
+
+    const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+      ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+    // null is genuinely unknown (a machine not reporting, or no tariff), and an
+    // em dash says so. Everything else is USD from the API and is rendered in
+    // whatever currency the viewer reads in.
+    const money = v => (v == null ? '—' : CP.formatCurrency(v));
+
+    const rows = machines.map(m => {
+      const losing = m.verdict === 'losing_money';
+      return `
+        <div class="economics-row">
+          <div>
+            <div class="economics-machine">${esc(m.machine)}</div>
+            <div class="economics-summary">${esc(m.summary)}</div>
+          </div>
+          <div class="economics-figures">
+            <span title="gross earnings per month">${money(m.monthly_gross)}</span>
+            <span style="color:var(--text-muted);">−</span>
+            <span title="estimated electricity per month">${money(m.monthly_cost)}</span>
+            <span style="color:${losing ? 'var(--danger)' : 'var(--success)'}; font-weight:700;"
+                  title="net per month">${money(m.monthly_net)}</span>
+          </div>
+        </div>`;
+    }).join('');
+
+    // Per-service net, but ONLY the rows whose cost can honestly be attributed.
+    // A container adding 1-3 W to a host that is already on is below what a
+    // smart plug can resolve, so its share is arithmetic, not measurement. The
+    // count of what was withheld is shown rather than the rows being dropped
+    // silently.
+    let services = '';
+    if (net && Array.isArray(net.services) && net.cost_known) {
+      const attributable = net.services.filter(s => s.cost_attributable && s.cost != null);
+      const withheld = net.services.length - attributable.length;
+      if (attributable.length) {
+        services = `
+          <div class="economics-services">
+            <div class="detail-label" style="margin-bottom:6px;">Per service, where the cost can be attributed</div>
+            ${attributable.map(s => `
+              <div class="economics-service-row">
+                <span>${esc(s.platform)}</span>
+                <span style="color:${s.negative ? 'var(--danger)' : 'var(--text-secondary)'};">
+                  ${money(s.gross)} − ${money(s.cost)} = ${money(s.net)}
+                </span>
+              </div>`).join('')}
+          </div>`;
+      }
+      if (withheld > 0) {
+        services += `<div class="economics-note">${withheld} service(s) draw too little on a machine that is already on for their share of the bill to mean anything, so no per-service figure is shown for them. Their cost is still counted in the machine totals above.</div>`;
+      }
+    }
+
+    if (quality) {
+      quality.textContent = economics.summary || '';
+    }
+    card.style.display = '';
+    body.innerHTML = rows + services;
+  }
+
+  // How many workers share each display name.
+  //
+  // A worker redeployed with a new or empty /data registers under a fresh
+  // client_id, and the old row stays forever — offline, same display name,
+  // last-known container pills. The operator then picks one to Remove by
+  // guesswork, and removing the LIVE one takes that host out of the fleet.
+  // Naming the duplicates and showing the id is what makes that choice safe
+  // (CashPilot-3fr).
+  //
+  // Object.create(null), not {}. A worker name is user-controlled
+  // (CASHPILOT_WORKER_NAME), so it can be "__proto__" or "toString". On a plain
+  // object `counts["__proto__"] = ...` hits a setter and the count never
+  // sticks, and `counts["toString"] || 0` reads the inherited FUNCTION —
+  // producing the string "function toString() { [native code] }11" as a count.
+  // Either way two workers with that name are never flagged as duplicates,
+  // which is the one case this whole feature exists for. (CodeRabbit, PR #220.)
+  function countWorkerNames(workers) {
+    const counts = Object.create(null);
+    for (const w of workers || []) {
+      const key = String(w.name || '');
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    return counts;
   }
 
   function renderWorkers(workers) {
     const container = document.getElementById('fleet-workers');
     if (!container) return;
+
+    const nameCounts = countWorkerNames(workers);
 
     let html = '';
 
@@ -215,17 +425,53 @@ ${wurl ? `      - CASHPILOT_WORKER_URL=${wurl}\n` : `      # - CASHPILOT_WORKER_
                 <span class="status-dot ${statusClass}"></span>
                 <span style="font-weight: 600; color: var(--text-primary);">${esc(w.name)}</span>
                 ${isAndroid ? '<span style="font-size:0.7rem; padding:2px 6px; border-radius:4px; background:var(--bg-hover); color:var(--text-muted);">Android</span>' : ''}
+                ${nameCounts[String(w.name || '')] > 1 ? `<span style="font-size:0.7rem; padding:2px 6px; border-radius:4px; background:var(--warning-soft, var(--bg-hover)); color:var(--warning);" title="More than one worker is registered under this name. That usually means this host was redeployed with a new or empty /data, so it re-registered under a new id and the old row stayed behind. Compare the ids and the last-seen times before removing one.">duplicate name</span>` : ''}
+                ${w.enrollment === 'incomplete'
+                  ? `<span style="font-size:0.7rem; padding:2px 6px; border-radius:4px; background:var(--warning-soft, var(--bg-hover)); color:var(--warning);" title="This worker enrolled but never used its own key, so it is still authenticating with the shared CASHPILOT_API_KEY. The shared key is no longer accepted for it. It usually means the worker cannot persist /data/.worker_key — an old image, or a /data that is read-only or not a persistent volume. Upgrade it to 1.0.0+ with a writable persistent /data, then remove it here so it can enroll again.">enrollment incomplete</span>`
+                  : w.enrollment === 'pending'
+                  ? `<span style="font-size:0.7rem; padding:2px 6px; border-radius:4px; background:var(--bg-hover); color:var(--text-muted);" title="This worker has been issued its own key but has not used it yet, so the shared key still works for it for a short while. It clears itself on the worker's next heartbeat.">enrolling</span>`
+                  : ''}
+                <code style="font-size:0.68rem; color:var(--text-muted); background:var(--bg-hover); padding:1px 5px; border-radius:3px;" title="This worker's client_id — the id CashPilot keys it on. Two rows with the same name always have different ids; this is how to tell which is which.">${esc(w.client_id || ('#' + w.id))}</code>
               </div>
-              ${_isOwner ? `<button class="btn btn-danger btn-sm btn-remove-worker" data-worker-id="${w.id}" data-worker-name="${esc(w.name)}" title="Remove worker">Remove</button>` : ''}
+              ${_isOwner ? `<button class="btn btn-danger btn-sm btn-remove-worker" data-worker-id="${w.id}" data-worker-name="${esc(w.name)}" data-worker-client="${esc(w.client_id || '')}" title="Remove worker">Remove</button>` : ''}
             </div>
             <div style="display: flex; gap: 16px; flex-wrap: wrap; font-size: 0.82rem; color: var(--text-muted);">
               <span>${esc(w.url || '-')}</span>
               <span>${esc(sysInfo.os || '-')}${sysInfo.os_version ? ' ' + esc(sysInfo.os_version) : ''}</span>
               <span>${esc(sysInfo.arch || '-')}</span>
-              <span>Last seen: ${w.last_heartbeat || 'never'}</span>
+              <span title="${esc(CP.fmtTimestamp(w.last_heartbeat).title)}">Last seen: ${esc(CP.fmtTimestamp(w.last_heartbeat).text)}</span>
+              <span>
+                <label for="watts-${esc(w.client_id || w.id)}" style="color:var(--text-muted);">Draw</label>
+                <input id="watts-${esc(w.client_id || w.id)}" class="power-watts form-input" type="number" min="0" step="1"
+                       data-client-id="${esc(w.client_id || w.id)}" value="${esc(w.watts ?? '')}"
+                       placeholder="65" style="width:5rem; padding:2px 6px; font-size:0.78rem;"
+                       title="Wall power this machine draws, in watts. Without it CashPilot cannot say what the machine costs to run.">W
+                <label style="color:var(--text-muted); margin-left:8px;">
+                  <input type="checkbox" class="power-dedicated" data-client-id="${esc(w.client_id || w.id)}" ${w.dedicated ? 'checked' : ''}>
+                  dedicated
+                </label>
+                <button class="btn btn-ghost btn-sm power-save-worker" data-client-id="${esc(w.client_id || w.id)}"
+                        style="font-size:0.7rem; padding:1px 6px;">Save</button>
+              </span>
+              ${sysInfo.version
+                ? (() => {
+                    // What this worker was actually judged against. An Android
+                    // client is compared to the newest CashPilot-android
+                    // release, not to the UI: the two ship on separate tracks,
+                    // so "v0.3.0 != UI v1.24.1" was never skew, it was two
+                    // different products, and it flagged every phone forever.
+                    const isAndroid = String(sysInfo.os || '').toLowerCase() === 'android';
+                    const ref = w.reference_version || w.ui_version || '?';
+                    const refLabel = isAndroid ? `latest v${esc(ref)}` : `UI v${esc(ref)}`;
+                    const why = isAndroid
+                      ? `This phone is on an older CashPilot Android release than the newest published one (${esc(ref)}). Install the newer APK from the GitHub releases page.`
+                      : `This worker is on a different release series from the UI (${esc(ref)}). Update whichever is behind — on Unraid the UI and the worker are two separate apps, so updating one leaves the other.`;
+                    return `<span${w.version_skew ? ` style="color:var(--warning); font-weight:600;" title="${why}"` : ''}>v${esc(sysInfo.version)}${w.version_skew ? ` \u2260 ${refLabel}` : ''}</span>`;
+                  })()
+                : `<span title="This worker predates version reporting, so CashPilot cannot tell which release it is. Update it to find out.">version unknown</span>`}
             </div>
-            ${isAndroid && items.length > 0 ? renderApps(items) : ''}
-            ${!isAndroid && items.length > 0 ? renderContainers(w) : ''}
+            ${isAndroid && items.length > 0 ? renderApps(items, isOnline, w.last_heartbeat) : ''}
+            ${!isAndroid && items.length > 0 ? renderContainers(w, isOnline) : ''}
           </div>
         </div>`;
       }
@@ -240,40 +486,69 @@ ${wurl ? `      - CASHPILOT_WORKER_URL=${wurl}\n` : `      # - CASHPILOT_WORKER_
     return (b / 1073741824).toFixed(2) + ' GB';
   }
 
-  function renderApps(apps) {
+  function renderApps(apps, isOnline, lastSeen) {
     let html = '<div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-color);">';
+    if (isOnline === false) {
+      html += `<div style="font-size:0.7rem; color:var(--text-muted); margin-bottom:6px;">Last known state — not reachable</div>`;
+    }
     html += '<div style="display: flex; gap: 6px; flex-wrap: wrap;">';
     for (const a of apps) {
-      const isRunning = a.running;
+      // Same rule as the containers: an unreachable device cannot be reporting
+      // an app as running, whatever its last heartbeat said.
+      const isRunning = isOnline !== false && a.running;
       const color = isRunning ? 'var(--success)' : 'var(--text-muted)';
       const bg = isRunning ? 'var(--success-soft)' : 'var(--bg-hover)';
       const tx = a.net_tx_24h || 0;
       const rx = a.net_rx_24h || 0;
-      const netTip = (tx || rx) ? ` title="24h: ↑${fmtBytes(tx)} ↓${fmtBytes(rx)}"` : '';
-      html += `<span style="font-size:0.75rem; padding:3px 8px; border-radius:4px; background:${bg}; color:${color}; font-weight:500;"${netTip}>${esc(a.slug)}</span>`;
+      const staleTip = isOnline === false ? esc(staleNote(lastSeen)) : '';
+      const trafficTip = (tx || rx) ? `24h: ↑${fmtBytes(tx)} ↓${fmtBytes(rx)}` : '';
+      const tipText = [staleTip, trafficTip].filter(Boolean).join(' — ');
+      const netTip = tipText ? ` title="${tipText}"` : '';
+      const appStyle = isOnline === false ? ' border:1px dashed var(--border-color); opacity:0.75;' : '';
+      html += `<span style="font-size:0.75rem; padding:3px 8px; border-radius:4px; background:${bg}; color:${color}; font-weight:500;${appStyle}"${netTip}>${esc(a.slug)}</span>`;
     }
     html += '</div></div>';
     return html;
   }
 
-  function renderContainers(worker) {
+  // A container's colour is a claim about RIGHT NOW, and it can only be made
+  // while the worker is reachable. When it is not, every chip stayed the colour
+  // frozen into the last heartbeat — so a host that is powered off rendered a
+  // row of success-green containers next to a grey dot, and green is the louder
+  // signal. The state is still shown, because "what was running when we last
+  // heard" is useful, but it is shown as a memory rather than a measurement.
+  function staleNote(lastSeen) {
+    return `Last reported ${CP.fmtTimestamp(lastSeen).text}. This host is not reachable, so this is the last known state, not the current one.`;
+  }
+
+  function renderContainers(worker, isOnline) {
     let html = '<div style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-color);">';
+    if (!isOnline) {
+      html += `<div style="font-size:0.7rem; color:var(--text-muted); margin-bottom:6px;">Last known state — not reachable</div>`;
+    }
     html += '<div style="display: flex; gap: 6px; flex-wrap: wrap;">';
     for (const c of worker.containers) {
       const status = (c.status || 'stopped').toLowerCase();
-      const isRunning = status === 'running';
+      const isRunning = isOnline && status === 'running';
       const color = isRunning ? 'var(--success)' : 'var(--text-muted)';
       const bg = isRunning ? 'var(--success-soft)' : 'var(--bg-hover)';
-      html += `<span style="font-size:0.75rem; padding:3px 8px; border-radius:4px; background:${bg}; color:${color}; font-weight:500;">${esc(c.slug || c.name)}</span>`;
+      const style = isOnline ? '' : ' border:1px dashed var(--border-color); opacity:0.75;';
+      const tip = isOnline ? '' : ` title="${esc(staleNote(worker.last_heartbeat))}"`;
+      html += `<span style="font-size:0.75rem; padding:3px 8px; border-radius:4px; background:${bg}; color:${color}; font-weight:500;${style}"${tip}>${esc(c.slug || c.name)}</span>`;
     }
     html += '</div></div>';
     return html;
   }
 
   function esc(str) {
-    const d = document.createElement('div');
-    d.textContent = str || '';
-    return d.innerHTML;
+    // Escape quotes too (the textContent/innerHTML trick doesn't), so values
+    // interpolated into attributes like data-worker-name="..." can't break out.
+    return String(str ?? '')
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#39;');
   }
 
   window.toggleApiKey = async function() {
@@ -282,20 +557,23 @@ ${wurl ? `      - CASHPILOT_WORKER_URL=${wurl}\n` : `      # - CASHPILOT_WORKER_
       _apiKeyRevealed = false;
       btn.textContent = 'Reveal API Key';
     } else {
-      if (!_apiKey) {
-        try {
-          const data = await CP.api('/api/fleet/api-key');
-          _apiKey = data.api_key || '(not configured)';
-        } catch { _apiKey = '(error)'; }
-      }
+      btn.disabled = true;
+      const prev = btn.textContent;
+      btn.textContent = 'Revealing…';
+      await fetchApiKey();
+      btn.disabled = false;
       _apiKeyRevealed = true;
       btn.textContent = 'Hide API Key';
     }
     renderSnippet();
   };
 
-  async function removeWorker(workerId, name) {
-    if (!confirm(`Remove worker "${name}"? This will unregister it from the fleet.`)) return;
+  async function removeWorker(workerId, name, clientId) {
+    // The id is in the prompt because two rows can share a display name — a
+    // host redeployed with a new /data leaves its old row behind — and picking
+    // the wrong one takes the LIVE host out of the fleet (CashPilot-3fr).
+    const which = clientId ? `\n\nId: ${clientId}` : '';
+    if (!confirm(`Remove worker "${name}"?${which}\n\nIt is removed from the fleet here, but the worker itself keeps running. It will re-enrol on its own after a few minutes of rejected heartbeats. To bring it back immediately, delete /data/.worker_key on that host and restart the container.`)) return;
     try {
       await CP.api(`/api/workers/${workerId}`, { method: 'DELETE' });
       CP.toast(`Worker "${name}" removed`, 'success');
@@ -305,30 +583,108 @@ ${wurl ? `      - CASHPILOT_WORKER_URL=${wurl}\n` : `      # - CASHPILOT_WORKER_
     }
   }
 
-  document.getElementById('fleet-workers').addEventListener('click', function(e) {
+  // The tariff the running-costs card needs. These keys were read by
+  // app/main.py and written by nothing: no field, no docs, no route short of
+  // hand-crafting a POST /api/config (CashPilot-jm6).
+  async function loadPowerSettings() {
+    const price = document.getElementById('power-price');
+    const currency = document.getElementById('power-currency');
+    if (!price || !currency) return;
+    try {
+      const config = await CP.api('/api/config');
+      // power_price_per_kwh is canonical; electricity_price_per_kwh is the older
+      // name main.py still honours, so an existing setting shows up here rather
+      // than looking unset and being silently overwritten.
+      const stored = config.power_price_per_kwh ?? config.electricity_price_per_kwh;
+      if (stored != null && stored !== '') price.value = stored;
+      if (config.power_currency) currency.value = config.power_currency;
+    } catch (err) {
+      console.warn('Could not read the power settings:', err);
+    }
+  }
+
+  async function savePowerSettings() {
+    const price = document.getElementById('power-price');
+    const currency = document.getElementById('power-currency');
+    const raw = (price.value || '').trim();
+    if (raw === '') {
+      CP.toast('Enter your price per kWh first', 'warning');
+      return;
+    }
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value < 0) {
+      CP.toast('That is not a price per kWh', 'error');
+      return;
+    }
+    const code = (currency.value || 'EUR').trim().toUpperCase();
+    try {
+      await CP.api('/api/config', { method: 'POST', body: { data: {
+        power_price_per_kwh: String(value),
+        power_currency: code,
+      } } });
+      CP.toast('Electricity price saved', 'success');
+      loadFleetEconomics();
+    } catch (err) {
+      CP.toast('Could not save: ' + err.message, 'error');
+    }
+  }
+
+  document.getElementById('power-save').addEventListener('click', savePowerSettings);
+
+  document.getElementById('fleet-workers').addEventListener('click', async function(e) {
+    // Per-machine power. machine_economics needs BOTH a tariff and a wattage;
+    // with either missing every machine reports UNKNOWN, which is what the card
+    // did forever because neither had an input (CashPilot-jm6).
+    const powerBtn = e.target.closest('.power-save-worker');
+    if (powerBtn) {
+      const id = powerBtn.dataset.clientId;
+      const watts = document.querySelector(`.power-watts[data-client-id="${CSS.escape(id)}"]`);
+      const dedicated = document.querySelector(`.power-dedicated[data-client-id="${CSS.escape(id)}"]`);
+      const raw = (watts?.value || '').trim();
+      const value = Number(raw);
+      if (raw !== '' && (!Number.isFinite(value) || value < 0)) {
+        CP.toast('That is not a wattage', 'error');
+        return;
+      }
+      try {
+        await CP.api('/api/config', { method: 'POST', body: { data: {
+          // Keyed on client_id, which survives re-enrolment — the row id does
+          // not, and settings keyed on it are orphaned when a host re-enrols.
+          [`worker_${id}_watts`]: raw,
+          [`worker_${id}_dedicated`]: dedicated?.checked ? 'true' : 'false',
+        } } });
+        CP.toast('Machine power saved', 'success');
+        loadFleetEconomics();
+      } catch (err) {
+        CP.toast('Could not save: ' + err.message, 'error');
+      }
+      return;
+    }
+
     const btn = e.target.closest('.btn-remove-worker');
     if (!btn) return;
     const id = parseInt(btn.dataset.workerId, 10);
     if (isNaN(id)) return;
     const name = btn.dataset.workerName;
-    removeWorker(id, name);
+    removeWorker(id, name, btn.dataset.workerClient);
   });
 
   window.copySnippet = async function() {
-    // Make sure the real key is included even if not currently revealed
-    if (!_apiKey) {
-      try {
-        const data = await CP.api('/api/fleet/api-key');
-        _apiKey = data.api_key || '(not configured)';
-      } catch { _apiKey = '(error)'; }
-    }
+    // Make sure the real key is included even if not currently revealed.
+    // fetchApiKey() hits the owner-only reveal endpoint and returns the
+    // plaintext key (or "(error)"/"(not configured)" on failure).
+    await fetchApiKey();
     const prevRevealed = _apiKeyRevealed;
     _apiKeyRevealed = true;
     renderSnippet();
     const text = document.getElementById('snippet-output').textContent;
     _apiKeyRevealed = prevRevealed;
     renderSnippet();
+    // navigator.clipboard is gated on a SECURE CONTEXT, and docs/fleet.md
+    // documents the normal setup as plain http:// on the LAN. There the object
+    // is undefined, so the property access throws and the copy silently fails.
     try {
+      if (!navigator.clipboard) throw new Error('clipboard unavailable');
       await navigator.clipboard.writeText(text);
       CP.toast('Copied to clipboard', 'success');
     } catch {
@@ -336,6 +692,7 @@ ${wurl ? `      - CASHPILOT_WORKER_URL=${wurl}\n` : `      # - CASHPILOT_WORKER_
     }
   };
 
+  loadApiKeyStatus();
   loadFleet();
   fleetTimer = setInterval(loadFleet, 60000);
 })();

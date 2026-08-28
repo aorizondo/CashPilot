@@ -10,6 +10,7 @@ import logging
 
 import httpx
 
+from app.collectors import base
 from app.collectors.base import BaseCollector, EarningsResult
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ class RepocketCollector(BaseCollector):
     platform = "repocket"
 
     def __init__(self, email: str, password: str) -> None:
+        super().__init__()
         self.email = email
         self.password = password
         self._id_token: str | None = None
@@ -71,38 +73,42 @@ class RepocketCollector(BaseCollector):
     async def collect(self) -> EarningsResult:
         """Fetch current Repocket balance."""
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                if not self._id_token:
-                    await self._authenticate(client)
+            client = self._get_client(timeout=30)
+            if not self._id_token:
+                await self._authenticate(client)
 
-                headers = {"Auth-Token": self._id_token}
-                resp = await client.get(
+            headers = {"Auth-Token": self._id_token}
+
+            async def _fetch_balance() -> httpx.Response:
+                return await client.get(
                     f"{API_BASE}/reports/current",
                     headers=headers,
                 )
 
-                if resp.status_code == 401:
-                    await self._refresh(client)
-                    headers = {"Auth-Token": self._id_token}
-                    resp = await client.get(
-                        f"{API_BASE}/reports/current",
-                        headers=headers,
-                    )
+            resp = await self._retry(_fetch_balance)
 
-                resp.raise_for_status()
-                data = resp.json()
+            if resp.status_code == 401:
+                await self._refresh(client)
+                headers = {"Auth-Token": self._id_token}
+                resp = await self._retry(_fetch_balance)
 
-                # centsCredited is in cents
-                cents = float(data.get("centsCredited", 0))
-                balance_usd = round(cents / 100, 4)
+            resp.raise_for_status()
+            data = resp.json()
 
-                return EarningsResult(
-                    platform=self.platform,
-                    balance=balance_usd,
-                    currency="USD",
-                )
+            # centsCredited is in cents
+            raw = data.get("centsCredited")
+            if raw is None:
+                raise ValueError("centsCredited field missing — API shape may have changed")
+            cents = float(raw)
+            balance_usd = round(cents / 100, 4)
+
+            return EarningsResult(
+                platform=self.platform,
+                balance=balance_usd,
+                currency="USD",
+            )
         except Exception as exc:
-            logger.error("Repocket collection failed: %s", exc)
+            base.log_failure(logger, "Repocket", exc)
             return EarningsResult(
                 platform=self.platform,
                 balance=0.0,

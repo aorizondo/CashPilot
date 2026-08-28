@@ -1,0 +1,68 @@
+# CashPilot - build from source (for contributors / local development)
+# https://github.com/GeiserX/CashPilot
+#
+# This file builds the UI and worker images from the local checkout instead of
+# pulling the published releases. Use it when developing changes:
+#
+#   docker compose -f docker-compose.build.yml up -d --build
+#
+# Regular users should use the default docker-compose.yml, which pulls the
+# published `latest` image (no build toolchain required).
+
+services:
+  cashpilot-ui:
+    build: .
+    image: drumsergio/cashpilot:dev
+    container_name: cashpilot-ui
+    # Loopback by default (the UI can command the Docker-socket worker). Set
+    # CASHPILOT_BIND_ADDR to a specific interface to reach it from another machine,
+    # or 0.0.0.0 to publish on all interfaces (prefer a reverse proxy with auth).
+    ports:
+      - "${CASHPILOT_BIND_ADDR:-127.0.0.1}:8080:8080"
+    volumes:
+      - cashpilot_data:/data
+      - cashpilot_fleet:/fleet
+    environment:
+      - TZ=${TZ:-UTC}
+      - CASHPILOT_SECRET_KEY=${CASHPILOT_SECRET_KEY:-}
+      # Optional: only needed to RESTORE credentials onto a fresh volume.
+      # An existing /data/.fernet_key always wins, so setting this is safe.
+      - CASHPILOT_ENCRYPTION_KEY=${CASHPILOT_ENCRYPTION_KEY:-}
+      - CASHPILOT_ALLOW_EPHEMERAL_KEY=${CASHPILOT_ALLOW_EPHEMERAL_KEY:-false}
+      - CASHPILOT_API_KEY=${CASHPILOT_API_KEY:-}
+      - CASHPILOT_ADMIN_API_KEY=${CASHPILOT_ADMIN_API_KEY:-}
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64M
+
+  cashpilot-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: drumsergio/cashpilot-worker:dev
+    container_name: cashpilot-worker
+    expose:
+      - "8081"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - cashpilot_worker_data:/data
+      - cashpilot_fleet:/fleet
+    environment:
+      - TZ=${TZ:-UTC}
+      - CASHPILOT_UI_URL=http://cashpilot-ui:8080
+      - CASHPILOT_API_KEY=${CASHPILOT_API_KEY:-}
+      - CASHPILOT_WORKER_NAME=local
+    init: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=64M
+
+volumes:
+  cashpilot_data:
+  cashpilot_worker_data:
+  cashpilot_fleet:

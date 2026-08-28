@@ -27,12 +27,58 @@ _by_slug: dict[str, dict[str, Any]] = {}
 _REQUIRED_FIELDS = {"name", "slug", "category", "status", "description", "docker"}
 
 
+_CATEGORIES = {"bandwidth", "depin", "storage", "compute"}
+_VALID_STATUSES = {"active", "beta", "broken", "dead", "dropped"}
+
+
 def _validate(data: dict[str, Any], path: Path) -> list[str]:
-    """Return a list of validation errors (empty = OK)."""
+    """Return a list of validation errors (empty = OK).
+
+    A service with ANY error is skipped at load (it silently disappears from the
+    UI), so these checks only assert invariants every real entry already satisfies
+    — they exist to catch a malformed NEW entry, not to drop valid ones.
+    """
     errors: list[str] = []
     missing = _REQUIRED_FIELDS - set(data.keys())
     if missing:
         errors.append(f"{path.name}: missing required fields: {missing}")
+
+    category = data.get("category")
+    if category is not None and category not in _CATEGORIES:
+        errors.append(f"{path.name}: invalid category {category!r} (expected one of {sorted(_CATEGORIES)})")
+
+    status = data.get("status")
+    if status is not None and status not in _VALID_STATUSES:
+        errors.append(f"{path.name}: invalid status {status!r} (expected one of {sorted(_VALID_STATUSES)})")
+
+    disclosure = data.get("disclosure")
+    if disclosure is not None and not isinstance(disclosure, dict):
+        # `disclosure: TODO` loaded fine and then 500'd the endpoint at request
+        # time, so the fault was invisible until someone opened that one service.
+        errors.append(f"{path.name}: disclosure must be a mapping, not {type(disclosure).__name__}")
+
+    docker = data.get("docker")
+    if isinstance(docker, dict):
+        image = docker.get("image")
+        # Extension/app-only services legitimately have an empty (or absent) image —
+        # they are listed but not Docker-deployable. Only reject a non-string image.
+        if image is not None and not isinstance(image, str):
+            errors.append(f"{path.name}: docker.image must be a string")
+        env = docker.get("env")
+        if env is not None and not isinstance(env, list):
+            errors.append(f"{path.name}: docker.env must be a list")
+        elif isinstance(env, list):
+            for i, item in enumerate(env):
+                key = item.get("key") if isinstance(item, dict) else None
+                if not isinstance(key, str) or not key.strip():
+                    errors.append(f"{path.name}: docker.env[{i}] must have a non-empty string 'key'")
+
+    reqs = data.get("requirements")
+    if isinstance(reqs, dict):
+        for field in ("residential_ip", "vps_ip", "gpu"):
+            if field in reqs and not isinstance(reqs[field], bool):
+                errors.append(f"{path.name}: requirements.{field} must be a boolean")
+
     return errors
 
 
@@ -183,3 +229,49 @@ def register_sighup() -> None:
     """Register SIGHUP handler for catalog reload (Unix only)."""
     if sys.platform != "win32":
         signal.signal(signal.SIGHUP, _sighup_handler)
+
+
+def critical_volume_targets(slug: str) -> dict[str, str] | None:
+    """Return {container_path: why_it_matters} for a service's irreplaceable mounts.
+
+    Returns ``None`` when criticality cannot be determined at all — an unknown
+    slug, or a build whose image does not ship the catalog. Callers must treat
+    ``None`` as "unsafe to destroy", not as "nothing is critical": silently
+    allowing deletion because the catalog was missing is exactly the kind of
+    fail-open this guard exists to prevent. An empty dict means the catalog was
+    read and the service genuinely declares nothing critical.
+    """
+    svc = get_service(slug)
+    if svc is None:
+        return None
+    docker = svc.get("docker") or {}
+    entries = docker.get("critical_volumes") or []
+    targets: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        target = entry.get("target")
+        if target:
+            targets[str(target)] = str(entry.get("holds") or "Irreplaceable service state.")
+    return targets
+
+
+def vps_allowed(requirements: dict[str, Any] | None) -> bool | None:
+    """Whether a VPS is permitted, applying the schema's documented default.
+
+    ``services/_schema.yml`` states that ``vps_ip`` defaults to the opposite of
+    ``residential_ip``. Two consumers read this one fact and disagreed:
+    ``scripts/generate_readme_tables.py`` applied the default (so the catalog
+    page tells the user "VPS not allowed"), while ``app/preflight.py`` tested
+    ``reqs.get("vps_ip") is False`` — demanding the literal boolean, so an
+    absent key never entered the branch and 21 services that the docs describe
+    as residential-only produced no warning at all before a deploy onto a
+    hosting worker.
+
+    Returns None when neither field is set: unknown, not permitted.
+    """
+    reqs = requirements or {}
+    if reqs.get("vps_ip") is not None:
+        return bool(reqs["vps_ip"])
+    residential = reqs.get("residential_ip")
+    return None if residential is None else not residential

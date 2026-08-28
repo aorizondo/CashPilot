@@ -25,6 +25,7 @@ from app.constants import (
     LABEL_MANAGED,
     LABEL_SERVICE,
     LABEL_VERSION,
+    UNDEPLOYABLE_STATUSES,
 )
 
 
@@ -35,6 +36,33 @@ def _escape_interpolation(value: str) -> str:
     since catalog YAML exclusively uses the braced form.
     """
     return re.sub(r"(?<!\$)\$\{", "$${", value)
+
+
+def _escape_value(value: str) -> str:
+    """Escape every $ in a substituted value so Compose keeps it literal.
+
+    Compose interpolates $VAR and ${VAR} in unquoted and double-quoted YAML
+    values, so a credential like ``tok$word`` written into the file verbatim
+    silently CHANGES when the exported file runs. $$ is the spec's literal form.
+    """
+    return value.replace("$", "$$")
+
+
+def _substitute_env(value: str, env: dict[str, str]) -> str:
+    """Fill ${KEY} placeholders from the emitted environment map.
+
+    The catalog uses ${KEY} in `command` and volume host paths to mean "the value
+    of this service's KEY variable" — and the worker deploy path substitutes them
+    (app/main.py api_deploy). The exporter used to only ESCAPE them instead, so an
+    exported honeygain/iproyal/traffmonetizer/packetstream/proxybase file ran the
+    client with the literal eight characters "${EMAIL}" as its credentials: a file
+    that could never authenticate, silently. Placeholders with no corresponding
+    entry (proxyrack's ${UUID}) are left for _escape_interpolation, preserving the
+    old template behavior for values CashPilot does not hold. Inserted values are
+    $-escaped so a credential containing a dollar sign survives Compose's own
+    interpolation pass.
+    """
+    return re.sub(r"\$\{(\w+)\}", lambda m: _escape_value(env[m.group(1)]) if m.group(1) in env else m.group(0), value)
 
 
 def _is_named_volume(volume_str: str) -> str | None:
@@ -101,17 +129,22 @@ def _service_to_compose(
         elif var.get("required"):
             env[key] = f"<{var.get('label', key)}>"
     if env:
-        compose_svc["environment"] = env
+        # $-escaped at emission: Compose interpolates inside environment values
+        # too, so a stored password containing $ would otherwise change (or
+        # error) when the exported file runs. The raw map stays unescaped — it
+        # is also the substitution source for command/volumes, which escape at
+        # their own emission point.
+        compose_svc["environment"] = {key: _escape_value(value) for key, value in env.items()}
 
     # Ports
     ports = docker_conf.get("ports", [])
     if ports:
         compose_svc["ports"] = [str(p) for p in ports]
 
-    # Volumes — escape ${VAR} interpolation in host paths
+    # Volumes — fill ${VAR} host paths from known values, escape whatever remains
     volumes = docker_conf.get("volumes", [])
     if volumes:
-        compose_svc["volumes"] = [_escape_interpolation(str(v)) for v in volumes]
+        compose_svc["volumes"] = [_escape_interpolation(_substitute_env(str(v), env)) for v in volumes]
 
     # Network mode
     network_mode = docker_conf.get("network_mode")
@@ -123,10 +156,22 @@ def _service_to_compose(
     if cap_add:
         compose_svc["cap_add"] = cap_add
 
-    # Command — escape ${VAR} interpolation
+    # Command — fill ${VAR} credentials from known values, escape whatever remains
     command = docker_conf.get("command")
     if command:
-        compose_svc["command"] = _escape_interpolation(command)
+        compose_svc["command"] = _escape_interpolation(_substitute_env(command, env))
+
+    # Durable resource limits. Compose accepts these as top-level service keys
+    # under the same names the catalog uses; dropping them exported a container
+    # WITHOUT its memory ceiling, OOM bias or CPU weight — silently less
+    # protected than the same service deployed by the worker (CashPilot-65q4).
+    # Only keys the catalog actually sets are emitted; absent stays absent.
+    resources = docker_conf.get("resources") or {}
+    if isinstance(resources, dict):
+        for key in ("mem_limit", "mem_reservation", "cpu_shares", "oom_score_adj"):
+            value = resources.get(key)
+            if value is not None:
+                compose_svc[key] = value
 
     return compose_svc
 
@@ -140,6 +185,11 @@ def generate_compose_single(
     svc = get_service(slug)
     if not svc:
         raise ValueError(f"Unknown service: {slug}")
+    if svc.get("status") in UNDEPLOYABLE_STATUSES:
+        # A compose file for a dead service is a runnable artifact pointing at
+        # something that cannot earn — the export must refuse like the deploy
+        # route does, not hand the user a working-looking YAML.
+        raise ValueError(f"Service {slug} is no longer available ({svc.get('status')})")
 
     compose_svc = _service_to_compose(svc, env_vars, hostname)
     if not compose_svc:
@@ -166,6 +216,8 @@ def generate_compose_multi(
     for slug in slugs:
         svc = get_service(slug)
         if not svc:
+            continue
+        if svc.get("status") in UNDEPLOYABLE_STATUSES:
             continue
         compose_svc = _service_to_compose(svc, env_map.get(slug), hostname)
         if compose_svc:

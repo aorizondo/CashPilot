@@ -12,16 +12,20 @@ short_description: Bandwidth sharing - 15% lifetime referral, works on VPS
 
 referral:
   signup_url: "https://proxylite.ru/?r=KMUPRZIZ"
+  code: "KMUPRZIZ"
 
 docker:
   image: proxylite/proxyservice
   platforms: [linux/amd64, linux/arm64]
+  resources:
+    mem_limit: "128m"
+    oom_score_adj: 300
   env:
     - key: USER_ID
       label: "User ID"
       required: true
       secret: false
-      description: "Your ProxyLite account ID (found in dashboard at lk.proxylite.ru after registration)"
+      description: "Log in at <a href=\"https://lk.proxylite.ru\">lk.proxylite.ru</a> → your User ID is shown on the main dashboard page next to your email"
   ports: []
   volumes: []
   command: ""
@@ -57,3 +61,7 @@ platforms: [docker, windows, linux]
 collector:
   type: api
   notes: "Dashboard at lk.proxylite.ru. User ID based authentication."
+
+payout:
+  model: unknown
+  notes: "Not yet determined. Flagged rather than shown blank -- see CashPilot-luj."

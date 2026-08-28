@@ -15,14 +15,14 @@ theme:
   favicon: icon.svg
   palette:
     - scheme: slate
-      primary: deep purple
-      accent: pink
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-4
         name: Switch to light mode
     - scheme: default
-      primary: deep purple
-      accent: pink
+      primary: custom
+      accent: custom
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
@@ -55,10 +55,27 @@ markdown_extensions:
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.inlinehilite
-  - pymdownx.snippets
+  # base_path reaches the repo ROOT so a docs page can include a real shipped
+  # file verbatim -- the quickstart includes docker-compose.yml, so it cannot
+  # drift from what actually ships. A hand-copied one did: it published the
+  # worker's Docker-socket API on every interface and pinned :latest, both of
+  # which security-defaults.md forbids.
+  #
+  # check_paths makes a missing include FAIL the build instead of rendering an
+  # empty block, which would look like a quickstart with no compose file.
+  - pymdownx.snippets:
+      base_path:
+        - .
+        - docs
+      check_paths: true
   - pymdownx.mark
   - attr_list
   - md_in_html
+  # Renders :material-xxx: shortcodes as real icons. Without this the feature
+  # cards on the home page print the literal shortcode text instead.
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - tables
   - toc:
       permalink: true
@@ -70,13 +87,51 @@ extra:
     - icon: fontawesome/brands/docker
       link: https://hub.docker.com/r/drumsergio/cashpilot
 
+extra_css:
+  - stylesheets/theme.css
+
+# Files that live under docs/ but must NEVER be published.
+#
+# MkDocs builds EVERY file in docs_dir, whether or not it appears in nav — so
+# these three were live on the public site despite being in no menu:
+#   /GOAL/                -> HTTP 200
+#   /AUTOPILOT-WORKLOG/   -> HTTP 200
+# They are agent working files. Between them they published this project's
+# internal planning verbatim, quoted the maintainer directly, and printed a
+# real Mysterium node identity address, which links this public repository to a
+# specific earning node.
+#
+# `mkdocs build --strict` does NOT catch this: validation.nav.omitted_files
+# defaults to `info`, and --strict only promotes `warn` to an error. Exclusion
+# has to be explicit.
+exclude_docs: |
+  GOAL.md
+  AUTOPILOT-WORKLOG.md
+  DEFERRED-QUESTIONS.md
+  # The changelog and its archive are deliberately NOT part of the docs site.
+  # They belong beside the code, where someone comparing the version they run
+  # against the one they are about to pull will actually look, and their links
+  # are written relative to the REPOSITORY root (../CHANGELOG.md,
+  # docs/guides/proxybase.md) rather than to the site tree — which is also why
+  # --strict fails on them if they are published.
+  changelog-0.x-handwritten.md
+  # An internal working checklist, not a product page. It opens "Track status of
+  # each action here", lists promotion tactics in candid internal wording, and
+  # ticks off features that do not exist yet. Publishing it told visitors what we
+  # do to acquire them, and a checklist published as a page is a checklist nobody
+  # updates. It was reachable at /growth-strategy/ (verified 200) even though no
+  # nav entry linked it.
+  #
+  # This stops it being a PAGE. It does NOT make it private: the repository is
+  # public, so the file is still readable on GitHub. Removing it from history is
+  # a separate, deliberate decision.
+  growth-strategy.md
+
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
-  - Architecture: architecture.md
-  - Fleet Management: fleet.md
   - Service Guides:
-    - guides/README.md
+    - Overview: guides/README.md
     - Bandwidth Sharing:
       - Bitping: guides/bitping.md
       - Bytebenefit: guides/bytebenefit.md
@@ -92,6 +147,7 @@ nav:
       - PacketStream: guides/packetstream.md
       - Peer2Profit: guides/peer2profit.md
       - ProxyBase: guides/proxybase.md
+      - ProxyBase Markets: guides/proxybase-xyz.md
       - ProxyLite: guides/proxylite.md
       - ProxyRack: guides/proxyrack.md
       - Repocket: guides/repocket.md
@@ -102,7 +158,7 @@ nav:
       - WizardGain: guides/wizardgain.md
     - DePIN:
       - Anyone Protocol: guides/anyone-protocol.md
-      - BlockMesh: guides/blockmesh.md
+      - BlockMesh (Perceptron Network): guides/blockmesh.md
       - Dawn Internet: guides/dawn.md
       - Deeper Network: guides/deeper-network.md
       - GagaNode: guides/gaganode.md
@@ -121,8 +177,6 @@ nav:
       - Titan Network: guides/titan.md
       - Uprock: guides/uprock.md
       - Wipter: guides/wipter.md
-    - Storage:
-      - Storj: guides/storj.md
     - GPU Compute:
       - Flux: guides/flux.md
       - Golem Network: guides/golem.md
@@ -130,3 +184,24 @@ nav:
       - Nosana: guides/nosana.md
       - Salad: guides/salad.md
       - Vast.ai: guides/vast-ai.md
+    - Storage:
+      - Storj: guides/storj.md
+  - Configuration:
+    - Configuration: configuration.md
+    - Fleet Management: fleet.md
+  - Security:
+    - Security Defaults: security-defaults.md
+    - Network Isolation: isolation.md
+  - Operations:
+    - Backup and Restore: backup-restore.md
+    - Backing Up Node Identities: backup.md
+    - Prometheus Metrics: guides/prometheus-metrics.md
+    - Upgrade to v1.0.0: upgrade-v1.md
+  - Reference:
+    - Architecture: architecture.md
+    - Direction and Roadmap: roadmap.md
+    - What "idle" looks like on the wire: research/idle-network-traffic.md
+    - Per-IP device limits: research/per-ip-device-limits.md
+    - Self-hosting operability review: research/self-hosting-operability.md
+    - Fleet upgrades & onboarding (design): research/fleet-upgrades-and-onboarding.md
+    - Earnings benchmarks (design): research/earnings-benchmarks.md

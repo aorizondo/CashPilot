@@ -12,10 +12,14 @@ short_description: Bandwidth sharing - most established platform
 
 referral:
   signup_url: "https://dashboard.honeygain.com/ref/SERGIB4014"
+  code: "SERGIB4014"
 
 docker:
   image: honeygain/honeygain
   platforms: [linux/amd64]
+  resources:
+    mem_limit: "256m"
+    oom_score_adj: 200
   env:
     - key: HONEYGAIN_EMAIL
       label: "Email"
@@ -37,11 +41,13 @@ docker:
   volumes: []
   command: "-tou-accept -email ${HONEYGAIN_EMAIL} -pass ${HONEYGAIN_PASSWORD} -device ${HONEYGAIN_DEVICE_NAME}"
   network_mode: ""
-  privileged: true
+  privileged: false
 
 requirements:
   residential_ip: true
+  vps_ip: false
   devices_per_account: 10
+  devices_per_ip: 1
   min_bandwidth: ""
   gpu: false
   min_storage: ""
@@ -71,3 +77,8 @@ platforms: [docker, windows, macos, linux, android]
 collector:
   type: api
   notes: "JWT auth via /v1/users/me and /v2/earnings endpoints"
+  credential_hint: "Use your Honeygain account email and password (same as <a href='https://dashboard.honeygain.com' target='_blank'>dashboard.honeygain.com</a>)."
+
+payout:
+  model: internal
+  notes: "Balance held by Honeygain; withdrawn on request."

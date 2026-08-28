@@ -9,7 +9,9 @@ CashPilot takes security seriously. This document describes how to report vulner
 | Latest release (`latest` Docker tag) | Yes |
 | Previous releases | No |
 
-Only the latest published Docker images (`drumsergio/cashpilot:latest` and `drumsergio/cashpilot-worker:latest`) receive security patches. There are no LTS branches.
+Only the most recent release line receives security patches. There are no LTS branches.
+
+The example compose files pin the **major.minor** tag (e.g. `drumsergio/cashpilot:1.4`), so a `docker compose pull` picks up patch fixes automatically but never moves you to a new minor or major without an explicit edit. `:latest` is published but deliberately not used in the quickstart: it makes what you are running unknowable and can carry a breaking change into a routine pull.
 
 ## Reporting a Vulnerability
 
@@ -87,14 +89,15 @@ CashPilot requires access to the Docker socket (`/var/run/docker.sock`) for cont
 
 ### Authentication
 
-- **UI users**: Session-based authentication with bcrypt-hashed passwords. Sessions are signed JWT tokens stored in HTTP-only cookies.
-- **Worker-to-UI**: Shared API key (`CASHPILOT_API_KEY`) sent as Bearer token. All fleet management endpoints require this key.
-- **Role-based access**: Three roles (viewer, writer, owner) with escalating permissions. Container management requires writer or owner role.
+- **UI users**: Session-based authentication with bcrypt-hashed passwords. Sessions are signed tokens stored in HTTP-only cookies.
+- **Worker-to-UI**: Per-worker fleet keys (since v1.0.0). `CASHPILOT_API_KEY` is only a shared enrollment/bootstrap credential -- on a worker's first heartbeat the UI issues it a unique key (stored encrypted, returned once), and every subsequent request in *either* direction (worker heartbeat, UI command) authenticates with that worker's own key. The shared key is rejected once a worker is enrolled, so a leaked worker key only affects that one worker.
+- **Role-based access**: Three roles (viewer, writer, owner) with escalating permissions, plus an implicit `fleet` role for authenticated worker requests. Container management requires writer or owner role.
 
 ### Data Storage
 
 - SQLite database stored in a Docker volume (`/data/cashpilot.db`)
-- Service credentials are encrypted at rest using Fernet symmetric encryption (`CASHPILOT_SECRET_KEY`)
+- Service credentials are encrypted at rest using Fernet symmetric encryption. The key is generated on first run and stored at `/data/.fernet_key`; it can be supplied via `CASHPILOT_ENCRYPTION_KEY` to restore a backup. This is **not** `CASHPILOT_SECRET_KEY`, which signs login sessions and lives at `/data/.secret_key` — two separate keys with separate jobs
+- If the encryption key cannot be persisted, CashPilot refuses to start rather than continuing with a key that dies with the process (override with `CASHPILOT_ALLOW_EPHEMERAL_KEY`)
 - Database is not network-accessible (local file only)
 - 400-day data retention with automatic purging
 
@@ -104,18 +107,61 @@ CashPilot is designed to run on **private, trusted networks** (home lab, VPN, LA
 
 - Place it behind a reverse proxy with TLS termination (e.g., Caddy, Traefik, nginx)
 - Restrict access via firewall rules or VPN
-- Use a strong `CASHPILOT_SECRET_KEY` and `CASHPILOT_API_KEY`
+- Use a strong `CASHPILOT_SECRET_KEY` and `CASHPILOT_API_KEY`, and back up `/data/.fernet_key`
+- Set the reverse-proxy-aware environment variables below so cookies, client-IP logging, and session invalidation behave correctly behind TLS termination
+
+These variables only matter when CashPilot sits behind a reverse proxy; a direct/private-network deployment can leave them unset:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CASHPILOT_TRUSTED_PROXY` | unset (off) | Opt-in. When set (`1`/`true`/`yes`/`on`), trusts the right-most `X-Forwarded-For` entry as the real client IP. Only enable this behind exactly one reverse proxy you control -- the header is otherwise attacker-controlled |
+| `CASHPILOT_BASE_URL` | -- | The externally-visible base URL (e.g. `https://cashpilot.example.com`). Used by `CASHPILOT_SECURE_COOKIE=auto` to detect HTTPS |
+| `CASHPILOT_SECURE_COOKIE` | `auto` | Controls the session cookie's `Secure` flag. `auto` sets it when `CASHPILOT_BASE_URL` starts with `https`; override with a truthy (`true`/`1`/`yes`/`on`) or falsy (`false`/`0`/`no`/`off`) value |
+| `CASHPILOT_SESSION_EPOCH` | `0` | Unix timestamp. Bump it to mass-invalidate every existing session (e.g. after a credential leak) -- any session token issued before this timestamp is rejected |
+
+### Worker URL Validation (SSRF)
+
+Worker URLs arrive in the fleet-key-authenticated heartbeat and are later fetched with the fleet bearer token attached, so the UI validates every worker URL before contacting it:
+
+- **Cloud-metadata addresses** (IPv4 `169.254.169.254`, IPv6 `fd00:ec2::254`) and loopback/link-local ranges are **always blocked**, regardless of policy.
+- **DNS-rebinding guard**: hostnames are resolved and the resolved IP is re-validated before each request, so a name that points at a metadata or loopback address is rejected. IPv4-mapped IPv6 bypasses are normalized and caught.
+- **Default policy is permissive**: LAN (RFC1918) and Tailscale (CGNAT `100.64.0.0/10`) workers keep working out of the box with no configuration.
+- **Opt-in `strict` mode** restricts workers to an explicit allowlist of CIDRs and hostname suffixes. See [Fleet Management](docs/fleet.md) for `CASHPILOT_WORKER_URL_POLICY`, `CASHPILOT_WORKER_ALLOWED_HOSTS`, and `CASHPILOT_WORKER_ALLOW_METADATA`.
+
+## What CashPilot will never do
+
+Three constraints are deliberate design decisions, not gaps waiting to be filled. They are recorded here because this is the file someone reads just before proposing to cross one of them.
+
+**We will never hold your keys on a server we control.** Software that runs on your own machine — where key material never leaves it and the maintainers cannot read it — is a fundamentally different thing from a service that holds other people's secrets. The second is a regulated activity carrying licensing, capital and anti-money-laundering obligations. Staying on the self-hosted side of that line is a constraint we design around, not an oversight.
+
+**We will never offer key recovery.** If you lose your encryption key or your passphrase, the data encrypted under it is gone. There is no reset link and no support route, because a recovery path we could operate would mean we could decrypt your data — which is the thing we just said we will not do. Saying this plainly is more honest than implying a safety net that does not exist. Back up `/data/.fernet_key`.
+
+**We will never ship tooling that eases multi-account evasion.** Several providers forbid more than one account per household. Making evasion easy would put users at risk of forfeited balances for the sake of a feature we cannot make safe.
+
+### For contributors
+
+A pull request that adds any of the following will be declined with a link to this section:
+
+- a server-held key, passphrase, or seed — including "remember it for convenience"
+- a cloud sync or hosted-backup path for credentials or wallet material
+- an automatic off-machine backup timer
+- anything whose purpose is to make one household look like several accounts
+
+The tempting version of the first one is real and will come up: once encrypted backup and restore exists, "just let the server remember the passphrase so restore is easier" is the obvious next request. The answer is no, for the reason above. Convenience that requires us to be able to decrypt your data is the exact thing this boundary exists to prevent.
+
+The reasoning in full is in [Direction and Roadmap](https://geiserx.github.io/CashPilot/roadmap/).
 
 ## Hardening Recommendations
 
 1. **Use a reverse proxy with TLS** if accessible beyond localhost
-2. **Set strong, unique values** for `CASHPILOT_SECRET_KEY` and `CASHPILOT_API_KEY`
+2. **Set strong, unique values** for `CASHPILOT_SECRET_KEY` and `CASHPILOT_API_KEY`, and **back up `/data/.fernet_key`** — without it, stored credentials cannot be decrypted
 3. **Do not use `--privileged`** for the CashPilot container itself
 4. **Keep Docker Engine updated** on all hosts
 5. **Use `--network host` only when necessary** (e.g., cross-subnet worker communication)
 6. **Restrict Docker socket access** — do not mount it in containers that don't need it
 7. **Review deployed service configurations** — CashPilot deploys third-party containers; review their security posture independently
 8. **Back up your SQLite database** regularly (`/data/cashpilot.db`)
+9. **Enable strict worker-URL mode** (`CASHPILOT_WORKER_URL_POLICY=strict`) for internet-exposed deployments, with `CASHPILOT_WORKER_ALLOWED_HOSTS` set to your worker subnets
 
 ## Responsible Disclosure
 

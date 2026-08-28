@@ -1,0 +1,138 @@
+name: Collector Live Check
+
+# A recorded fixture is frozen at the moment it was written, so it can prove our
+# code still reads what we said it reads and nothing more. Only calling the real
+# API notices that a provider renamed a field — which is how several collectors
+# silently started returning zero while every test stayed green.
+#
+# Runs on a schedule and by hand, never on a PR: it needs real credentials, and
+# a third party being down must never redden someone's pull request.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+# Least privilege: the job that handles real provider credentials gets read
+# only. Issue-writing belongs to the reporter job alone, which declares it.
+permissions:
+  contents: read
+
+concurrency:
+  group: collector-live-check
+  cancel-in-progress: false
+
+jobs:
+  live:
+    # Public repo -> GitHub-hosted runners are free, ephemeral and isolated,
+    # which also keeps provider credentials off the self-hosted fleet.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # Same lockfile as the test job and the shipped image. A live check that
+      # runs against a different resolution than production can pass or fail for
+      # reasons that have nothing to do with the provider it is checking.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip uv
+          uv sync --frozen --extra dev
+
+      - name: Run live collector checks
+        id: live
+        env:
+          CASHPILOT_LIVE_CREDENTIALS: ${{ secrets.CASHPILOT_LIVE_CREDENTIALS }}
+        run: |
+          set -o pipefail
+          # Exit 5 is pytest's "no tests collected". No test carries the `live`
+          # marker yet, so without this the job fails EVERY night and files a
+          # false drift alert — which trains the maintainer to ignore the one
+          # alert designed to catch a real provider change.
+          #
+          # PIPESTATUS is captured into `rc` immediately, because EVERY later
+          # command overwrites it -- including the `[ ... ]` test that used to be
+          # on the right of this `||`. Reading ${PIPESTATUS[0]} on any subsequent
+          # line yields that test's own status, not pytest's.
+          rc=0
+          uv run pytest tests/ -m live -q 2>&1 | tee live.log || rc=${PIPESTATUS[0]}
+          # ...but say so. Masking exit 5 keeps the job green, which is right —
+          # and it also makes "green" mean two different things: "every provider
+          # still matches its collector" and "nothing was checked at all". Today
+          # it is always the second (no test carries the marker yet), so the
+          # nightly run is a safety net that reports healthy while catching
+          # nothing. The summary makes which one it is visible without turning
+          # the job red and training alert-blindness.
+          #
+          # A REAL failure (exit 1) must still redden the job and reach the
+          # issue-filing step below. Masking only the empty case is the whole
+          # point; masking everything would turn this into a silencer.
+          if [ "$rc" != "0" ] && [ "$rc" != "5" ]; then
+            exit "$rc"
+          fi
+          if [ "$rc" = "5" ]; then
+            {
+              echo "### Provider-drift detection is NOT active"
+              echo
+              echo "0 tests carry the \`live\` marker, so **no collector was checked against a real API**."
+              echo "This job passed because there was nothing to run — not because the providers are unchanged."
+              echo
+              echo "To activate it, mark a collector test with \`@pytest.mark.live\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # A SEPARATE JOB, not a step, and deliberately dependency-free.
+  #
+  # This alarm used to be an `if: failure()` step inside the job above. That
+  # cannot fire when the job never starts -- and for six consecutive nights it
+  # did not, because the job's own `actions/github-script` pin named a commit
+  # that does not exist, so GitHub failed the job during "Set up job", before
+  # any step ran. The check reported nothing and filed nothing while never once
+  # having checked a provider.
+  #
+  # As a job with `needs:`, this runs whenever `live` fails for ANY reason,
+  # including one that kills it at setup. It uses the preinstalled `gh` CLI
+  # rather than an action, so the path that reports a broken workflow cannot
+  # itself be broken by an unresolvable action.
+  report:
+    needs: live
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the drift issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # The log is deliberately never pasted: collector failures can echo
+          # request payloads containing credentials.
+          body=$(cat <<EOF
+          The nightly live collector check failed.
+
+          This usually means a provider renamed or moved a field, which the recorded
+          fixtures cannot detect on their own. Compare the failing collector against
+          \`tests/fixtures/collectors/<slug>.json\` and update BOTH the collector and its
+          contract.
+
+          If the job failed before any step ran, the cause is the workflow itself
+          (an unresolvable action pin, a missing secret) and no provider was checked.
+
+          Run: $RUN_URL
+          EOF
+          )
+          gh label create collector-drift \
+            --description "Automated collector drift findings" --color ededed 2>/dev/null || true
+          existing=$(gh issue list --state open --label collector-drift --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create \
+              --title "Collector live check failed — a provider may have changed its API" \
+              --label collector-drift --body "$body"
+          fi

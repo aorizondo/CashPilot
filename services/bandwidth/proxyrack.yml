@@ -13,10 +13,14 @@ short_description: Bandwidth sharing - UUID per device, works on VPS
 
 referral:
   signup_url: "https://peer.proxyrack.com/ref/mpwiok3xlaxeycnn5znqlg7ipjeutxyxr6xl7vmn"
+  code: "mpwiok3xlaxeycnn5znqlg7ipjeutxyxr6xl7vmn"
 
 docker:
   image: proxyrack/pop
   platforms: [linux/amd64]
+  resources:
+    mem_limit: "256m"
+    oom_score_adj: 300
   env:
     - key: UUID
       label: "Device UUID"
@@ -27,7 +31,7 @@ docker:
       label: "API Key"
       required: false
       secret: true
-      description: "Your ProxyRack API key (auto-registers device in dashboard if provided)"
+      description: "Log in at <a href=\"https://peer.proxyrack.com\">peer.proxyrack.com</a> → API Key is shown on the main dashboard page (auto-registers device if provided)"
     - key: DEVICE_NAME
       label: "Device name"
       required: false
@@ -38,11 +42,13 @@ docker:
   volumes: []
   command: ""
   network_mode: ""
-  privileged: true
+  privileged: false
 
 requirements:
   residential_ip: false
   devices_per_account: 500
+  note: "Proxyrack documents a 500-device limit per ACCOUNT and no per-IP limit. Datacentre IPs are accepted but reclassified to a lower rate."
+  note_column: devices_per_ip
   min_bandwidth: ""
   gpu: false
   min_storage: ""
@@ -71,3 +77,8 @@ platforms: [docker, windows, macos, linux]
 collector:
   type: api
   notes: "Dashboard behind Cloudflare. May need API key from browser session. Per-device earnings visible."
+  credential_hint: "Log in at <a href='https://peer.proxyrack.com' target='_blank'>peer.proxyrack.com</a>, press F12 → Network, find any API request and copy the <b>Api-Key</b> header value."
+
+payout:
+  model: internal
+  notes: "Balance held by ProxyRack; withdrawn on request."

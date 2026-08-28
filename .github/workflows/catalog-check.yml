@@ -1,0 +1,85 @@
+name: Catalog Check
+
+# A new service should be one YAML file plus an optional collector. This is the
+# fast feedback that makes that true: it validates the entry with the same
+# strict loader the app uses, and proves the README tables still match the
+# catalog. The README used to be hand-maintained and drifted — it kept
+# publishing a per-IP device limit for weeks after the catalog dropped it.
+#
+# Deliberately separate from the full test job so a first-time contributor gets
+# an answer in seconds rather than waiting on the whole suite.
+
+on:
+  pull_request:
+    paths:
+      - "services/**"
+      - "README.md"
+      - "scripts/generate_readme_tables.py"
+      - "scripts/referral_check.py"
+      - ".github/workflows/catalog-check.yml"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  catalog:
+    # Public repo: GitHub-hosted runners are free, unlimited and ephemeral, and
+    # a fork PR cannot reach the self-hosted fleet from here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install the minimum needed to read the catalog
+        run: pip install pyyaml
+
+      - name: Every service entry loads under the strict validator
+        run: |
+          python - <<'PY'
+          import sys
+          from app import catalog
+
+          services = catalog.get_services()
+          if not services:
+              sys.exit("The catalog loaded ZERO services — an invalid entry is silently dropped at load.")
+          print(f"{len(services)} service(s) loaded and valid.")
+          PY
+
+      - name: README service tables match the catalog
+        run: python scripts/generate_readme_tables.py --check
+
+      # Referral links are revenue. This fails on regressions (a recorded code
+      # no longer anchored in its signup_url, malformed registry facts);
+      # known-program-without-code gaps and unresearched providers are printed,
+      # not failed. A contributor who updates a migrated provider's signup_url
+      # CAN trip the code check -- the error text tells them the escape hatch:
+      # leave `code` as it was and flag it, since only the account holder can
+      # re-issue the link.
+      - name: Referral links still carry their codes
+        run: python scripts/referral_check.py
+
+      - name: Every service has a guide
+        run: |
+          python - <<'PY'
+          import pathlib
+          import sys
+
+          from app import catalog
+
+          missing = [
+              s["slug"]
+              for s in catalog.get_services()
+              if not pathlib.Path(f"docs/guides/{s['slug']}.md").exists()
+          ]
+          if missing:
+              sys.exit(
+                  f"No guide for: {missing}\n"
+                  "Generate a stub with: python scripts/new_service_stub.py <slug>"
+              )
+          print("Every catalogued service has a guide.")
+          PY

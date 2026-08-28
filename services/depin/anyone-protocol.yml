@@ -6,30 +6,85 @@ website: https://anyone.io
 description: >
   Anyone Protocol (formerly ATOR) is a decentralized onion-routing privacy
   network. Node operators run relay nodes and earn ANYONE tokens for bandwidth
-  contributed. Think "incentivized Tor." Official Docker images available for
-  amd64 and arm64 including Raspberry Pi. Configuration is file-based via an
-  anonrc file mounted into the container (Nickname, ContactInfo, ORPort, etc.).
+  contributed. Think "incentivized Tor." This template uses the env-configurable
+  image aorizondo/anyone-anon, which renders the anonrc from environment
+  variables at startup (no anonrc file to mount). Available for amd64 and arm64.
 short_description: Decentralized onion routing - incentivized Tor relay nodes
 
 referral:
   signup_url: "https://anyone.io"
+  program: false
 
 docker:
-  image: ghcr.io/anyone-protocol/ator-protocol
+  image: aorizondo/anyone-anon
   tag: latest
   platforms: [linux/amd64, linux/arm64]
-  env: []
+  resources:
+    mem_limit: "1536m"
+    oom_score_adj: -100
+  env:
+    - key: ANON_NICKNAME
+      label: "Relay nickname"
+      required: true
+      default: "{hostname}"
+      description: "1-19 characters, only [a-zA-Z0-9], no spaces. Defaults to the deploy hostname so each relay gets a unique name when deploying many at once. If you override it, keep it unique per relay and within the 19-char alphanumeric limit."
+    - key: ANON_ETHEREUM_ADDRESS
+      label: "Ethereum wallet address (rewards)"
+      required: false
+      description: "EVM address (0x...) used to claim contribution rewards. Written as 'ContactInfo @anon: <addr>' in anonrc. Required to earn ANYONE tokens."
+    - key: ANON_ORPORT
+      label: "ORPort"
+      required: false
+      default: "9001"
+      description: "Onion routing port. Must be reachable/open on the host (TCP, UDP also recommended). Default 9001."
+    - key: ANON_CONTROLPORT
+      label: "ControlPort"
+      required: false
+      default: "9051"
+      description: "Control protocol port for monitoring (e.g. Nyx). Use 0 to disable."
+    - key: ANON_EXITRELAY
+      label: "Exit relay"
+      required: false
+      default: "0"
+      description: "0 = middle/guard relay (recommended), 1 = exit relay (requires exit policy + more legal exposure)."
+    - key: ANON_BANDWIDTHRATE
+      label: "Bandwidth rate (Mbit)"
+      required: false
+      description: "Sustained bandwidth cap in Mbit, e.g. 100. Leave empty for unlimited."
+    - key: ANON_BANDWIDTHBURST
+      label: "Bandwidth burst (Mbit)"
+      required: false
+      description: "Burst bandwidth cap in Mbit, e.g. 120. Leave empty for unlimited."
+    - key: ANON_MYFAMILY
+      label: "MyFamily fingerprints"
+      required: false
+      description: "Comma-separated relay fingerprints if you operate multiple relays, so they aren't double-counted."
+    - key: ANON_AGREETOTERMS
+      label: "Agree to terms"
+      required: false
+      default: "1"
+      description: "Must be 1 or the relay exits immediately. Accept the Anyone Protocol terms."
+    - key: ANON_CONTACTINFO
+      label: "Operator contact (optional email)"
+      required: false
+      description: "Optional operator email. Recorded as a comment in anonrc for reference; the rewards wallet is set via ANON_ETHEREUM_ADDRESS."
   ports: ["9001:9001"]
   volumes:
     - "anon-data:/var/lib/anon"
-    - "anon-config:/etc/anon"
     - "anon-run:/run/anon"
+  critical_volumes:
+    - target: "/var/lib/anon"
+      holds: >-
+        Relay ed25519 identity key. Destroying it retires the relay's reputation
+        and restarts its earning history from zero.
   command: ""
   network_mode: ""
   notes: >
-    Requires an anonrc config file mounted at /etc/anon/anonrc with AgreeToTerms 1.
-    The config dir must be writable (chown 100:101) for notices.log.
-    Port 9001 is the ORPort for relay traffic.
+    Uses aorizondo/anyone-anon, an image with an entrypoint that translates
+    environment variables into an anonrc at startup (no config file to mount).
+    The Ethereum rewards wallet is written as 'ContactInfo @anon: <addr>'.
+    Port 9001 (ORPort) MUST be forwarded/open on the host or the relay will not
+    publish its descriptor and will earn nothing. AgreeToTerms defaults to 1.
 
 requirements:
   residential_ip: false
@@ -48,16 +103,60 @@ earnings:
   monthly_high: 50
   currency: USD
   per: "relay"
-  notes: "Earnings based on bandwidth contributed and uptime. Open source project with active development."
+  notes: "Earnings based on bandwidth contributed and uptime. Non-hardware relays must lock 100 ANYONE per relay and hold the prerequisite at airdrop time."
 
 cashout:
   method: manual
   dashboard_url: "https://anyone.io"
-  min_amount: 0
+  # Undocumented: the provider does not publish a minimum. NOT 0 —
+  # 0 means 'no minimum, cash out anything', which would tell the
+  # user they can withdraw now and disables payout detection.
+  min_amount: null
   currency: ANYONE
+  notes: "Claim relays and manage rewards on the Anyone Protocol Dashboard after adding your EVM wallet."
 
 platforms: [docker, linux]
 
 collector:
-  type: manual
-  notes: "Open source relay. Earnings tracked on-chain."
+  type: auto
+  # Under credential_hint, which is the field the UI actually reads
+  # (app/main.py: `(svc.get("collector") or {}).get("credential_hint")`) and the
+  # one services/_schema.yml documents. This text previously sat in a
+  # `credentials:` list that nothing anywhere reads, so the ONE credential in the
+  # catalog that cannot be found in a provider dashboard — it needs a shell
+  # command against the running container — was the one credential with no
+  # guidance on screen.
+  credential_hint: >
+    Comma-separated relay fingerprints. This one is not in a web dashboard:
+    run <b>docker exec cashpilot-anyone-protocol anon --list-fingerprint</b> on
+    the host running the relay, or look the relay up at
+    <a href="https://api.ec.anyone.tech/relays/">api.ec.anyone.tech/relays/</a>.
+  notes: "Queries AO relay-rewards contract by fingerprint, converts ANYONE tokens to USD via CoinGecko."
+
+# What this service does with the user's machine (CashPilot-66x).
+# Written to be read by someone deciding whether to trust it.
+disclosure:
+  sells: >-
+    Bandwidth, as a relay in the Anyone network (a Tor fork).
+  third_party_traffic: >-
+    Yes. It relays other people's traffic. Whether your IP is the final hop
+    depends on whether the relay is configured as an exit.
+  data_collected: >-
+    The relay's public identity key, your IP and port, and uptime statistics,
+    all published to the network directory by design. If you set ContactInfo in
+    your anonrc it is published there too and is permanently, publicly
+    indexed — it is usually an email address, so leave it empty unless you want
+    it public.
+  isp_risk: >-
+    Real. Relay traffic is attributed to your connection. Exit relays in
+    particular attract abuse complaints; many consumer ISPs prohibit them.
+  account_rules: >-
+    No account is needed at all, so there is nothing to limit per account. The
+    project does not publish a per-IP relay limit, and the catalog does not
+    declare one.
+
+payout:
+  model: external
+  chain: ethereum
+  address_source: manual
+  notes: "Set as ContactInfo in anonrc, prefixed '@anon:0x...'."

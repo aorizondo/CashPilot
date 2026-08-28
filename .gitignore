@@ -11,3 +11,30 @@ venv/
 dist/
 build/
 .ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Agent / tooling working dirs (not part of the project)
+#
+# .beads/ is NOT optional here and must not be "helpfully" committed later. The
+# usual beads convention is to commit the export so the tracker travels with the
+# repo; this repository is the exception, because the backlog contains real
+# wallet addresses and this repo is PUBLIC. It was previously protected only by
+# .git/info/exclude, which is local to one clone and travels with nothing.
+.beads/
+.omc/
+.claude/
+.sddw/
+.superset/
+.tbd/
+
+# Agent working files. These are scratch, not documentation, and they must never
+# be committed: they carried this project's internal planning verbatim, quoted
+# the maintainer directly, and printed a real node identity address — all of
+# which was then published to the public docs site, because MkDocs builds every
+# file in docs_dir whether or not it appears in nav.
+docs/GOAL.md
+docs/AUTOPILOT-WORKLOG.md
+docs/DEFERRED-QUESTIONS.md

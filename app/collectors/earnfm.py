@@ -1,7 +1,7 @@
 """Earn.fm earnings collector.
 
-Authenticates via Supabase (sb.earn.fm) and fetches balance from
-the Earn.fm harvester API.
+Authenticates via Supabase (email/password) at sb.earn.fm, then uses
+the access token to query the harvester balance API.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import logging
 
 import httpx
 
+from app.collectors import base
 from app.collectors.base import BaseCollector, EarningsResult
 
 logger = logging.getLogger(__name__)
@@ -17,95 +18,91 @@ logger = logging.getLogger(__name__)
 SUPABASE_URL = "https://sb.earn.fm"
 SUPABASE_ANON_KEY = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-    "ewogICJyb2xlIjogImFub24iLAogICJpc3MiOiAic3VwYWJhc2UiLAog"
-    "ICJpYXQiOiAxNjkyNjU1MjAwLAogICJleHAiOiAxODUwNTA4MDAwCn0."
+    "ewogICJyb2xlIjogImFub24iLAogICJpc3MiOiAic3VwYWJhc2UiLAogICJpYXQiOiAxNjkyNjU1MjAwLAogICJleHAiOiAxODUwNTA4MDAwCn0."
     "jp-Uj5ro0jj7MHnlE8HHZRsZAFOI1d_T9n_9tnE09vM"
 )
 API_BASE = "https://api.earn.fm/v2"
 
 
 class EarnFMCollector(BaseCollector):
-    """Collect earnings from Earn.fm's API via Supabase auth."""
+    """Collect earnings from Earn.fm using Supabase email/password auth."""
 
     platform = "earnfm"
 
     def __init__(self, email: str, password: str) -> None:
-        self.email = email
-        self.password = password
-        self._access_token: str | None = None
-        self._refresh_token: str | None = None
+        super().__init__()
+        self._email = email.strip()
+        self._password = password.strip()
+        self._access_token: str = ""
 
-    async def _authenticate(self, client: httpx.AsyncClient) -> str:
-        """Obtain Supabase access token via email/password."""
+    async def _authenticate(self) -> str | None:
+        """Sign in via Supabase and return the access token."""
+        client = self._get_client(timeout=30)
         resp = await client.post(
             f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
-            json={"email": self.email, "password": self.password},
             headers={
                 "apikey": SUPABASE_ANON_KEY,
                 "Content-Type": "application/json",
             },
+            json={"email": self._email, "password": self._password},
         )
+        if resp.status_code == 400:
+            return None
         resp.raise_for_status()
         data = resp.json()
-        self._access_token = data.get("access_token", "")
-        self._refresh_token = data.get("refresh_token", "")
-        if not self._access_token:
-            raise ValueError("No access_token in Supabase login response")
-        return self._access_token
-
-    async def _refresh(self, client: httpx.AsyncClient) -> str:
-        """Refresh Supabase access token."""
-        if not self._refresh_token:
-            return await self._authenticate(client)
-        resp = await client.post(
-            f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token",
-            json={"refresh_token": self._refresh_token},
-            headers={
-                "apikey": SUPABASE_ANON_KEY,
-                "Content-Type": "application/json",
-            },
-        )
-        if resp.status_code in (401, 403):
-            return await self._authenticate(client)
-        resp.raise_for_status()
-        data = resp.json()
-        self._access_token = data.get("access_token", "")
-        self._refresh_token = data.get("refresh_token", self._refresh_token)
-        return self._access_token
+        return data.get("access_token")
 
     async def collect(self) -> EarningsResult:
         """Fetch current Earn.fm balance."""
+        if not self._email or not self._password:
+            return EarningsResult(
+                platform=self.platform,
+                balance=0.0,
+                error="No credentials configured — enter Earn.fm email and password",
+            )
+
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                if not self._access_token:
-                    await self._authenticate(client)
-
-                headers = {"X-API-Key": self._access_token}
-                resp = await client.get(
-                    f"{API_BASE}/harvester/view_balance",
-                    headers=headers,
-                )
-
-                if resp.status_code == 401:
-                    await self._refresh(client)
-                    headers = {"X-API-Key": self._access_token}
-                    resp = await client.get(
-                        f"{API_BASE}/harvester/view_balance",
-                        headers=headers,
-                    )
-
-                resp.raise_for_status()
-                data = resp.json()
-
-                balance = float(data.get("data", {}).get("totalBalance", 0))
-
+            token = await self._authenticate()
+            if not token:
                 return EarningsResult(
                     platform=self.platform,
-                    balance=round(balance, 4),
-                    currency="USD",
+                    balance=0.0,
+                    error="Invalid credentials — check Earn.fm email/password in Settings",
                 )
+
+            client = self._get_client(timeout=30)
+
+            async def _fetch_balance() -> httpx.Response:
+                return await client.get(
+                    f"{API_BASE}/harvester/view_balance",
+                    headers={"X-API-Key": token},
+                )
+
+            resp = await self._retry(_fetch_balance)
+
+            if resp.status_code in (401, 403):
+                return EarningsResult(
+                    platform=self.platform,
+                    balance=0.0,
+                    error="Auth token rejected — check Earn.fm email/password in Settings",
+                )
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            balance_data = data.get("data") or {}
+            raw = balance_data.get("totalBalance")
+            if raw is None:
+                raise ValueError("totalBalance field missing — API shape may have changed")
+            balance = float(raw)
+
+            return EarningsResult(
+                platform=self.platform,
+                balance=round(balance, 4),
+                currency="USD",
+            )
         except Exception as exc:
-            logger.error("EarnFM collection failed: %s", exc)
+            base.log_failure(logger, "EarnFM", exc)
             return EarningsResult(
                 platform=self.platform,
                 balance=0.0,

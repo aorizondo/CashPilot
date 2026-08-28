@@ -8,12 +8,21 @@ on:
 
 jobs:
   update-description:
-    runs-on: [self-hosted, linux, x64]
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
-      - uses: peter-evans/dockerhub-description@v4
+      - name: Sync UI Docker Hub description
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: drumsergio/cashpilot
+
+      - name: Sync worker Docker Hub description
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: drumsergio/cashpilot-worker
+          short-description: "CashPilot worker — Docker agent that deploys and monitors passive-income service containers (pairs with the drumsergio/cashpilot UI)."
